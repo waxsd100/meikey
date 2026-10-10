@@ -1,0 +1,4 @@
+# このプロジェクトで使う Rust（rustup が自動でこのバージョンを入れて使う）
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy", "rust-src"]

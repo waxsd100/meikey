@@ -1,0 +1,44 @@
+[package]
+name = "meikey"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Vanity ed25519 SSH key generator — 公開鍵に好きな文字列を刻む"
+license = "MIT"
+keywords = ["ssh", "ed25519", "vanity", "keygen"]
+categories = ["command-line-utilities", "cryptography"]
+
+[dependencies]
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+curve25519-dalek = "5.0.0"
+ed25519-dalek = "3.0.0"
+rand = { version = "0.10.3", features = ["chacha"] }
+sha2 = "0.11"
+
+[dev-dependencies]
+num-bigint = "0.5.1"
+num-integer = "0.1.46"
+num-traits = "0.2.19"
+proptest = "1.11.0"
+rstest = "0.27.0"
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# テストを速くするため、依存クレートだけは開発ビルドでも最適化する。
+# meikey 自身は最適化しないので、桁あふれ検査（overflow-checks）はテストで有効なまま
+[profile.dev.package."*"]
+opt-level = 3
+
+# cargo make proptest-deep 用: 最適化して速く回しつつ、桁あふれ検査とデバッグ用の assert は残す
+[profile.proptest]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true
+lto = false
+codegen-units = 16

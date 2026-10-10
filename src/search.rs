@@ -1,0 +1,319 @@
+//! 全コアで鍵を生成して、当たりを探す
+
+use crate::derive::{BATCH, Backend, Deriver, PublicKeys, Seeds};
+use crate::key::{self, PUBLIC_B64_LEN, VanityKey};
+use crate::pattern::Pattern;
+use rand::Rng;
+use rand::rngs::ChaCha20Rng;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// 進捗確認・停止確認の間隔（当たり・時間切れに気づくまでの最大の遅れ）
+const TICK: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Clone)]
+pub struct SearchConfig {
+    /// `None` なら判定せずに鍵を作り続ける（ベンチマーク用）
+    pub pattern: Option<Pattern>,
+    pub threads: usize,
+    /// 公開鍵の計算方法
+    pub backend: Backend,
+    /// この時間が経ったら打ち切る
+    pub time_limit: Option<Duration>,
+    /// 進捗コールバックを呼ぶ間隔
+    pub progress_interval: Duration,
+}
+
+impl SearchConfig {
+    pub fn new(pattern: Option<Pattern>) -> Self {
+        Self {
+            pattern,
+            threads: thread::available_parallelism().map_or(1, |n| n.get()),
+            backend: Backend::default(),
+            time_limit: None,
+            progress_interval: Duration::from_secs(5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Stats {
+    pub tries: u64,
+    pub elapsed: Duration,
+}
+
+impl Stats {
+    /// 平均の生成速度（鍵/秒）
+    pub fn rate(&self) -> f64 {
+        self.tries as f64 / self.elapsed.as_secs_f64().max(f64::EPSILON)
+    }
+}
+
+#[derive(Debug)]
+pub struct Outcome {
+    /// 見つかった鍵（打ち切り・ベンチマークなら `None`）
+    pub key: Option<VanityKey>,
+    pub stats: Stats,
+}
+
+/// 探索を実行する。`on_progress` は呼び出し元スレッドで定期的に呼ばれる。
+pub fn run(config: &SearchConfig, mut on_progress: impl FnMut(Stats)) -> Outcome {
+    let stop = AtomicBool::new(false);
+    let tries = AtomicU64::new(0);
+    let found = OnceLock::new();
+    let start = Instant::now();
+    let stats = || Stats {
+        tries: tries.load(Relaxed),
+        elapsed: start.elapsed(),
+    };
+
+    thread::scope(|s| {
+        for _ in 0..config.threads.max(1) {
+            s.spawn(|| worker(config, &stop, &tries, &found));
+        }
+
+        let mut next_report = start + config.progress_interval;
+        while !stop.load(Relaxed) {
+            thread::sleep(TICK);
+            if config
+                .time_limit
+                .is_some_and(|limit| start.elapsed() >= limit)
+            {
+                stop.store(true, Relaxed);
+            } else if Instant::now() >= next_report {
+                on_progress(stats());
+                next_report += config.progress_interval;
+            }
+        }
+    });
+
+    Outcome {
+        key: found.into_inner().map(VanityKey::from_seed),
+        stats: stats(),
+    }
+}
+
+/// スレッドがパニックで終わるときも、ほかのスレッドと呼び出し元に止まるよう伝える
+/// （伝えないと、残りのスレッドが時間制限まで、制限が無ければ永久に回り続ける）
+struct StopOnPanic<'a>(&'a AtomicBool);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.0.store(true, Relaxed);
+        }
+    }
+}
+
+fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &OnceLock<[u8; 32]>) {
+    let _guard = StopOnPanic(stop);
+    let mut rng: ChaCha20Rng = rand::make_rng();
+    let mut deriver = Deriver::new(config.backend);
+    let mut seeds: Seeds = [[0u8; 32]; BATCH];
+    let mut publics: PublicKeys = [[0u8; 32]; BATCH];
+    let mut b64 = [0u8; PUBLIC_B64_LEN];
+
+    while !stop.load(Relaxed) {
+        seeds.iter_mut().for_each(|s| rng.fill_bytes(s));
+        deriver.public_keys(&seeds, &mut publics);
+
+        for (i, (seed, public)) in seeds.iter().zip(&publics).enumerate() {
+            key::encode_public_b64(public, &mut b64);
+            let Some(pattern) = &config.pattern else {
+                std::hint::black_box(&b64); // ベンチマーク: 判定せずに回す
+                continue;
+            };
+            if pattern.is_match(&b64) {
+                // 書き出す鍵は ed25519-dalek で計算し直すので、そちらでも一致するか確かめる。
+                // 一致しなければ高速版の計算が間違っている（バグ）ので止める
+                assert!(
+                    pattern.is_match(&VanityKey::from_seed(*seed).public_b64()),
+                    "内部エラー: {:?} の公開鍵計算が ed25519-dalek と一致しません",
+                    config.backend
+                );
+                let _ = found.set(*seed); // 同時に当たったら先着を採用
+                stop.store(true, Relaxed);
+                tries.fetch_add(i as u64 + 1, Relaxed);
+                return;
+            }
+        }
+        tries.fetch_add(BATCH as u64, Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::property::check;
+    use proptest::prelude::*;
+    use rstest::rstest;
+
+    /// 見つからない探索の種類
+    #[derive(Debug, Clone, Copy)]
+    enum Endless {
+        /// ベンチマーク（判定しない）
+        Bench,
+        /// 42文字の z（現実には見つからない）
+        Impossible,
+    }
+
+    impl Endless {
+        fn pattern(self) -> Option<Pattern> {
+            match self {
+                Endless::Bench => None,
+                Endless::Impossible => {
+                    Some(Pattern::new(&"z".repeat(Pattern::MAX_LEN), false).unwrap())
+                }
+            }
+        }
+    }
+
+    /// 短い文字列はすぐ見つかり、見つかった鍵は本当に一致している。
+    /// 期待試行回数は多くても100回ほどなので、10秒で見つからなければ公開鍵の計算が壊れている
+    #[rstest]
+    fn finds_matching_key(
+        #[values("a", "Wa", "+/")] pattern: &str,
+        #[values(1, 4)] threads: usize,
+        #[values(Backend::Fast, Backend::ConstantTime)] backend: Backend,
+    ) {
+        let cfg = SearchConfig {
+            threads,
+            backend,
+            time_limit: Some(Duration::from_secs(10)),
+            ..SearchConfig::new(Some(Pattern::new(pattern, false).unwrap()))
+        };
+        let out = run(&cfg, |_| {});
+
+        let key = out.key.expect("短い文字列ならすぐ見つかる");
+        assert!(cfg.pattern.unwrap().is_match(&key.public_b64()));
+        assert!(out.stats.tries >= 1);
+    }
+
+    /// 見つからない探索は、時間制限が来たらすぐ止まる
+    #[rstest]
+    fn stops_at_time_limit(
+        #[values(Endless::Bench, Endless::Impossible)] endless: Endless,
+        #[values(Backend::Fast, Backend::ConstantTime)] backend: Backend,
+        #[values(1, 2)] threads: usize,
+    ) {
+        let limit = Duration::from_millis(60);
+        let cfg = SearchConfig {
+            threads,
+            backend,
+            time_limit: Some(limit),
+            ..SearchConfig::new(endless.pattern())
+        };
+        let out = run(&cfg, |_| {});
+
+        assert!(out.key.is_none());
+        assert!(out.stats.tries > 0, "時間内に鍵を作っている");
+        assert!(out.stats.elapsed >= limit);
+        assert!(
+            out.stats.elapsed < limit + Duration::from_secs(2),
+            "止まるのが遅い: {:?}",
+            out.stats.elapsed
+        );
+    }
+
+    /// 進捗は間隔ごとに呼ばれる（早すぎず、多すぎず）。間隔より先に時間制限が来たら呼ばれない。
+    /// 進捗の仕組みは公開鍵の計算方法によらないので、ベンチマーク（判定なし）の高速版で測る
+    #[rstest]
+    #[case::every_40ms(40, 180, 4)]
+    #[case::every_60ms(60, 250, 4)]
+    #[case::none_before_first_interval(10_000, 60, 0)]
+    fn progress_timing(#[case] interval_ms: u64, #[case] limit_ms: u64, #[case] expected: usize) {
+        let interval = Duration::from_millis(interval_ms);
+        let cfg = SearchConfig {
+            threads: 1,
+            time_limit: Some(Duration::from_millis(limit_ms)),
+            progress_interval: interval,
+            ..SearchConfig::new(None)
+        };
+        let mut at = Vec::new();
+        run(&cfg, |s| at.push(s.elapsed));
+
+        assert!(
+            (expected.saturating_sub(1)..=expected).contains(&at.len()),
+            "{} 回（期待 {expected} 回前後）: {at:?}",
+            at.len()
+        );
+        for (k, t) in at.iter().enumerate() {
+            assert!(
+                *t >= interval * (k as u32 + 1),
+                "{k} 回目が早すぎる: {at:?}"
+            );
+        }
+    }
+
+    /// 速度は 試行回数 / 経過秒。経過時間 0 でも 0 除算せず有限
+    #[rstest]
+    #[case::per_second(1000, 1.0, Some(1000.0))]
+    #[case::half_second(150, 0.5, Some(300.0))]
+    #[case::zero_elapsed_no_tries(0, 0.0, None)]
+    #[case::zero_elapsed(1, 0.0, None)]
+    #[case::zero_elapsed_max_tries(u64::MAX, 0.0, None)]
+    fn rate(#[case] tries: u64, #[case] secs: f64, #[case] want: Option<f64>) {
+        let r = Stats {
+            tries,
+            elapsed: Duration::from_secs_f64(secs),
+        }
+        .rate();
+        assert!(r.is_finite());
+        if let Some(want) = want {
+            assert!((r - want).abs() < 1e-9, "{r}");
+        }
+    }
+
+    /// 1つのスレッドがパニックしたら、ほかのスレッドも呼び出し元もすぐ止まる。
+    /// パニックしなければガードは何もしない
+    #[rstest]
+    fn stop_on_panic_guard(#[values(true, false)] panics: bool, #[values(2, 4)] threads: usize) {
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        let give_up = Duration::from_millis(50); // パニックしない場合に他のスレッドが待つ時間
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            thread::scope(|s| {
+                s.spawn(|| {
+                    let _guard = StopOnPanic(&stop);
+                    assert!(!panics, "わざとパニック");
+                });
+                for _ in 1..threads {
+                    s.spawn(|| {
+                        while !stop.load(Relaxed) && started.elapsed() < give_up {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    });
+                }
+            });
+        }));
+        assert_eq!(result.is_err(), panics, "パニックは呼び出し元に伝わる");
+        assert_eq!(
+            stop.load(Relaxed),
+            panics,
+            "停止フラグはパニックのときだけ立つ"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "すぐ止まる");
+    }
+
+    /// どの1文字でも、見つかった鍵は ed25519-dalek で計算し直しても一致する
+    #[rstest]
+    fn found_key_really_matches(
+        #[values(Backend::Fast, Backend::ConstantTime)] backend: Backend,
+        #[values(false, true)] case_sensitive: bool,
+    ) {
+        check(2, "[A-Za-z0-9+/]", |c| {
+            let cfg = SearchConfig {
+                threads: 2,
+                backend,
+                time_limit: Some(Duration::from_secs(10)),
+                ..SearchConfig::new(Some(Pattern::new(&c, case_sensitive).unwrap()))
+            };
+            let key = run(&cfg, |_| {}).key.expect("1文字ならすぐ見つかる");
+            let recomputed = VanityKey::from_seed(*key.seed()).public_b64();
+            prop_assert!(cfg.pattern.unwrap().is_match(&recomputed));
+            Ok(())
+        });
+    }
+}

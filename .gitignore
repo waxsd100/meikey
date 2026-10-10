@@ -1,0 +1,12 @@
+/target
+
+# 生成した鍵をうっかりコミットしないように
+id_ed25519*
+*.pub
+/out
+
+# cargo make mutants の出力
+/mutants.out*/
+
+# IDE（RustRover）の各自の設定
+/.idea/

@@ -1,0 +1,75 @@
+# cargo-make のタスク（cargo install cargo-make で入れる）
+#
+#   cargo make                          # CI と同じ確認（整形・clippy・全テスト）
+#   cargo make test                     # 全テスト（引数はそのまま cargo nextest run に渡る）
+#   cargo make test --lib               #   ユニットテストだけ
+#   cargo make test --test it           #   IT だけ
+#   cargo make proptest-deep            # proptest の試行回数を100倍にして全テスト
+#   cargo make mutants                  # ミューテーションテスト
+#   cargo make run wakokara --bench 10  # 速度と期待時間を測る
+#   cargo make run wakokara -C wakokara -o ~/.ssh/id_ed25519_wakokara  # 鍵を探して書き出す
+#   cargo make build                    # 最適化ビルド（target/release/meikey）
+#   cargo make breakdown                # 1鍵あたりの計算時間を実装ごとに比べる
+#
+# run・build・breakdown は、実行するCPU向けに最適化（-C target-cpu=native）してビルドする。
+
+[config]
+skip_core_tasks = true
+
+[tasks.default]
+alias = "ci"
+
+[tasks.ci]
+description = "整形の確認・clippy・全テスト（nextest は doctest を回さないので cargo test --doc も）"
+dependencies = ["install-nextest"]
+script_runner = "@duckscript"
+script = '''
+exec --fail-on-error cargo fmt --all --check
+exec --fail-on-error cargo clippy --all-targets -- -D warnings
+exec --fail-on-error cargo nextest run
+exec --fail-on-error cargo test --doc
+'''
+
+[tasks.test]
+description = "全テスト（引数はそのまま cargo nextest run に渡る。設定は .config/nextest.toml）"
+dependencies = ["install-nextest"]
+command = "cargo"
+args = ["nextest", "run", "${@}"]
+
+[tasks.proptest-deep]
+description = "proptest の試行回数を MEIKEY_PROPTEST_SCALE 倍（既定 100）にして、最適化ビルドで全テスト"
+env = { MEIKEY_PROPTEST_SCALE = { value = "100", condition = { env_not_set = ["MEIKEY_PROPTEST_SCALE"] } } }
+dependencies = ["install-nextest"]
+command = "cargo"
+args = ["nextest", "run", "--cargo-profile", "proptest", "--profile", "deep", "${@}"]
+
+# main.rs（CLI の配線）は IT で確かめているので対象外（変異ごとに IT まで回すと遅い）
+[tasks.mutants]
+description = "本体を少しずつ壊して、ユニットテストが検出できるか調べる"
+env = { MEIKEY_PROPTEST_SCALE = "0.1" }
+dependencies = ["install-nextest"]
+command = "cargo"
+args = ["mutants", "--test-tool", "nextest", "--jobs", "2", "--exclude", "src/main.rs", "${@}", "--", "--lib"]
+
+[tasks.run]
+description = "最適化ビルドで meikey を実行する（引数はそのまま meikey に渡る）"
+env = { RUSTFLAGS = "-C target-cpu=native" }
+command = "cargo"
+args = ["run", "--release", "--quiet", "--", "${@}"]
+
+[tasks.build]
+description = "最適化ビルド（target/release/meikey）"
+env = { RUSTFLAGS = "-C target-cpu=native" }
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.breakdown]
+description = "1鍵あたりの計算時間を実装ごとに比べる"
+env = { RUSTFLAGS = "-C target-cpu=native" }
+command = "cargo"
+args = ["run", "--release", "--quiet", "--example", "breakdown"]
+
+[tasks.install-nextest]
+private = true
+install_crate = { crate_name = "cargo-nextest", binary = "cargo", test_arg = ["nextest", "--version"] }
+install_crate_args = ["--locked"]

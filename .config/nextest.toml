@@ -1,0 +1,40 @@
+# cargo-nextest の設定（`cargo make` / `cargo make test` と、RustRover のテストランナー「nextest」で使われる）
+#
+# nextest はテストを1つずつ別のプロセスで並列に走らせる。ユニットテストと IT のバイナリをまたいで
+# 空いたコアに次々とテストを割り当てるので、コアの多いマシンで速い。どのテストが遅いか・止まったかもすぐ分かる。
+
+# テストの優先度（priority）は 0.9.91 から
+nextest-version = { required = "0.9.91" }
+
+[profile.default]
+# 15 秒を超えたテストは SLOW と表示し、60 秒（15 秒 × 4）で打ち切る（探索が止まらない、などのバグ）
+slow-timeout = { period = "15s", terminate-after = 4 }
+
+# 時間のかかるテスト（nextest で 1 件 0.2〜0.6 秒）を先に始める。
+# コアが多いと全体が 1 秒ほどで終わるので、遅いテストが最後に回ると、それだけを待つ時間ができる
+[[profile.default.overrides]]
+filter = '''
+    test(/^derive::tests::conformance::(implementations_agree|outputs_are_canonical_points_of_order_l)::/)
+    | test(/^field::tests::(arithmetic_matches_bigint|batch_invert_gives_inverses)::/)
+    | test(=field::tests::sums_of_results_can_be_multiplied)
+    | test(/^comb::tests::(add_niels_matches_rfc_point_add|mul_base_matches)::/)
+    | test(/^keys_work::tests::(sshd_accepts_only_the_registered_key|ssh_keygen_restores_public_key_and_comment)::/)
+'''
+priority = 100
+
+# 時間を測るテスト（進捗の間隔・時間制限で止まるか）。マシンが混んでいると稀に外れるので、1 回だけやり直す
+[[profile.default.overrides]]
+filter = 'test(/^search::tests::(progress_timing|stops_at_time_limit)::/)'
+retries = 1
+
+# CI 用（cargo nextest run --profile ci）: 失敗しても最後まで回し、結果を JUnit 形式でも残す
+# （target/nextest/ci/junit.xml）
+[profile.ci]
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# cargo make proptest-deep 用: 試行回数を増やすと 1 件が長くなるので、打ち切らない
+[profile.deep]
+slow-timeout = { period = "60s" }
