@@ -3,16 +3,26 @@
 //! `s * B` を `Σ d_i * (2^(W*i) * B)` として計算する。各 `d_i * 2^(W*i) * B` は表から直接引くので、
 //! 倍算は加算 `ROWS` 回だけで済み、倍加は不要。テーブルのアクセス位置が秘密に依存する
 //! （＝定数時間ではない）ため、探索の高速化専用。
+//!
+//! 複数の鍵をまとめて、表の1行ずつ処理する（[`Table::mul_base_batch`]）。表全体は数MBあるが、
+//! 同時に使うのは1行（数百KB）だけなので、全コアで回してもキャッシュに収まりやすい。
 
 use crate::field::Fe;
 use std::sync::LazyLock;
 
-/// 1桁のビット数（5〜12 で計測して 8 に決めた。8〜11 で頭打ちになったので、テーブルが L2 キャッシュに収まる 8 にした）
-pub const W: usize = 8;
+/// 1桁のビット数（8〜14 で計測して 12 に決めた。13 は全スレッドではわずかに速いが、1スレッドでは遅く、テーブルも倍近くになる）
+pub const W: usize = 12;
 /// 桁数。クランプ済みスカラーは 2^255 未満なので floor(255/W)+1 桁で足りる
-const ROWS: usize = 255 / W + 1;
+pub(crate) const ROWS: usize = 255 / W + 1;
 /// 1行のエントリ数（0..=2^(W-1)。負の桁は符号反転で表す）
-const COLS: usize = (1 << (W - 1)) + 1;
+pub(crate) const COLS: usize = (1 << (W - 1)) + 1;
+/// 桁の絶対値の上限 2^(W-1)
+const HALF: i32 = 1 << (W - 1);
+
+// 桁は i16 に入れる。最上位桁は繰り上げないので、2^255 未満の値の残りのビットに
+// 下からの繰り上がり 1 を足しても 2^(W-1) 以下（＝表の範囲内）に収まる必要がある
+const _: () = assert!(W >= 2 && W <= 15);
+const _: () = assert!(255 - W * (ROWS - 1) < W);
 
 /// 2d（d はエドワーズ曲線の係数 -121665/121666）
 const D2: Fe = Fe([
@@ -165,21 +175,34 @@ pub fn compress_with_zinv(p: &Extended, z_inv: Fe) -> [u8; 32] {
     y
 }
 
-/// 前計算テーブル: `TABLE[i][k] = k * 2^(W*i) * B`
-pub struct Table(Box<[[Niels; COLS]; ROWS]>);
+/// 前計算テーブル: `row(i)[k] = k * 2^(W*i) * B`。
+/// 1行が大きい（W = 12 で約 240KB）ので、スタックに置かないよう1本の Vec に並べている
+pub struct Table(Box<[Niels]>);
 
 impl Table {
-    /// プロセスで1つだけ作って共有する（約 500KB、作成は数十ミリ秒）
+    /// プロセスで1つだけ作って共有する（W = 12 で約 5.4MB、作成は最適化ビルドで約 10ms）
     pub fn get() -> &'static Table {
         static TABLE: LazyLock<Table> = LazyLock::new(Table::build);
         &TABLE
     }
 
-    fn build() -> Table {
-        let mut rows = vec![[Niels::IDENTITY; COLS]; ROWS];
+    #[inline(always)]
+    fn row(&self, i: usize) -> &[Niels; COLS] {
+        &self.0.as_chunks::<COLS>().0[i]
+    }
+
+    /// `i` 行目の `k` 番目のエントリ `[y+x, y-x, 2dxy]`（AVX2 用のテーブルを作るときに使う）
+    pub(crate) fn entry(&self, i: usize, k: usize) -> [Fe; 3] {
+        let n = self.row(i)[k];
+        [n.ypx, n.ymx, n.xy2d]
+    }
+
+    pub(crate) fn build() -> Table {
+        let mut entries = vec![Niels::IDENTITY; ROWS * COLS];
         // 各行の基準点 2^(W*i) * B（アフィン）
         let (mut bx, mut by) = (BX, BY);
-        for row in rows.iter_mut() {
+        let mut scratch = Vec::new();
+        for row in entries.as_chunks_mut::<COLS>().0 {
             let base = Niels::from_affine(bx, by);
             let mut acc = Extended::IDENTITY;
             let mut multiples = Vec::with_capacity(COLS);
@@ -189,7 +212,7 @@ impl Table {
             }
             // 1/Z をまとめて計算してアフィンにする
             let mut zs: Vec<Fe> = multiples.iter().map(|p| p.z).collect();
-            Fe::batch_invert(&mut zs, &mut Vec::new());
+            Fe::batch_invert(&mut zs, &mut scratch);
             for (k, (p, zi)) in multiples.iter().zip(zs).enumerate() {
                 row[k + 1] = Niels::from_affine(p.x * zi, p.y * zi);
             }
@@ -200,46 +223,74 @@ impl Table {
                 .add_niels(&Niels::from_affine(hx, hy))
                 .to_affine();
         }
-        Table(rows.into_boxed_slice().try_into().expect("ROWS 行"))
+        Table(entries.into_boxed_slice())
     }
 
-    /// `clamp(scalar) * B`（scalar はリトルエンディアン、クランプ済みであること）
-    #[inline]
+    /// `scalars[k] * B` を `out[k]` に（scalar はリトルエンディアン、2^255 未満であること）。
     ///
+    /// 鍵ごとに倍算を終わらせるのではなく、表の1行目を全部の鍵に足し、次に2行目を…と1行ずつ進める。
+    /// 同時に使う表が1行だけになるので、表全体がキャッシュに収まらなくても速い。
     /// 戻り値の T は計算していない（圧縮には X, Y, Z だけ使う）。
-    pub fn mul_base(&self, scalar: &[u8; 32]) -> Extended {
-        let digits = signed_digits(scalar);
-        let entry = |i: usize| {
-            let d = digits[i];
-            let p = self.0[i][d.unsigned_abs() as usize];
+    pub fn mul_base_batch<const N: usize>(&self, scalars: &[[u8; 32]; N], out: &mut [Extended; N]) {
+        // digits[i][k] = k 番目の鍵の i 桁目（行ごとに鍵を順に読めるよう転置しておく）
+        let mut digits = [[0i16; N]; ROWS];
+        for (k, s) in scalars.iter().enumerate() {
+            for (i, d) in signed_digits(s).into_iter().enumerate() {
+                digits[i][k] = d;
+            }
+        }
+        let entry = |row: &[Niels; COLS], d: i16| {
+            let p = row[usize::from(d.unsigned_abs())];
             if d < 0 { p.neg() } else { p }
         };
+
         // 最初の桁は単位元への加算なので、表の値をそのまま座標にする
-        let mut acc = entry(0).to_extended();
-        for (i, &d) in digits.iter().enumerate().take(ROWS - 1).skip(1) {
-            if d != 0 {
-                acc = acc.add_niels(&entry(i));
+        let row = self.row(0);
+        for (acc, &d) in out.iter_mut().zip(&digits[0]) {
+            *acc = entry(row, d).to_extended();
+        }
+        for (i, ds) in digits.iter().enumerate().take(ROWS - 1).skip(1) {
+            let row = self.row(i);
+            for (acc, &d) in out.iter_mut().zip(ds) {
+                if d != 0 {
+                    *acc = acc.add_niels(&entry(row, d));
+                }
             }
         }
         // 最上位桁（クランプで 2^254 のビットが立つので通常 0 ではない。0 でも単位元の加算になるだけ）
-        acc.add_niels_last(&entry(ROWS - 1))
+        let row = self.row(ROWS - 1);
+        for (acc, &d) in out.iter_mut().zip(&digits[ROWS - 1]) {
+            *acc = acc.add_niels_last(&entry(row, d));
+        }
     }
 }
 
-/// スカラーを符号付き 256 進の桁（-128 ≤ d < 128、最上位桁のみ 0 ≤ d ≤ 128）に分解する。
-/// 1桁 = 1バイトなので、各バイトに下の桁からの繰り上がりを足し、128 以上なら 256 を引いて上へ繰り上げる
+/// スカラーを符号付き 2^W 進の桁（-2^(W-1) ≤ d < 2^(W-1)、最上位桁のみ 0 ≤ d ≤ 2^(W-1)）に分解する。
+/// 下の桁から W ビットずつ取り出して繰り上がりを足し、2^(W-1) 以上なら 2^W を引いて上へ繰り上げる
 #[inline(always)]
-fn signed_digits(s: &[u8; 32]) -> [i16; ROWS] {
-    const _: () = assert!(W == 8 && ROWS == 32, "1桁 = 1バイトとして分解している");
-    let mut out = [0i16; ROWS];
-    let mut carry = 0i16;
-    for (o, &b) in out.iter_mut().zip(s) {
-        let v = i16::from(b) + carry;
-        carry = (v + 128) >> 8;
-        *o = v - (carry << 8);
+pub(crate) fn signed_digits(s: &[u8; 32]) -> [i16; ROWS] {
+    // 5語目は、最後の桁が4語目からはみ出して読むときの 0
+    let mut words = [0u64; 5];
+    for (w, c) in words.iter_mut().zip(s.as_chunks::<8>().0) {
+        *w = u64::from_le_bytes(*c);
     }
-    // 2^255 未満なので最上位バイトは 0x7f 以下。繰り上がりを足しても 128 以下に収まる
-    out[ROWS - 1] += carry << 8;
+    let mut out = [0i16; ROWS];
+    let mut carry = 0i32;
+    for (i, o) in out.iter_mut().enumerate() {
+        let (q, r) = (i * W / 64, i * W % 64);
+        let mut bits = words[q] >> r;
+        if r + W > 64 {
+            bits |= words[q + 1] << (64 - r);
+        }
+        let v = (bits & ((1 << W) - 1)) as i32 + carry;
+        if i == ROWS - 1 {
+            // 最上位桁は繰り上げない（ファイル先頭の assert により 2^(W-1) 以下）
+            *o = v as i16;
+        } else {
+            carry = (v + HALF) >> W;
+            *o = (v - (carry << W)) as i16;
+        }
+    }
     out
 }
 
@@ -253,6 +304,34 @@ mod tests {
 
     fn compress(p: &Extended) -> [u8; 32] {
         compress_with_zinv(p, p.z.invert())
+    }
+
+    /// 1鍵だけの倍算（テストでは本番と同じ mul_base_batch を N = 1 で通す）
+    fn mul_base(s: &[u8; 32]) -> Extended {
+        let mut out = [Extended::IDENTITY];
+        Table::get().mul_base_batch(&[*s], &mut out);
+        out[0]
+    }
+
+    /// 桁が範囲内（最上位以外は -2^(W-1)〜2^(W-1)-1、最上位は 0〜2^(W-1)）
+    fn digits_in_range(d: &[i16; ROWS]) -> bool {
+        let half = HALF as i16;
+        d[..ROWS - 1].iter().all(|x| (-half..half).contains(x)) && (0..=half).contains(&d[ROWS - 1])
+    }
+
+    /// 桁から元の値に戻す（Σ d_i * 2^(W*i)）
+    fn reconstruct(d: &[i16; ROWS]) -> num_bigint::BigInt {
+        d.iter()
+            .rev()
+            .fold(num_bigint::BigInt::from(0), |acc, &x| (acc << W) + x)
+    }
+
+    /// 最上位以外の全桁（W ビットずつ）が `v` のスカラー
+    fn repeated_digit(v: u32) -> [u8; 32] {
+        let s = (0..ROWS - 1).fold(num_bigint::BigInt::from(0), |acc, i| {
+            acc + (num_bigint::BigInt::from(v) << (W * i))
+        });
+        rfc8032::to_le32(&s)
     }
 
     #[rstest]
@@ -279,26 +358,19 @@ mod tests {
     /// 境界のスカラー: 桁分解して戻すと元の値になり、倍算は curve25519-dalek・RFC 8032 の参照実装と一致する
     #[rstest]
     #[case::zero([0u8; 32])]
-    #[case::clamped_min({ let mut s = [0u8; 32]; s[31] = 0x40; s })] // 2^254
+    #[case::clamped_min({ let mut s = [0u8; 32]; s[31] = 0x40; s })] // 2^254（途中の桁はすべて 0）
     #[case::clamped_max(clamp_integer([0xff; 32]))] // 繰り上がりが最上位まで伝わる
-    #[case::all_digits_minus_128(clamp_integer([0x80; 32]))] // 各桁がちょうど繰り上がりの境界
-    #[case::all_digits_127(clamp_integer([0x7f; 32]))]
+    #[case::all_digits_half(repeated_digit(1 << (W - 1)))] // 各桁がちょうど繰り上がりの境界
+    #[case::all_digits_half_minus_1(repeated_digit((1 << (W - 1)) - 1))] // 境界の1つ手前（繰り上がらない）
+    #[case::all_digits_max(repeated_digit((1 << W) - 1))]
     #[case::ones({ let mut s = [0x01u8; 32]; s[0] = 0x08; s[31] = 0x41; s })]
-    #[case::max_below_2_255({ let mut s = [0xffu8; 32]; s[31] = 0x7f; s })] // 最上位桁がちょうど 128
+    #[case::max_below_2_255({ let mut s = [0xffu8; 32]; s[31] = 0x7f; s })] // 全桁で繰り上がる
     fn edge_scalars(#[case] s: [u8; 32]) {
         let d = signed_digits(&s);
-        assert!(
-            d[..ROWS - 1].iter().all(|&x| (-128..128).contains(&x)),
-            "{d:?}"
-        );
-        assert!((0..=128).contains(&d[ROWS - 1]), "{d:?}");
-        let back = d
-            .iter()
-            .rev()
-            .fold(num_bigint::BigInt::from(0), |acc, &x| (acc << 8) + x);
-        assert_eq!(back, rfc8032::from_le(&s), "桁分解");
+        assert!(digits_in_range(&d), "{d:?}");
+        assert_eq!(reconstruct(&d), rfc8032::from_le(&s), "桁分解");
 
-        let got = compress(&Table::get().mul_base(&s));
+        let got = compress(&mul_base(&s));
         let dalek = EdwardsPoint::mul_base(&curve25519_dalek::Scalar::from_bytes_mod_order(s));
         assert_eq!(got, dalek.compress().to_bytes(), "curve25519-dalek");
         assert_eq!(got, rfc8032::base_mul_encoded(&s), "RFC 8032 参照実装");
@@ -306,11 +378,11 @@ mod tests {
 
     #[rstest]
     fn niels_to_extended_is_same_point(
-        #[values(0, 3, 31)] row: usize,
-        #[values(0, 1, 2, 127, 128)] k: usize,
+        #[values(0, 3, ROWS - 1)] row: usize,
+        #[values(0, 1, 2, COLS - 2, COLS - 1)] k: usize,
         #[values(false, true)] negate: bool,
     ) {
-        let n = Table::get().0[row][k];
+        let n = Table::get().row(row)[k];
         let n = if negate { n.neg() } else { n };
         assert_eq!(
             compress(&n.to_extended()),
@@ -340,18 +412,18 @@ mod tests {
         Niels::from_affine(fe_of(&x), fe_of(&y))
     }
 
-    /// テーブルの全エントリ（32 行 × 129）を、参照実装で `k * 256^row * B` を計算して検算する
+    /// テーブルの全エントリ（22 行 × 2049）を、参照実装で `k * 2^(W*row) * B` を計算して検算する
     #[rstest]
     fn table_matches_rfc_reference_exhaustively(
         #[values(
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
         )]
         row: usize,
     ) {
-        let base = rfc8032::point_mul(&(num_bigint::BigInt::from(1) << (8 * row)), &rfc8032::G);
+        assert_eq!(ROWS, 22, "行を増減したら #[values] も合わせる");
+        let base = rfc8032::point_mul(&(num_bigint::BigInt::from(1) << (W * row)), &rfc8032::G);
         let mut acc = [0, 1, 1, 0].map(num_bigint::BigInt::from); // 単位元
-        for (k, entry) in Table::get().0[row].iter().enumerate() {
+        for (k, entry) in Table::get().row(row).iter().enumerate() {
             let got = compress(&Extended::IDENTITY.add_niels(entry));
             assert_eq!(got, rfc8032::point_compress(&acc), "row {row}, k {k}");
             acc = rfc8032::point_add(&acc, &base);
@@ -381,20 +453,15 @@ mod tests {
         }
     }
 
-    /// 符号付き 256 進の桁に分解して戻すと元の値（各桁は範囲内）
+    /// 符号付き 2^W 進の桁に分解して戻すと元の値（各桁は範囲内）
     #[rstest]
     fn signed_digits_reconstruct_any_scalar(
         #[values(Scalars::Clamped, Scalars::Below2_255)] scalars: Scalars,
     ) {
         check(1024, scalars.strategy(), |s| {
             let d = signed_digits(&s);
-            prop_assert!(d[..ROWS - 1].iter().all(|&x| (-128..128).contains(&x)));
-            prop_assert!((0..=128).contains(&d[ROWS - 1]));
-            let back = d
-                .iter()
-                .rev()
-                .fold(num_bigint::BigInt::from(0), |acc, &x| (acc << 8) + x);
-            prop_assert_eq!(back, rfc8032::from_le(&s));
+            prop_assert!(digits_in_range(&d), "{:?}", d);
+            prop_assert_eq!(reconstruct(&d), rfc8032::from_le(&s));
             Ok(())
         });
     }
@@ -431,7 +498,31 @@ mod tests {
         #[values(Scalars::Clamped, Scalars::Below2_255)] scalars: Scalars,
     ) {
         check(cases, scalars.strategy(), |s| {
-            prop_assert_eq!(compress(&Table::get().mul_base(&s)), reference.mul_base(&s));
+            prop_assert_eq!(compress(&mul_base(&s)), reference.mul_base(&s));
+            Ok(())
+        });
+    }
+
+    /// 1つのバッチに入れた鍵どうしは混ざらない。途中の桁が 0 で加算を飛ばす鍵（2^254 など）を
+    /// 混ぜても、どの位置の鍵も curve25519-dalek と一致する
+    #[rstest]
+    fn mul_base_batch_keeps_keys_separate(
+        #[values(Scalars::Clamped, Scalars::Below2_255)] scalars: Scalars,
+    ) {
+        let strategy = (
+            prop::collection::vec(scalars.strategy(), 8),
+            prop::collection::vec(any::<bool>(), 8),
+        );
+        check(64, strategy, |(random, sparse)| {
+            let mut sparse_scalar = [0u8; 32];
+            sparse_scalar[31] = 0x40; // 2^254: 途中の桁がすべて 0
+            let s: [[u8; 32]; 8] =
+                std::array::from_fn(|k| if sparse[k] { sparse_scalar } else { random[k] });
+            let mut out = [Extended::IDENTITY; 8];
+            Table::get().mul_base_batch(&s, &mut out);
+            for (k, (p, s)) in out.iter().zip(&s).enumerate() {
+                prop_assert_eq!(compress(p), Reference::Dalek.mul_base(s), "#{}", k);
+            }
             Ok(())
         });
     }

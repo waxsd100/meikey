@@ -4,8 +4,10 @@
 //! - [`pattern`] — 探す文字列と、公開鍵に含まれるかの判定（memmem と総当たりを切り替えられる）
 //! - [`search`] — 全コアで鍵を生成して当たりを探す
 //! - [`format`] — 件数・時間の表示
-//! - [`derive`] — シードから公開鍵をまとめて計算する（高速化ありと高速化前の計算を切り替えられる）
+//! - [`derive`] — シードから公開鍵をまとめて計算する（高速化ありと高速化前の計算を切り替えられる。x86_64 では AVX2 で4鍵ずつ同時に計算する）
 
+#[cfg(target_arch = "x86_64")]
+mod avx2;
 mod comb;
 pub mod derive;
 mod field;
@@ -13,8 +15,10 @@ pub mod format;
 pub mod key;
 pub mod pattern;
 pub mod search;
+#[cfg(target_arch = "x86_64")]
+mod sha512x4;
 
-pub use derive::{Backend, Compress, Mul};
+pub use derive::{Backend, Compress, Mul, Simd};
 pub use key::VanityKey;
 pub use pattern::{Find, Matcher, Pattern, PatternError};
 pub use search::{Outcome, SearchConfig, Stats};

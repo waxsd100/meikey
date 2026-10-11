@@ -2,12 +2,27 @@
 //!
 //! ed25519 の公開鍵は `clamp(SHA-512(seed)[..32]) * B` を圧縮したもの。
 //! 探索ではこれを [`BATCH`] 個ずつまとめて計算し、圧縮に必要な逆元を1回にまとめる。
+//! AVX2 に対応した CPU では、SHA-512 とテーブルの倍算を4鍵ずつ同時に計算する。
 
+#[cfg(target_arch = "x86_64")]
+use crate::avx2::{Avx2, Table4};
 use crate::comb::{self, Extended, Table};
 use crate::field::Fe;
 use curve25519_dalek::edwards::EdwardsPoint;
 use curve25519_dalek::scalar::clamp_integer;
 use sha2::{Digest, Sha512};
+
+/// x86_64 以外では AVX2 は使えない（値の無い型なので `Option<Avx2>` は常に `None`）
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+enum Avx2 {}
+
+#[cfg(not(target_arch = "x86_64"))]
+impl Avx2 {
+    fn detect() -> Option<Avx2> {
+        None
+    }
+}
 
 /// 一度にまとめて計算する鍵の数
 pub const BATCH: usize = 256;
@@ -15,20 +30,22 @@ pub const BATCH: usize = 256;
 pub type Seeds = [[u8; 32]; BATCH];
 pub type PublicKeys = [[u8; 32]; BATCH];
 
-/// 公開鍵の計算方法。2つの高速化を別々に切り替えられる（既定は両方あり）。
-/// 両方なしにすると、ed25519-dalek で1鍵ずつ計算する高速化前と同じ計算になる
+/// 公開鍵の計算方法。3つの高速化を別々に切り替えられる（既定は全部あり）。
+/// 全部なしにすると、ed25519-dalek で1鍵ずつ計算する高速化前と同じ計算になる
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Backend {
     /// 基点倍算
     pub mul: Mul,
     /// 圧縮（1/Z の計算）
     pub compress: Compress,
+    /// SIMD で4鍵ずつ同時に計算するか
+    pub simd: Simd,
 }
 
 /// 基点倍算 `s * B` の方法
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mul {
-    /// 自前の 8 ビット幅テーブルを直接引く（加算32回。可変時間なので探索専用）
+    /// 自前の 12 ビット幅テーブルを直接引く（加算22回。可変時間なので探索専用）
     #[default]
     Table,
     /// curve25519-dalek の定数時間実装（加算64回 + テーブルの全走査。タイミング攻撃に強いが遅い）
@@ -45,30 +62,60 @@ pub enum Compress {
     Each,
 }
 
+/// SIMD で4鍵ずつ同時に計算するか
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Simd {
+    /// CPU が AVX2 に対応していれば、SHA-512 と（[`Mul::Table`] のとき）倍算を4鍵ずつ同時に計算する。
+    /// 対応していなければ [`Simd::Off`] と同じ
+    #[default]
+    Avx2,
+    /// 1鍵ずつ計算する
+    Off,
+}
+
 impl Backend {
-    /// 両方の高速化あり（既定）
+    /// 全部の高速化あり（既定）
     pub const FAST: Backend = Backend {
         mul: Mul::Table,
         compress: Compress::Batch,
+        simd: Simd::Avx2,
     };
-    /// 両方の高速化なし（ed25519-dalek で1鍵ずつ計算するのと同じ）
+    /// 全部の高速化なし（ed25519-dalek で1鍵ずつ計算するのと同じ）
     pub const BASELINE: Backend = Backend {
         mul: Mul::ConstantTime,
         compress: Compress::Each,
+        simd: Simd::Off,
     };
-    /// すべての組み合わせ
-    pub const ALL: [Backend; 4] = [
-        Backend::FAST,
-        Backend {
-            mul: Mul::Table,
-            compress: Compress::Each,
-        },
-        Backend {
-            mul: Mul::ConstantTime,
-            compress: Compress::Batch,
-        },
-        Backend::BASELINE,
-    ];
+    /// すべての組み合わせ（FAST から BASELINE へ）
+    pub const ALL: [Backend; 8] = {
+        let (muls, compresses) = (
+            [Mul::Table, Mul::ConstantTime],
+            [Compress::Batch, Compress::Each],
+        );
+        let mut all = [Backend::FAST; 8];
+        let mut i = 0;
+        while i < 8 {
+            all[i] = Backend {
+                mul: muls[i / 2 % 2],
+                compress: compresses[i % 2],
+                simd: if i < 4 { Simd::Avx2 } else { Simd::Off },
+            };
+            i += 1;
+        }
+        all
+    };
+
+    /// このマシンで実際に AVX2 を使うか
+    pub fn uses_avx2(&self) -> bool {
+        self.avx2().is_some()
+    }
+
+    fn avx2(&self) -> Option<Avx2> {
+        match self.simd {
+            Simd::Avx2 => Avx2::detect(),
+            Simd::Off => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Backend {
@@ -81,13 +128,20 @@ impl std::fmt::Display for Backend {
             Compress::Batch => "まとめて",
             Compress::Each => "1鍵ずつ",
         };
-        write!(f, "倍算={mul}・圧縮={compress}")
+        let simd = match (self.simd, self.uses_avx2()) {
+            (Simd::Avx2, true) => "AVX2",
+            (Simd::Avx2, false) => "なし（CPU が AVX2 に非対応）",
+            (Simd::Off, _) => "なし",
+        };
+        write!(f, "倍算={mul}・圧縮={compress}・SIMD={simd}")
     }
 }
 
 /// スレッドごとに1つ持つ作業領域
 pub struct Deriver {
     backend: Backend,
+    /// AVX2 を使うとき Some
+    avx2: Option<Avx2>,
     points: Box<[Extended; BATCH]>,
     zs: Box<[Fe; BATCH]>,
     scratch: Vec<Fe>,
@@ -95,11 +149,22 @@ pub struct Deriver {
 
 impl Deriver {
     pub fn new(backend: Backend) -> Self {
+        let avx2 = backend.avx2();
         if backend.mul == Mul::Table {
-            Table::get(); // テーブル作成を探索開始前に済ませる
+            // テーブル作成を探索開始前に済ませる
+            match avx2 {
+                #[cfg(target_arch = "x86_64")]
+                Some(a) => {
+                    Table4::get(a);
+                }
+                _ => {
+                    Table::get();
+                }
+            }
         }
         Self {
             backend,
+            avx2,
             points: Box::new([Extended::IDENTITY; BATCH]),
             zs: Box::new([Fe::ZERO; BATCH]),
             scratch: Vec::with_capacity(BATCH),
@@ -107,16 +172,38 @@ impl Deriver {
     }
 
     pub fn public_keys(&mut self, seeds: &Seeds, out: &mut PublicKeys) {
+        let scalars = self.scalars(seeds);
         match self.backend.mul {
-            Mul::Table => self.table(seeds, out),
-            Mul::ConstantTime => constant_time(seeds, out, self.backend.compress),
+            Mul::Table => self.table(&scalars, out),
+            Mul::ConstantTime => constant_time(&scalars, out, self.backend.compress),
         }
     }
 
-    fn table(&mut self, seeds: &Seeds, out: &mut PublicKeys) {
-        let table = Table::get();
-        for ((seed, p), z) in seeds.iter().zip(&mut self.points).zip(&mut self.zs) {
-            *p = table.mul_base(&scalar(seed));
+    /// 全シードの秘密スカラー
+    fn scalars(&self, seeds: &Seeds) -> Seeds {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(avx2) = self.avx2 {
+            let mut out: Seeds = [[0u8; 32]; BATCH];
+            for (o, s) in out
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(seeds.as_chunks::<4>().0)
+            {
+                *o = crate::sha512x4::prefixes(avx2, s).map(clamp_integer);
+            }
+            return out;
+        }
+        std::array::from_fn(|i| scalar(&seeds[i]))
+    }
+
+    fn table(&mut self, scalars: &Seeds, out: &mut PublicKeys) {
+        match self.avx2 {
+            #[cfg(target_arch = "x86_64")]
+            Some(a) => Table4::get(a).mul_base_batch(a, scalars, &mut self.points),
+            _ => Table::get().mul_base_batch(scalars, &mut self.points),
+        }
+        for (p, z) in self.points.iter().zip(&mut self.zs) {
             *z = p.z;
         }
         match self.backend.compress {
@@ -129,19 +216,19 @@ impl Deriver {
     }
 }
 
-fn constant_time(seeds: &Seeds, out: &mut PublicKeys, compress: Compress) {
-    let point = |seed| EdwardsPoint::mul_base_clamped(scalar(seed));
+fn constant_time(scalars: &Seeds, out: &mut PublicKeys, compress: Compress) {
+    let point = |s: &[u8; 32]| EdwardsPoint::mul_base_clamped(*s);
     match compress {
         Compress::Batch => {
-            let points: [EdwardsPoint; BATCH] = std::array::from_fn(|i| point(&seeds[i]));
+            let points: [EdwardsPoint; BATCH] = std::array::from_fn(|i| point(&scalars[i]));
             let compressed = EdwardsPoint::compress_batch::<BATCH>(&points);
             for (o, c) in out.iter_mut().zip(compressed.iter()) {
                 *o = c.to_bytes();
             }
         }
         Compress::Each => {
-            for (o, seed) in out.iter_mut().zip(seeds) {
-                *o = point(seed).compress().to_bytes();
+            for (o, s) in out.iter_mut().zip(scalars) {
+                *o = point(s).compress().to_bytes();
             }
         }
     }
@@ -195,8 +282,13 @@ mod tests {
         #[case] batches: &[Batch],
         #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
         #[values(Compress::Batch, Compress::Each)] compress: Compress,
+        #[values(Simd::Avx2, Simd::Off)] simd: Simd,
     ) {
-        let mut d = Deriver::new(Backend { mul, compress });
+        let mut d = Deriver::new(Backend {
+            mul,
+            compress,
+            simd,
+        });
         let mut out: PublicKeys = [[0u8; 32]; BATCH];
         for (round, batch) in batches.iter().enumerate() {
             let seeds = batch.seeds();
@@ -211,16 +303,25 @@ mod tests {
         }
     }
 
-    /// --bench の表示。既定は両方の高速化あり、BASELINE は両方なし、ALL は4通りを1回ずつ
+    /// --bench の表示。既定は全部の高速化あり、BASELINE は全部なし、ALL は8通りを1回ずつ。
+    /// AVX2 に対応していない CPU では「SIMD=なし（CPU が AVX2 に非対応）」になる
     #[rstest]
-    #[case::fast(Backend::FAST, "倍算=テーブル・圧縮=まとめて")]
-    #[case::no_batch(Backend { mul: Mul::Table, compress: Compress::Each }, "倍算=テーブル・圧縮=1鍵ずつ")]
-    #[case::constant_time(Backend { mul: Mul::ConstantTime, compress: Compress::Batch }, "倍算=定数時間・圧縮=まとめて")]
-    #[case::baseline(Backend::BASELINE, "倍算=定数時間・圧縮=1鍵ずつ")]
+    #[case::fast(Backend::FAST, "倍算=テーブル・圧縮=まとめて・SIMD=AVX2")]
+    #[case::no_batch(Backend { compress: Compress::Each, ..Backend::FAST }, "倍算=テーブル・圧縮=1鍵ずつ・SIMD=AVX2")]
+    #[case::constant_time(Backend { mul: Mul::ConstantTime, ..Backend::FAST }, "倍算=定数時間・圧縮=まとめて・SIMD=AVX2")]
+    #[case::no_simd(Backend { simd: Simd::Off, ..Backend::FAST }, "倍算=テーブル・圧縮=まとめて・SIMD=なし")]
+    #[case::baseline(Backend::BASELINE, "倍算=定数時間・圧縮=1鍵ずつ・SIMD=なし")]
     fn backend_display(#[case] backend: Backend, #[case] want: &str) {
+        let want = if backend.simd == Simd::Avx2 && !backend.uses_avx2() {
+            want.replace("AVX2", "なし（CPU が AVX2 に非対応）")
+        } else {
+            want.to_string()
+        };
         assert_eq!(backend.to_string(), want);
         assert_eq!(Backend::ALL.iter().filter(|&&b| b == backend).count(), 1);
         assert_eq!(Backend::default(), Backend::FAST);
+        assert_eq!(Backend::ALL[0], Backend::FAST);
+        assert_eq!(Backend::ALL[7], Backend::BASELINE);
     }
 
     // ---- RFC 8032 Section 5.1.5 手順 1・2（SHA-512 とクランプ） ----
@@ -265,9 +366,9 @@ mod tests {
     mod conformance {
         use super::*;
 
-        fn derive(mul: Mul, compress: Compress, seeds: &Seeds) -> PublicKeys {
+        fn derive(backend: Backend, seeds: &Seeds) -> PublicKeys {
             let mut out: PublicKeys = [[0u8; 32]; BATCH];
-            Deriver::new(Backend { mul, compress }).public_keys(seeds, &mut out);
+            Deriver::new(backend).public_keys(seeds, &mut out);
             out
         }
 
@@ -289,7 +390,7 @@ mod tests {
         #[rstest]
         #[case::table_batch_first(Mul::Table, Compress::Batch, 0)]
         #[case::table_batch_second(Mul::Table, Compress::Batch, 1)]
-        #[case::table_batch_middle(Mul::Table, Compress::Batch, 128)]
+        #[case::table_batch_middle(Mul::Table, Compress::Batch, 130)]
         #[case::table_batch_last(Mul::Table, Compress::Batch, BATCH - 1)]
         #[case::table_each_first(Mul::Table, Compress::Each, 0)]
         #[case::table_each_last(Mul::Table, Compress::Each, BATCH - 1)]
@@ -301,12 +402,23 @@ mod tests {
             #[case] mul: Mul,
             #[case] compress: Compress,
             #[case] position: usize,
+            #[values(Simd::Avx2, Simd::Off)] simd: Simd,
             #[values("1", "2", "3", "1024", "SHA(abc)")] name: &str,
         ) {
             let v = rfc8032::vector(name);
             let mut seeds = filler_seeds();
             seeds[position] = v.secret;
-            assert_eq!(derive(mul, compress, &seeds)[position], v.public);
+            assert_eq!(
+                derive(
+                    Backend {
+                        mul,
+                        compress,
+                        simd
+                    },
+                    &seeds
+                )[position],
+                v.public
+            );
         }
 
         /// 書き出しに使う VanityKey（ed25519-dalek）もテストベクタどおり
@@ -321,13 +433,21 @@ mod tests {
         fn section_7_1_all_vectors_in_one_batch(
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
+            #[values(Simd::Avx2, Simd::Off)] simd: Simd,
         ) {
             let vectors = rfc8032::vectors();
             let mut seeds = filler_seeds();
             for (i, v) in vectors.iter().enumerate() {
                 seeds[i * 50] = v.secret;
             }
-            let out = derive(mul, compress, &seeds);
+            let out = derive(
+                Backend {
+                    mul,
+                    compress,
+                    simd,
+                },
+                &seeds,
+            );
             for (i, v) in vectors.iter().enumerate() {
                 assert_eq!(out[i * 50], v.public, "TEST {}", v.name);
             }
@@ -343,9 +463,17 @@ mod tests {
         fn implementations_agree(
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
+            #[values(Simd::Avx2, Simd::Off)] simd: Simd,
         ) {
             check(16, (seeds_strategy(), 0..BATCH), |(seeds, pick)| {
-                let got = derive(mul, compress, &seeds);
+                let got = derive(
+                    Backend {
+                        mul,
+                        compress,
+                        simd,
+                    },
+                    &seeds,
+                );
                 for (i, (seed, pk)) in seeds.iter().zip(&got).enumerate() {
                     prop_assert_eq!(
                         *pk,
@@ -369,11 +497,19 @@ mod tests {
         fn outputs_are_canonical_points_of_order_l(
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
+            #[values(Simd::Avx2, Simd::Off)] simd: Simd,
         ) {
             check(16, (any::<[u8; 32]>(), 0..BATCH), |(seed, position)| {
                 let mut seeds = filler_seeds();
                 seeds[position] = seed;
-                let pk = derive(mul, compress, &seeds)[position];
+                let pk = derive(
+                    Backend {
+                        mul,
+                        compress,
+                        simd,
+                    },
+                    &seeds,
+                )[position];
 
                 let point = rfc8032::point_decompress(&pk);
                 prop_assert!(point.is_some(), "Section 5.1.3 で復号できない: {:02x?}", pk);

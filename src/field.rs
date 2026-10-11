@@ -37,6 +37,22 @@ impl Fe {
 
     /// 正規化してリトルエンディアン32バイトに
     pub fn to_bytes(self) -> [u8; 32] {
+        let l = self.reduce();
+        let mut out = [0u8; 32];
+        let words = [
+            l[0] | l[1] << 51,
+            l[1] >> 13 | l[2] << 38,
+            l[2] >> 26 | l[3] << 25,
+            l[3] >> 39 | l[4] << 12,
+        ];
+        for (chunk, w) in out.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+            *chunk = w.to_le_bytes();
+        }
+        out
+    }
+
+    /// 正規化したリム（0 以上 p 未満の値で、各リム 2^51 未満）
+    pub fn reduce(self) -> [u64; 5] {
         let mut l = self.carry().0;
         // l < 2p なので、p 以上なら p を引く（l + 19 が 2^255 を超えるかで判定）
         let mut q = (l[0] + 19) >> 51;
@@ -54,18 +70,7 @@ impl Fe {
         l[4] += l[3] >> 51;
         l[3] &= MASK;
         l[4] &= MASK;
-
-        let mut out = [0u8; 32];
-        let words = [
-            l[0] | l[1] << 51,
-            l[1] >> 13 | l[2] << 38,
-            l[2] >> 26 | l[3] << 25,
-            l[3] >> 39 | l[4] << 12,
-        ];
-        for (chunk, w) in out.as_chunks_mut::<8>().0.iter_mut().zip(words) {
-            *chunk = w.to_le_bytes();
-        }
-        out
+        l
     }
 
     /// 各リムを 2^51 + α に収める

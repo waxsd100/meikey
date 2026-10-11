@@ -1,5 +1,5 @@
 use clap::Parser;
-use meikey::{Compress, Find, Mul, Pattern, SearchConfig, Stats, VanityKey, format, search};
+use meikey::{Compress, Find, Mul, Pattern, SearchConfig, Simd, Stats, VanityKey, format, search};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,15 +36,20 @@ struct Cli {
     #[arg(long, value_name = "SECS", value_parser = parse_secs, allow_negative_numbers = true)]
     bench: Option<Duration>,
 
-    /// 基点倍算に定数時間の実装（curve25519-dalek）を使う（高速化前の倍算）。約3倍遅いが、
+    /// 基点倍算に定数時間の実装（curve25519-dalek）を使う（高速化前の倍算）。数倍遅いが、
     /// 同じマシン上の他プロセスからキャッシュのタイミングで秘密鍵を推測される余地をなくす
     #[arg(long)]
     constant_time: bool,
 
     /// 圧縮の逆元を256鍵でまとめず、1鍵ずつ計算する（高速化前の圧縮。比較用）。
-    /// --constant-time と両方付けると、ed25519-dalek で1鍵ずつ計算する高速化前と同じになる
+    /// --constant-time・--no-simd と全部付けると、ed25519-dalek で1鍵ずつ計算する高速化前と同じになる
     #[arg(long)]
     no_batch: bool,
+
+    /// AVX2 で4鍵ずつ同時に計算せず、1鍵ずつ計算する（高速化前の SHA-512 と倍算。比較用）。
+    /// CPU が AVX2 に対応していなければ、付けなくても1鍵ずつになる
+    #[arg(long)]
+    no_simd: bool,
 
     /// 公開鍵の中を memmem（SIMD の部分文字列検索）で探さず、1文字ずつずらして比べる
     /// （高速化前の検索。比較用）
@@ -75,6 +80,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.no_batch {
         config.backend.compress = Compress::Each;
+    }
+    if cli.no_simd {
+        config.backend.simd = Simd::Off;
     }
     if cli.no_memmem {
         config.find = Find::Naive;
