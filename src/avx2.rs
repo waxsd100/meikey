@@ -508,13 +508,9 @@ mod tests {
     use proptest::prelude::*;
     use rstest::rstest;
 
-    /// このマシンで AVX2 が使えなければテストを飛ばす（CI のマシンはどれも対応している）
+    /// このマシンで AVX2 が使えなければテストを飛ばす（MEIKEY_REQUIRE_SIMD に avx2 があれば失敗させる）
     fn avx2() -> Option<Avx2> {
-        let a = Avx2::detect();
-        if a.is_none() {
-            eprintln!("AVX2 に対応していない CPU なので飛ばします");
-        }
-        a
+        crate::simd_support::available("avx2", Avx2::detect())
     }
 
     /// 4レーンぶんのリム（lanes[k][i] = k 番目の元の i 番目のリム）から

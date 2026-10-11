@@ -25,9 +25,14 @@ fn main() {
     // 全角文字は {:<N} で揃わないので、名前は行末に置く
     println!("{base:>6.2} µs/鍵  (基準)    ed25519-dalek の SigningKey で1鍵ずつ");
 
-    // 高速化前（両方なし）から、1つずつ足して、両方ありまで
+    // 高速化前（全部なし）から、1つずつ足して、全部ありまで。CPU が対応していない SIMD は
+    // 下のものと同じ計算になるので飛ばす
     let mut publics = Vec::with_capacity(rounds * BATCH);
-    for backend in Backend::ALL.into_iter().rev() {
+    for backend in Backend::ALL
+        .into_iter()
+        .rev()
+        .filter(|b| b.simd.supported())
+    {
         let mut d = Deriver::new(backend);
         publics.clear();
         let s = Instant::now();

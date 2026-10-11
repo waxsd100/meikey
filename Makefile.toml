@@ -6,6 +6,7 @@
 #   cargo make test --test it           #   IT だけ
 #   cargo make proptest-deep            # proptest の試行回数を100倍にして全テスト
 #   cargo make mutants                  # ミューテーションテスト
+#   cargo make sde                      # Intel SDE で、この PC に無い命令セット（AVX-512 など）の経路もテスト
 #   cargo make run wakokara --bench 10  # 速度と期待時間を測る
 #   cargo make run wakokara -C wakokara -o ~/.ssh/id_ed25519_wakokara  # 鍵を探して書き出す
 #   cargo make build                    # 最適化ビルド（target/release/meikey）
@@ -50,6 +51,33 @@ env = { MEIKEY_PROPTEST_SCALE = "0.1" }
 dependencies = ["install-nextest"]
 command = "cargo"
 args = ["mutants", "--test-tool", "nextest", "--jobs", "2", "--exclude", "src/main.rs", "${@}", "--", "--lib"]
+
+# Intel SDE（Intel の命令エミュレーター）で CPU を3種類真似て、SIMD の経路のテストを回す。
+# AVX-512 に対応していない PC でも、AVX-512 IFMA・AVX-512F の経路を実際に実行して確かめられる。
+# 3種類それぞれで、その CPU にある命令セットを MEIKEY_REQUIRE_SIMD で必須にするので、黙って飛ばされない。
+# エミュレーションは遅いので、最適化したテスト用ビルド（proptest プロファイル）で回す。
+# SDE は https://www.intel.com/content/www/us/en/download/684897/ から入れ、環境変数 SDE に
+# sde64（Windows では sde.exe）のパスを入れておく
+[tasks.sde]
+description = "Intel SDE で Ice Lake サーバー（IFMA）・Skylake サーバー（AVX-512F）・Alder Lake（AVX2 まで）を真似て SIMD のテスト"
+dependencies = ["install-nextest"]
+script_runner = "@duckscript"
+script = '''
+sde = get_env SDE
+assert ${sde} "環境変数 SDE に Intel SDE（sde64 / sde.exe）のパスを入れてください"
+# CPU:その CPU で必須にする命令セット
+cases = array "icx:avx2,avx512,avx512-ifma" "skx:avx2,avx512" "adl:avx2"
+for case in ${cases}
+    parts = split ${case} :
+    cpu = array_get ${parts} 0
+    need = array_get ${parts} 1
+    echo "---- SDE -${cpu}（必須: ${need}）"
+    set_env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER "${sde} -${cpu} --"
+    set_env CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER "${sde} -${cpu} --"
+    set_env MEIKEY_REQUIRE_SIMD ${need}
+    exec --fail-on-error cargo nextest run --cargo-profile proptest --lib -E "test(/^(avx2|avx512|sha512x4|sha512x8|derive)::/)"
+end
+'''
 
 [tasks.run]
 description = "最適化ビルドで meikey を実行する（引数はそのまま meikey に渡る）"

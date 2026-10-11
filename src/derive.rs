@@ -2,27 +2,18 @@
 //!
 //! ed25519 の公開鍵は `clamp(SHA-512(seed)[..32]) * B` を圧縮したもの。
 //! 探索ではこれを [`BATCH`] 個ずつまとめて計算し、圧縮に必要な逆元を1回にまとめる。
-//! AVX2 に対応した CPU では、SHA-512 とテーブルの倍算を4鍵ずつ同時に計算する。
+//! x86_64 では CPU に合わせて、SHA-512 とテーブルの倍算を AVX-512 で8鍵ずつ（IFMA があれば
+//! 52 ビットの積和で）、AVX2 で4鍵ずつ同時に計算する。
 
 #[cfg(target_arch = "x86_64")]
 use crate::avx2::{Avx2, Table4};
+#[cfg(target_arch = "x86_64")]
+use crate::avx512::{self, Avx512, Ifma};
 use crate::comb::{self, Extended, Table};
 use crate::field::Fe;
 use curve25519_dalek::edwards::EdwardsPoint;
 use curve25519_dalek::scalar::clamp_integer;
 use sha2::{Digest, Sha512};
-
-/// x86_64 以外では AVX2 は使えない（値の無い型なので `Option<Avx2>` は常に `None`）
-#[cfg(not(target_arch = "x86_64"))]
-#[derive(Clone, Copy, Debug)]
-enum Avx2 {}
-
-#[cfg(not(target_arch = "x86_64"))]
-impl Avx2 {
-    fn detect() -> Option<Avx2> {
-        None
-    }
-}
 
 /// 一度にまとめて計算する鍵の数
 pub const BATCH: usize = 256;
@@ -30,7 +21,7 @@ pub const BATCH: usize = 256;
 pub type Seeds = [[u8; 32]; BATCH];
 pub type PublicKeys = [[u8; 32]; BATCH];
 
-/// 公開鍵の計算方法。3つの高速化を別々に切り替えられる（既定は全部あり）。
+/// 公開鍵の計算方法。高速化を別々に切り替えられる（既定は全部あり）。
 /// 全部なしにすると、ed25519-dalek で1鍵ずつ計算する高速化前と同じ計算になる
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Backend {
@@ -38,17 +29,17 @@ pub struct Backend {
     pub mul: Mul,
     /// 圧縮（1/Z の計算）
     pub compress: Compress,
-    /// SIMD で4鍵ずつ同時に計算するか
+    /// 何鍵ずつ同時に計算するか（使ってよい SIMD の上限）
     pub simd: Simd,
 }
 
 /// 基点倍算 `s * B` の方法
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mul {
-    /// 自前の 12 ビット幅テーブルを直接引く（加算22回。可変時間なので探索専用）
+    /// 自前の櫛形テーブルを直接引く（可変時間なので探索専用）
     #[default]
     Table,
-    /// curve25519-dalek の定数時間実装（加算64回 + テーブルの全走査。タイミング攻撃に強いが遅い）
+    /// curve25519-dalek の定数時間実装（タイミング攻撃に強いが遅い）
     ConstantTime,
 }
 
@@ -62,15 +53,93 @@ pub enum Compress {
     Each,
 }
 
-/// SIMD で4鍵ずつ同時に計算するか
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// 使ってよい SIMD の上限。CPU が対応していなければ、対応している中で一番上のものに下がる
+/// （上から Avx512Ifma → Avx512 → Avx2 → Off。x86_64 以外では常に Off）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Simd {
-    /// CPU が AVX2 に対応していれば、SHA-512 と（[`Mul::Table`] のとき）倍算を4鍵ずつ同時に計算する。
-    /// 対応していなければ [`Simd::Off`] と同じ
-    #[default]
-    Avx2,
-    /// 1鍵ずつ計算する
+    /// 1鍵ずつ（高速化前）
     Off,
+    /// AVX2 で4鍵ずつ（体演算は 25.5 ビット × 10 リム）
+    Avx2,
+    /// AVX-512F で8鍵ずつ（体演算は 25.5 ビット × 10 リム）
+    Avx512,
+    /// AVX-512 IFMA で8鍵ずつ（体演算は 51 ビット × 5 リムで、52 ビットの積和命令を使う）
+    #[default]
+    Avx512Ifma,
+}
+
+impl Simd {
+    /// 上から順に
+    pub const ALL: [Simd; 4] = [Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Simd::Avx512Ifma => "AVX-512 IFMA",
+            Simd::Avx512 => "AVX-512",
+            Simd::Avx2 => "AVX2",
+            Simd::Off => "なし",
+        }
+    }
+
+    /// この CPU で使えるか
+    pub fn supported(self) -> bool {
+        Lanes::detect(self).simd() == self
+    }
+
+    /// この上限で実際に使うもの
+    pub fn effective(self) -> Simd {
+        Lanes::detect(self).simd()
+    }
+}
+
+/// 実際に使う SIMD と、CPU が対応していることの証明
+#[derive(Debug, Clone, Copy)]
+enum Lanes {
+    #[cfg(target_arch = "x86_64")]
+    Ifma(Ifma),
+    #[cfg(target_arch = "x86_64")]
+    Avx512(Avx512),
+    #[cfg(target_arch = "x86_64")]
+    Avx2(Avx2),
+    Scalar,
+}
+
+impl Lanes {
+    /// `limit` 以下で、CPU が対応している中で一番上のもの
+    fn detect(limit: Simd) -> Lanes {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if limit >= Simd::Avx512Ifma
+                && let Some(i) = Ifma::detect()
+            {
+                return Lanes::Ifma(i);
+            }
+            if limit >= Simd::Avx512
+                && let Some(a) = Avx512::detect()
+            {
+                return Lanes::Avx512(a);
+            }
+            if limit >= Simd::Avx2
+                && let Some(a) = Avx2::detect()
+            {
+                return Lanes::Avx2(a);
+            }
+        }
+        let _ = limit;
+        Lanes::Scalar
+    }
+
+    fn simd(self) -> Simd {
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Ifma(_) => Simd::Avx512Ifma,
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Avx512(_) => Simd::Avx512,
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Avx2(_) => Simd::Avx2,
+            Lanes::Scalar => Simd::Off,
+        }
+    }
 }
 
 impl Backend {
@@ -78,7 +147,7 @@ impl Backend {
     pub const FAST: Backend = Backend {
         mul: Mul::Table,
         compress: Compress::Batch,
-        simd: Simd::Avx2,
+        simd: Simd::Avx512Ifma,
     };
     /// 全部の高速化なし（ed25519-dalek で1鍵ずつ計算するのと同じ）
     pub const BASELINE: Backend = Backend {
@@ -86,34 +155,40 @@ impl Backend {
         compress: Compress::Each,
         simd: Simd::Off,
     };
-    /// すべての組み合わせ（FAST から BASELINE へ）
-    pub const ALL: [Backend; 8] = {
-        let (muls, compresses) = (
-            [Mul::Table, Mul::ConstantTime],
-            [Compress::Batch, Compress::Each],
-        );
-        let mut all = [Backend::FAST; 8];
+    /// すべての組み合わせ（先頭が FAST、最後が BASELINE）
+    pub const ALL: [Backend; 16] = {
+        let muls = [Mul::Table, Mul::ConstantTime];
+        let compresses = [Compress::Batch, Compress::Each];
+        let mut all = [Backend::FAST; 16];
         let mut i = 0;
-        while i < 8 {
+        while i < 16 {
             all[i] = Backend {
-                mul: muls[i / 2 % 2],
-                compress: compresses[i % 2],
-                simd: if i < 4 { Simd::Avx2 } else { Simd::Off },
+                mul: muls[i / 8],
+                compress: compresses[(i / 4) % 2],
+                simd: Simd::ALL[i % 4],
             };
             i += 1;
         }
         all
     };
 
-    /// このマシンで実際に AVX2 を使うか
-    pub fn uses_avx2(&self) -> bool {
-        self.avx2().is_some()
-    }
-
-    fn avx2(&self) -> Option<Avx2> {
-        match self.simd {
-            Simd::Avx2 => Avx2::detect(),
-            Simd::Off => None,
+    /// 探索で使う表を作っておく（探索の時間に含めないため。2回目からは何もしない）
+    pub fn prepare(&self) {
+        if self.mul != Mul::Table {
+            return;
+        }
+        match Lanes::detect(self.simd) {
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Ifma(i) => avx512::ifma::prepare(i),
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Avx512(a) => avx512::f::prepare(a),
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Avx2(a) => {
+                Table4::get(a);
+            }
+            Lanes::Scalar => {
+                Table::get();
+            }
         }
     }
 }
@@ -128,20 +203,19 @@ impl std::fmt::Display for Backend {
             Compress::Batch => "まとめて",
             Compress::Each => "1鍵ずつ",
         };
-        let simd = match (self.simd, self.uses_avx2()) {
-            (Simd::Avx2, true) => "AVX2",
-            (Simd::Avx2, false) => "なし（CPU が AVX2 に非対応）",
-            (Simd::Off, _) => "なし",
-        };
-        write!(f, "倍算={mul}・圧縮={compress}・SIMD={simd}")
+        let used = self.simd.effective();
+        write!(f, "倍算={mul}・圧縮={compress}・SIMD={}", used.name())?;
+        if used != self.simd {
+            write!(f, "（{} は CPU が対応していません）", self.simd.name())?;
+        }
+        Ok(())
     }
 }
 
 /// スレッドごとに1つ持つ作業領域
 pub struct Deriver {
     backend: Backend,
-    /// AVX2 を使うとき Some
-    avx2: Option<Avx2>,
+    lanes: Lanes,
     points: Box<[Extended; BATCH]>,
     zs: Box<[Fe; BATCH]>,
     scratch: Vec<Fe>,
@@ -149,22 +223,10 @@ pub struct Deriver {
 
 impl Deriver {
     pub fn new(backend: Backend) -> Self {
-        let avx2 = backend.avx2();
-        if backend.mul == Mul::Table {
-            // テーブル作成を探索開始前に済ませる
-            match avx2 {
-                #[cfg(target_arch = "x86_64")]
-                Some(a) => {
-                    Table4::get(a);
-                }
-                _ => {
-                    Table::get();
-                }
-            }
-        }
+        backend.prepare();
         Self {
             backend,
-            avx2,
+            lanes: Lanes::detect(backend.simd),
             points: Box::new([Extended::IDENTITY; BATCH]),
             zs: Box::new([Fe::ZERO; BATCH]),
             scratch: Vec::with_capacity(BATCH),
@@ -181,27 +243,41 @@ impl Deriver {
 
     /// 全シードの秘密スカラー
     fn scalars(&self, seeds: &Seeds) -> Seeds {
-        #[cfg(target_arch = "x86_64")]
-        if let Some(avx2) = self.avx2 {
-            let mut out: Seeds = [[0u8; 32]; BATCH];
-            for (o, s) in out
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(seeds.as_chunks::<4>().0)
-            {
-                *o = crate::sha512x4::prefixes(avx2, s).map(clamp_integer);
+        let mut out: Seeds = [[0u8; 32]; BATCH];
+        match self.lanes {
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Ifma(i) => scalars_avx512(i.avx512(), seeds, &mut out),
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Avx512(a) => scalars_avx512(a, seeds, &mut out),
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Avx2(a) => {
+                for (o, s) in out
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(seeds.as_chunks::<4>().0)
+                {
+                    *o = crate::sha512x4::prefixes(a, s).map(clamp_integer);
+                }
             }
-            return out;
+            Lanes::Scalar => {
+                for (o, s) in out.iter_mut().zip(seeds) {
+                    *o = scalar(s);
+                }
+            }
         }
-        std::array::from_fn(|i| scalar(&seeds[i]))
+        out
     }
 
     fn table(&mut self, scalars: &Seeds, out: &mut PublicKeys) {
-        match self.avx2 {
+        match self.lanes {
             #[cfg(target_arch = "x86_64")]
-            Some(a) => Table4::get(a).mul_base_batch(a, scalars, &mut self.points),
-            _ => Table::get().mul_base_batch(scalars, &mut self.points),
+            Lanes::Ifma(i) => avx512::ifma::mul_base_batch(i, scalars, &mut self.points),
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Avx512(a) => avx512::f::mul_base_batch(a, scalars, &mut self.points),
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Avx2(a) => Table4::get(a).mul_base_batch(a, scalars, &mut self.points),
+            Lanes::Scalar => Table::get().mul_base_batch(scalars, &mut self.points),
         }
         for (p, z) in self.points.iter().zip(&mut self.zs) {
             *z = p.z;
@@ -213,6 +289,19 @@ impl Deriver {
         for ((p, z_inv), o) in self.points.iter().zip(&self.zs).zip(out) {
             *o = comb::compress_with_zinv(p, *z_inv);
         }
+    }
+}
+
+/// SHA-512 を AVX-512 で8シードずつ
+#[cfg(target_arch = "x86_64")]
+fn scalars_avx512(a: Avx512, seeds: &Seeds, out: &mut Seeds) {
+    for (o, s) in out
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip(seeds.as_chunks::<8>().0)
+    {
+        *o = crate::sha512x8::prefixes(a, s).map(clamp_integer);
     }
 }
 
@@ -282,7 +371,7 @@ mod tests {
         #[case] batches: &[Batch],
         #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
         #[values(Compress::Batch, Compress::Each)] compress: Compress,
-        #[values(Simd::Avx2, Simd::Off)] simd: Simd,
+        #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
     ) {
         let mut d = Deriver::new(Backend {
             mul,
@@ -303,25 +392,64 @@ mod tests {
         }
     }
 
-    /// --bench の表示。既定は全部の高速化あり、BASELINE は全部なし、ALL は8通りを1回ずつ。
-    /// AVX2 に対応していない CPU では「SIMD=なし（CPU が AVX2 に非対応）」になる
+    /// --bench の表示。SIMD は実際に使うものを表示し、上限より下がったときは理由も添える。
+    /// ALL は16通りを1回ずつ、先頭が既定（全部の高速化あり）、最後が BASELINE（全部なし）
     #[rstest]
-    #[case::fast(Backend::FAST, "倍算=テーブル・圧縮=まとめて・SIMD=AVX2")]
-    #[case::no_batch(Backend { compress: Compress::Each, ..Backend::FAST }, "倍算=テーブル・圧縮=1鍵ずつ・SIMD=AVX2")]
-    #[case::constant_time(Backend { mul: Mul::ConstantTime, ..Backend::FAST }, "倍算=定数時間・圧縮=まとめて・SIMD=AVX2")]
+    #[case::fast(Backend::FAST, "倍算=テーブル・圧縮=まとめて・SIMD=AVX-512 IFMA")]
+    #[case::no_batch(Backend { compress: Compress::Each, ..Backend::FAST }, "倍算=テーブル・圧縮=1鍵ずつ・SIMD=AVX-512 IFMA")]
+    #[case::constant_time(Backend { mul: Mul::ConstantTime, ..Backend::FAST }, "倍算=定数時間・圧縮=まとめて・SIMD=AVX-512 IFMA")]
+    #[case::avx512(Backend { simd: Simd::Avx512, ..Backend::FAST }, "倍算=テーブル・圧縮=まとめて・SIMD=AVX-512")]
+    #[case::avx2(Backend { simd: Simd::Avx2, ..Backend::FAST }, "倍算=テーブル・圧縮=まとめて・SIMD=AVX2")]
     #[case::no_simd(Backend { simd: Simd::Off, ..Backend::FAST }, "倍算=テーブル・圧縮=まとめて・SIMD=なし")]
     #[case::baseline(Backend::BASELINE, "倍算=定数時間・圧縮=1鍵ずつ・SIMD=なし")]
-    fn backend_display(#[case] backend: Backend, #[case] want: &str) {
-        let want = if backend.simd == Simd::Avx2 && !backend.uses_avx2() {
-            want.replace("AVX2", "なし（CPU が AVX2 に非対応）")
+    fn backend_display(#[case] backend: Backend, #[case] full: &str) {
+        let got = backend.to_string();
+        if backend.simd.supported() {
+            assert_eq!(got, full);
         } else {
-            want.to_string()
-        };
-        assert_eq!(backend.to_string(), want);
+            let (head, _) = full.split_once("SIMD=").unwrap();
+            let want = format!(
+                "{head}SIMD={}（{} は CPU が対応していません）",
+                backend.simd.effective().name(),
+                backend.simd.name()
+            );
+            assert_eq!(got, want);
+        }
         assert_eq!(Backend::ALL.iter().filter(|&&b| b == backend).count(), 1);
         assert_eq!(Backend::default(), Backend::FAST);
         assert_eq!(Backend::ALL[0], Backend::FAST);
-        assert_eq!(Backend::ALL[7], Backend::BASELINE);
+        assert_eq!(Backend::ALL[15], Backend::BASELINE);
+    }
+
+    /// 各 SIMD を「使える」と判定するのは、CPU がその命令セットに対応しているときだけ
+    /// （[`Simd::supported`] とは別に、命令セットの検出と直接比べる）
+    #[cfg(target_arch = "x86_64")]
+    #[rstest]
+    fn simd_support_matches_cpu() {
+        assert_eq!(Simd::Avx512Ifma.supported(), Ifma::detect().is_some());
+        assert_eq!(Simd::Avx512.supported(), Avx512::detect().is_some());
+        assert_eq!(Simd::Avx2.supported(), Avx2::detect().is_some());
+    }
+
+    /// SIMD の上限は、CPU が対応していなければ、対応している中で一番上のものに下がる
+    #[rstest]
+    fn simd_falls_back_to_best_supported(
+        #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] limit: Simd,
+    ) {
+        let used = limit.effective();
+        assert!(used <= limit && used.supported());
+        assert_eq!(limit.supported(), used == limit);
+        for s in Simd::ALL {
+            if used < s && s <= limit {
+                assert!(
+                    !s.supported(),
+                    "{s:?} に対応しているのに {used:?} に下がった"
+                );
+            }
+        }
+        assert!(Simd::Off.supported());
+        #[cfg(not(target_arch = "x86_64"))]
+        assert_eq!(used, Simd::Off);
     }
 
     // ---- RFC 8032 Section 5.1.5 手順 1・2（SHA-512 とクランプ） ----
@@ -402,7 +530,7 @@ mod tests {
             #[case] mul: Mul,
             #[case] compress: Compress,
             #[case] position: usize,
-            #[values(Simd::Avx2, Simd::Off)] simd: Simd,
+            #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
             #[values("1", "2", "3", "1024", "SHA(abc)")] name: &str,
         ) {
             let v = rfc8032::vector(name);
@@ -433,7 +561,7 @@ mod tests {
         fn section_7_1_all_vectors_in_one_batch(
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
-            #[values(Simd::Avx2, Simd::Off)] simd: Simd,
+            #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
         ) {
             let vectors = rfc8032::vectors();
             let mut seeds = filler_seeds();
@@ -463,7 +591,7 @@ mod tests {
         fn implementations_agree(
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
-            #[values(Simd::Avx2, Simd::Off)] simd: Simd,
+            #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
         ) {
             check(16, (seeds_strategy(), 0..BATCH), |(seeds, pick)| {
                 let got = derive(
@@ -497,7 +625,7 @@ mod tests {
         fn outputs_are_canonical_points_of_order_l(
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
-            #[values(Simd::Avx2, Simd::Off)] simd: Simd,
+            #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
         ) {
             check(16, (any::<[u8; 32]>(), 0..BATCH), |(seed, position)| {
                 let mut seeds = filler_seeds();

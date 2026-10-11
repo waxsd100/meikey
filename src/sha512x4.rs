@@ -7,7 +7,7 @@
 use crate::avx2::Avx2;
 use std::arch::x86_64::*;
 
-const K: [u64; 80] = [
+pub(crate) const K: [u64; 80] = [
     0x428a2f98d728ae22,
     0x7137449123ef65cd,
     0xb5c0fbcfec4d3b2f,
@@ -91,7 +91,7 @@ const K: [u64; 80] = [
 ];
 
 /// 初期値 H0〜H7
-const IV: [u64; 8] = [
+pub(crate) const IV: [u64; 8] = [
     0x6a09e667f3bcc908,
     0xbb67ae8584caa73b,
     0x3c6ef372fe94f82b,
@@ -231,8 +231,7 @@ mod tests {
     #[case::zero(Some([0u8; 32]))]
     #[case::ff(Some([0xffu8; 32]))]
     fn matches_sha2(#[case] fixed: Option<[u8; 32]>) {
-        let Some(avx2) = Avx2::detect() else {
-            eprintln!("AVX2 に対応していない CPU なので飛ばします");
+        let Some(avx2) = crate::simd_support::available("avx2", Avx2::detect()) else {
             return;
         };
         check(1024, any::<[[u8; 32]; 4]>(), |mut seeds| {

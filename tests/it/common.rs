@@ -38,7 +38,7 @@ pub enum Mode {
     Fast,
     /// `--constant-time`（倍算だけ高速化前）
     ConstantTime,
-    /// `--constant-time --no-batch --no-simd --no-memmem`（倍算も圧縮も SIMD も検索も高速化前）
+    /// `--constant-time --no-batch --simd off --no-memmem`（倍算も圧縮も SIMD も検索も高速化前）
     Baseline,
 }
 
@@ -47,7 +47,13 @@ impl Mode {
         match self {
             Mode::Fast => &[],
             Mode::ConstantTime => &["--constant-time"],
-            Mode::Baseline => &["--constant-time", "--no-batch", "--no-simd", "--no-memmem"],
+            Mode::Baseline => &[
+                "--constant-time",
+                "--no-batch",
+                "--simd",
+                "off",
+                "--no-memmem",
+            ],
         }
     }
 

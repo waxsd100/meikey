@@ -544,7 +544,7 @@ mod tests {
             .arg("-f")
             .arg(&key)));
         let restored =
-            ssh_format::parse_authorized_key(line.strip_suffix('\n').unwrap_or(&line)).unwrap();
+            ssh_format::parse_authorized_key(line.trim_end_matches(['\n', '\r'])).unwrap();
         assert_eq!(restored.public_key, v.public);
 
         // フィンガープリントは SHA-256(RFC 8709 の公開鍵 blob)
@@ -583,9 +583,8 @@ mod tests {
             let out = run(Command::new("ssh-keygen").arg("-y").arg("-f").arg(&private));
             // 改行だけを取る（trim_end だとコメント末尾の空白まで消える）
             let line = stdout(&out);
-            let restored =
-                ssh_format::parse_authorized_key(line.strip_suffix('\n').unwrap_or(&line))
-                    .map_err(TestCaseError::fail)?;
+            let restored = ssh_format::parse_authorized_key(line.trim_end_matches(['\n', '\r']))
+                .map_err(TestCaseError::fail)?;
             let public = ed25519_dalek::SigningKey::from_bytes(&seed)
                 .verifying_key()
                 .to_bytes();

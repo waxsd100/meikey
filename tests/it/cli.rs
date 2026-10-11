@@ -58,6 +58,7 @@ mod tests {
     #[case::bench_infinite(&["wako", "--bench", "inf"], &[], "0 より大きい秒数")]
     #[case::bench_nan(&["wako", "--bench", "NaN"], &[], "0 より大きい秒数")]
     #[case::bench_not_a_number(&["wako", "--bench", "abc"], &[], "は秒数ではありません")]
+    #[case::unknown_simd(&["wako", "--simd", "avx1024"], &[], "'--simd <LEVEL>'")]
     // コメントに改行（.pub が2行に割れる）
     #[case::comment_lf(&[PATTERN, "-C", "wako\nkara"], &[], "コメントに使えない文字")]
     #[case::comment_cr(&[PATTERN, "-C", "wako\rkara"], &[], "コメントに使えない文字")]
@@ -86,7 +87,7 @@ mod tests {
     #[rstest]
     #[case::version(&["--version"], &["meikey 0."], &[])]
     #[case::short_version(&["-V"], &["meikey 0."], &[])]
-    #[case::help(&["--help"], &["Usage: meikey", "--constant-time", "--no-batch", "--no-simd", "--no-memmem", "--bench <SECS>"], &[])]
+    #[case::help(&["--help"], &["Usage: meikey", "--constant-time", "--no-batch", "--simd <LEVEL>", "--no-memmem", "--bench <SECS>"], &[])]
     #[case::short_help(&["-h"], &["Usage: meikey"], &[])]
     // --bench は、どの組み合わせで測ったかを表示する
     #[case::bench_fast(
@@ -110,7 +111,7 @@ mod tests {
         &["1スレッド・倍算=定数時間・圧縮=まとめて・SIMD=", "・検索=memmem で0.1秒間"]
     )]
     #[case::bench_no_simd(
-        &["wakokara", "--bench", "0.1", "-j", "1", "--no-simd"],
+        &["wakokara", "--bench", "0.1", "-j", "1", "--simd", "off"],
         &["鍵/秒（1スレッド）"],
         &["1スレッド・倍算=テーブル・圧縮=まとめて・SIMD=なし・検索=memmem で0.1秒間"]
     )]
@@ -126,7 +127,7 @@ mod tests {
         &["で0.1秒間"]
     )]
     #[case::bench_baseline(
-        &["wakokara", "--bench", "0.1", "-j", "1", "--constant-time", "--no-batch", "--no-simd", "--no-memmem"],
+        &["wakokara", "--bench", "0.1", "-j", "1", "--constant-time", "--no-batch", "--simd", "off", "--no-memmem"],
         &["鍵/秒（1スレッド）"],
         &["1スレッド・倍算=定数時間・圧縮=1鍵ずつ・SIMD=なし・検索=総当たり で0.1秒間"]
     )]
@@ -150,6 +151,42 @@ mod tests {
                 "{want:?} が無い: {}",
                 stderr(&out)
             );
+        }
+        assert_eq!(files_in(dir.path()), BTreeMap::new(), "何も書かない");
+    }
+
+    /// `--check` は、各 SIMD に CPU が対応しているかと、`--simd` の上限で実際に使うもの（CPU が
+    /// 対応していなければ下がったもの）を表示する
+    #[rstest]
+    fn check_reports_simd_in_use(
+        #[values(
+            ("avx512-ifma", meikey::Simd::Avx512Ifma),
+            ("avx512", meikey::Simd::Avx512),
+            ("avx2", meikey::Simd::Avx2),
+            ("off", meikey::Simd::Off)
+        )]
+        level: (&str, meikey::Simd),
+    ) {
+        let (arg, limit) = level;
+        let (dir, out) = run_in_tempdir(&["--check", "--simd", arg], &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let err = stderr(&out);
+        let used = limit.effective();
+        assert!(err.contains(&format!("・SIMD={}", used.name())), "{err}");
+        for simd in meikey::Simd::ALL
+            .into_iter()
+            .filter(|&s| s != meikey::Simd::Off)
+        {
+            let line = err
+                .lines()
+                .find(|l| l.starts_with(&format!("- {}（", simd.name())))
+                .unwrap_or_else(|| panic!("{} の行が無い: {err}", simd.name()));
+            let want = match (simd == used, simd.supported()) {
+                (true, _) => "対応（使います）",
+                (false, true) => ": 対応",
+                (false, false) => "非対応",
+            };
+            assert!(line.ends_with(want), "{line}");
         }
         assert_eq!(files_in(dir.path()), BTreeMap::new(), "何も書かない");
     }

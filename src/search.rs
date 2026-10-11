@@ -66,6 +66,9 @@ pub struct Outcome {
 
 /// 探索を実行する。`on_progress` は呼び出し元スレッドで定期的に呼ばれる。
 pub fn run(config: &SearchConfig, mut on_progress: impl FnMut(Stats)) -> Outcome {
+    // 表（最適化ビルドで数十ミリ秒、テスト用のビルドでは数百ミリ秒）は計測の前に作っておく。
+    // 時間制限や速度に、表を作る時間を含めないため
+    config.backend.prepare();
     let stop = AtomicBool::new(false);
     let tries = AtomicU64::new(0);
     let found = OnceLock::new();

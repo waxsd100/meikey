@@ -9,8 +9,13 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(name = "meikey", version)]
 struct Cli {
+    /// 探索せずに、AVX2などの高速化機能が使えるか事前チェックして表示する
+    #[arg(long)]
+    check: bool,
+
     /// 公開鍵に入れたい文字列（A-Z a-z 0-9 + /、最大42文字）
-    target: String,
+    #[arg(required_unless_present = "check")]
+    target: Option<String>,
 
     /// 大文字小文字を区別する（英字8文字なら256倍遅くなる）
     #[arg(short = 's', long)]
@@ -42,19 +47,40 @@ struct Cli {
     constant_time: bool,
 
     /// 圧縮の逆元を256鍵でまとめず、1鍵ずつ計算する（高速化前の圧縮。比較用）。
-    /// --constant-time・--no-simd と全部付けると、ed25519-dalek で1鍵ずつ計算する高速化前と同じになる
+    /// --constant-time・--simd off・--no-memmem と全部付けると、ed25519-dalek で1鍵ずつ計算する高速化前と同じになる
     #[arg(long)]
     no_batch: bool,
 
-    /// AVX2 で4鍵ずつ同時に計算せず、1鍵ずつ計算する（高速化前の SHA-512 と倍算。比較用）。
-    /// CPU が AVX2 に対応していなければ、付けなくても1鍵ずつになる
-    #[arg(long)]
-    no_simd: bool,
+    /// 使う SIMD の上限（比較用）。CPU が対応していなければ、対応している中で一番上のものに下がる。
+    /// avx512-ifma・avx512 は8鍵ずつ、avx2 は4鍵ずつ同時に計算し、off は1鍵ずつ（高速化前の SHA-512 と倍算）
+    #[arg(long, value_enum, value_name = "LEVEL", default_value_t = SimdArg::Avx512Ifma)]
+    simd: SimdArg,
 
     /// 公開鍵の中を memmem（SIMD の部分文字列検索）で探さず、1文字ずつずらして比べる
     /// （高速化前の検索。比較用）
     #[arg(long)]
     no_memmem: bool,
+}
+
+/// `--simd` の値
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SimdArg {
+    #[value(name = "avx512-ifma")]
+    Avx512Ifma,
+    Avx512,
+    Avx2,
+    Off,
+}
+
+impl From<SimdArg> for Simd {
+    fn from(s: SimdArg) -> Simd {
+        match s {
+            SimdArg::Avx512Ifma => Simd::Avx512Ifma,
+            SimdArg::Avx512 => Simd::Avx512,
+            SimdArg::Avx2 => Simd::Avx2,
+            SimdArg::Off => Simd::Off,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -69,9 +95,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let pattern = Pattern::new(&cli.target, cli.case_sensitive)?;
-    meikey::key::check_comment(&cli.comment)?;
-    let mut config = SearchConfig::new(Some(pattern.clone()));
+    let mut config = SearchConfig::new(None);
     if let Some(n) = cli.threads {
         config.threads = n.into();
     }
@@ -81,19 +105,28 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.no_batch {
         config.backend.compress = Compress::Each;
     }
-    if cli.no_simd {
-        config.backend.simd = Simd::Off;
-    }
+    config.backend.simd = cli.simd.into();
     if cli.no_memmem {
         config.find = Find::Naive;
     }
+
+    if cli.check {
+        check_features(&config);
+        return Ok(());
+    }
+
+    let target = cli.target.as_ref().unwrap();
+    let pattern = Pattern::new(target, cli.case_sensitive)?;
+    meikey::key::check_comment(&cli.comment)?;
+    config.pattern = Some(pattern.clone());
+
+    check_features(&config);
 
     match cli.bench {
         Some(limit) => bench(config, &pattern, limit),
         None => generate(cli, config, &pattern),
     }
 }
-
 /// 0 より大きい秒数（小数可）
 fn parse_secs(s: &str) -> Result<Duration, String> {
     let secs: f64 = s
@@ -248,4 +281,26 @@ fn write_file(path: &Path, content: &str, mode: u32, overwrite: bool) -> io::Res
     #[cfg(not(unix))]
     let _ = mode;
     opts.open(path)?.write_all(content.as_bytes())
+}
+
+fn check_features(config: &SearchConfig) {
+    eprintln!("高速化機能の対応状況:");
+    let used = config.backend.simd.effective();
+    for simd in Simd::ALL {
+        let what = match simd {
+            Simd::Avx512Ifma => "8鍵同時、52 ビットの積和で倍算",
+            Simd::Avx512 => "8鍵同時",
+            Simd::Avx2 => "4鍵同時",
+            Simd::Off => continue,
+        };
+        let state = match (simd == used, simd.supported()) {
+            (true, _) => "対応（使います）",
+            (false, true) => "対応",
+            (false, false) => "非対応",
+        };
+        eprintln!("- {}（{what}）: {state}", simd.name());
+    }
+    eprintln!("- 計算バックエンド: {}", config.backend);
+    eprintln!("- 検索アルゴリズム: {}", config.find);
+    eprintln!();
 }

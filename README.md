@@ -51,7 +51,8 @@ ssh-keygen -p -f ~/.ssh/id_ed25519_wakokara
 | `--bench SECS` | 探索せず速度だけ測る |
 | `--constant-time` | 基点倍算に定数時間の実装を使う（約5倍遅い。[安全性](#安全性)を参照） |
 | `--no-batch` | 圧縮の逆元を1鍵ずつ計算する（比較用） |
-| `--no-simd` | AVX2 を使わない（比較用） |
+| `--simd LEVEL` | 使う SIMD の上限（`avx512-ifma`・`avx512`・`avx2`・`off`。比較用）。既定は CPU が対応している一番上 |
+| `--check` | 使える SIMD と、実際に使うものを表示して終わる |
 | `--no-memmem` | 文字列を memmem で探さず総当たりで比べる（比較用） |
 
 ### 入れられる文字列
@@ -75,8 +76,34 @@ i7-12700K（20スレッド）で約600万 鍵/秒、1スレッドで約70万 鍵
 - **12ビット窓の櫛形テーブル**：`k × 2^(12i) × B` を起動時に作っておき、倍加なしの22回の加算で倍算します
 - **表の1行ずつ処理**：256鍵に表の1行目を足し、次に2行目を…と進め、同時に使う範囲を L2 キャッシュに収めます
 - **AVX2**：倍算（25.5ビット×10リムの体演算）と SHA-512 を4鍵ずつ同時に計算します。AVX2 のない CPU では自動で1鍵ずつになります
+- **AVX-512**：対応した CPU では8鍵ずつ同時に計算します（[下記](#avx-512)）。i7-12700K は AVX-512 に対応していないので AVX2 を使います
 - **一括逆元**：圧縮に必要な 1/Z を256鍵ぶんまとめて1回の逆元で求めます
 - **memmem**：base64 の中の文字列を [memchr](https://crates.io/crates/memchr) の SIMD 検索で探します
+
+### AVX-512
+
+CPU が持っている乗算命令に合わせて、体演算を2通り用意しています。どちらも表引き（`vpgatherqq`）・
+負の桁の符号反転（マスクレジスタ）・SHA-512（回転は `vprorq`、Σ・Ch・Maj は `vpternlogq` の1命令）は共通です。
+
+| | 対象の CPU | 体演算 | 1回の乗算 |
+|---|---|---|---|
+| AVX-512 IFMA | Intel Ice Lake・Sapphire Rapids 以降、AMD Zen 4 以降 | 51ビット×5リム、`vpmadd52luq`/`vpmadd52huq`（52×52→104ビットの積和） | 積和 50 命令 |
+| AVX-512F | Skylake-SP・Cascade Lake | 25.5ビット×10リム、`vpmuludq`（AVX2 と同じ式を 512 ビットで） | 乗算 109 命令 |
+
+Xeon（Cascade Lake 2.8GHz、IFMA なし）の1スレッドで測った1鍵あたりの時間:
+
+| | AVX2 | AVX-512F |
+|---|---|---|
+| 基点倍算 | 約2.8µs | 約2.0µs |
+| SHA-512 | 約0.13µs | 約0.05µs |
+| 合計 | 約3.0µs | 約2.2µs |
+
+`-C target-cpu=native`（`cargo make run`）でビルドすると、AVX2 の経路も AVX-512VL の 32 本のレジスタや
+回転命令を使えるようになるので差は縮み、合計は約2.5µs → 約2.25µs（約1.1倍）です。
+
+IFMA は対応した CPU が手元に無いので、Intel SDE（命令のエミュレーター）で正しさだけを確かめています（`cargo make sde`）。
+速さは未計測ですが、llvm-mca の見積もりでは点の加算1回あたりのサイクル数が AVX2 の約4分の1（Ice Lake サーバー）〜
+約半分（Zen 4）です。
 
 当たりの鍵は書き出す前に ed25519-dalek で計算し直して確かめるので、高速化にバグがあっても誤った鍵は書きません。
 組み合わせごとの1鍵あたりの時間は `cargo make breakdown` で測れます。
@@ -96,6 +123,7 @@ i7-12700K（20スレッド）で約600万 鍵/秒、1スレッドで約70万 鍵
 | `cargo make test` | 全テストを [cargo-nextest](https://nexte.st/) で実行（引数は `cargo nextest run` に渡る） |
 | `cargo make proptest-deep` | proptest の試行回数を100倍にして全テスト |
 | `cargo make mutants` | [cargo-mutants](https://mutants.rs/) でミューテーションテスト |
+| `cargo make sde` | [Intel SDE](https://www.intel.com/content/www/us/en/download/684897/) で Ice Lake サーバー・Skylake サーバー・Alder Lake を真似て、SIMD の経路をテスト（環境変数 `SDE` に sde64 / sde.exe のパス） |
 | `cargo make run …` | 最適化ビルドで実行 |
 | `cargo make build` | 最適化ビルド（`target/release/meikey`） |
 | `cargo make breakdown` | 1鍵あたりの計算時間・検索時間を高速化の組み合わせごとに比較 |
@@ -114,19 +142,24 @@ src/
 ├── derive.rs    シード → 公開鍵を256個ずつ計算
 ├── comb.rs      櫛形テーブルによる固定基点倍算
 ├── avx2.rs      AVX2 で4鍵同時の倍算
+├── avx512.rs    AVX-512 で8鍵同時の倍算（表・表引き・点の演算。体演算は下の2つ）
+│   ├── ifma.rs    IFMA の体演算（51ビット×5リム）
+│   └── f.rs       IFMA の無い CPU の体演算（25.5ビット×10リム）
 ├── sha512x4.rs  AVX2 で4シード同時の SHA-512
+├── sha512x8.rs  AVX-512 で8シード同時の SHA-512
 ├── field.rs     GF(2^255-19) の体演算
 └── format.rs    件数・時間の表示
 tests/
 ├── it/          IT（CLI の振る舞い、作った鍵が OpenSSH で使えるか）
 ├── data/        RFC 8032 のテストベクタ
-└── support/     テスト用の独立実装（RFC 8032 の参照実装、SSH 形式）
+└── support/     テスト用の独立実装（RFC 8032 の参照実装、SSH 形式）と補助
 ```
 
 ### テスト
 
 - **ユニットテスト**：体演算・倍算・SHA-512・鍵の書き出しを、多倍長整数・RFC 8032 の参照実装・curve25519-dalek・ed25519-dalek と proptest で突き合わせます。RFC 8032 Section 7.1 のテストベクタもすべて通します
 - **IT**：meikey を実際に起動して鍵を作り、ssh-key・`ssh-keygen`・一時的に立てた sshd で、読み込み・署名・検証・ログインができることを確かめます。必要なツールがない環境ではその部分だけスキップします
+- **SIMD の経路**：CPU が対応していない命令セットのテストは飛ばします。環境変数 `MEIKEY_REQUIRE_SIMD`（例: `avx2,avx512,avx512-ifma`）に書いた命令セットは、飛ばさずに失敗させます。手元の CPU に無い命令セットは `cargo make sde` でエミュレートして確かめます
 - 正解には、本体とは別に仕様書（RFC 8032 / 8709 / 4251 / 4648、PROTOCOL.key / sshsig）から書いた独立実装（`tests/support/`）を使います
 
 ## ライセンス
