@@ -13,6 +13,7 @@ base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 curve25519-dalek = "5.0.0"
 ed25519-dalek = "3.0.0"
+memchr = "2.8.3"
 rand = { version = "0.10.3", features = ["chacha"] }
 sha2 = "0.11"
 

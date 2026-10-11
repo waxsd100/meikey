@@ -2,7 +2,7 @@
 
 use crate::derive::{BATCH, Backend, Deriver, PublicKeys, Seeds};
 use crate::key::{self, PUBLIC_B64_LEN, VanityKey};
-use crate::pattern::Pattern;
+use crate::pattern::{Find, Pattern};
 use rand::Rng;
 use rand::rngs::ChaCha20Rng;
 use std::sync::OnceLock;
@@ -15,11 +15,15 @@ const TICK: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
-    /// `None` なら判定せずに鍵を作り続ける（ベンチマーク用）
+    /// `None` なら判定せずに鍵を作り続ける
     pub pattern: Option<Pattern>,
     pub threads: usize,
     /// 公開鍵の計算方法
     pub backend: Backend,
+    /// 公開鍵の中から文字列を探す方法
+    pub find: Find,
+    /// `true` なら当たっても止まらず、判定だけして回し続ける（判定込みの速度を測る `--bench` 用）
+    pub bench: bool,
     /// この時間が経ったら打ち切る
     pub time_limit: Option<Duration>,
     /// 進捗コールバックを呼ぶ間隔
@@ -32,6 +36,8 @@ impl SearchConfig {
             pattern,
             threads: thread::available_parallelism().map_or(1, |n| n.get()),
             backend: Backend::default(),
+            find: Find::default(),
+            bench: false,
             time_limit: None,
             progress_interval: Duration::from_secs(5),
         }
@@ -111,6 +117,7 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
     let _guard = StopOnPanic(stop);
     let mut rng: ChaCha20Rng = rand::make_rng();
     let mut deriver = Deriver::new(config.backend);
+    let judge = config.pattern.as_ref().map(|p| (p, p.matcher(config.find)));
     let mut seeds: Seeds = [[0u8; 32]; BATCH];
     let mut publics: PublicKeys = [[0u8; 32]; BATCH];
     let mut b64 = [0u8; PUBLIC_B64_LEN];
@@ -121,17 +128,24 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
 
         for (i, (seed, public)) in seeds.iter().zip(&publics).enumerate() {
             key::encode_public_b64(public, &mut b64);
-            let Some(pattern) = &config.pattern else {
-                std::hint::black_box(&b64); // ベンチマーク: 判定せずに回す
+            let Some((pattern, matcher)) = &judge else {
+                std::hint::black_box(&b64); // 判定せずに回す
                 continue;
             };
-            if pattern.is_match(&b64) {
-                // 書き出す鍵は ed25519-dalek で計算し直すので、そちらでも一致するか確かめる。
-                // 一致しなければ高速版の計算が間違っている（バグ）ので止める
+            let hit = matcher.is_match(&b64);
+            if config.bench {
+                std::hint::black_box(hit); // 判定込みで測る: 当たっても止まらない
+                continue;
+            }
+            if hit {
+                // 書き出す鍵は ed25519-dalek で計算し直すので、そちらでも一致するか確かめる
+                // （判定は総当たりの Pattern::is_match）。一致しなければ高速版の計算か検索が
+                // 間違っている（バグ）ので止める
                 assert!(
                     pattern.is_match(&VanityKey::from_seed(*seed).public_b64()),
-                    "内部エラー: {:?} の公開鍵計算が ed25519-dalek と一致しません",
-                    config.backend
+                    "内部エラー: {}・{} の結果が ed25519-dalek・総当たりと一致しません",
+                    config.backend,
+                    config.find
                 );
                 let _ = found.set(*seed); // 同時に当たったら先着を採用
                 stop.store(true, Relaxed);
@@ -153,34 +167,42 @@ mod tests {
     /// 見つからない探索の種類
     #[derive(Debug, Clone, Copy)]
     enum Endless {
-        /// ベンチマーク（判定しない）
-        Bench,
+        /// 判定しない
+        NoPattern,
         /// 42文字の z（現実には見つからない）
         Impossible,
+        /// `--bench`: 毎回のように当たる "a" でも、判定するだけで止まらない
+        BenchWithHits,
     }
 
     impl Endless {
-        fn pattern(self) -> Option<Pattern> {
+        fn config(self) -> SearchConfig {
             match self {
-                Endless::Bench => None,
-                Endless::Impossible => {
-                    Some(Pattern::new(&"z".repeat(Pattern::MAX_LEN), false).unwrap())
-                }
+                Endless::NoPattern => SearchConfig::new(None),
+                Endless::Impossible => SearchConfig::new(Some(
+                    Pattern::new(&"z".repeat(Pattern::MAX_LEN), false).unwrap(),
+                )),
+                Endless::BenchWithHits => SearchConfig {
+                    bench: true,
+                    ..SearchConfig::new(Some(Pattern::new("a", false).unwrap()))
+                },
             }
         }
     }
 
     /// 短い文字列はすぐ見つかり、見つかった鍵は本当に一致している。
-    /// 期待試行回数は多くても100回ほどなので、10秒で見つからなければ公開鍵の計算が壊れている
+    /// 期待試行回数は多くても100回ほどなので、10秒で見つからなければ公開鍵の計算か検索が壊れている
     #[rstest]
     fn finds_matching_key(
         #[values("a", "Wa", "+/")] pattern: &str,
         #[values(1, 4)] threads: usize,
         #[values(Backend::FAST, Backend::BASELINE)] backend: Backend,
+        #[values(Find::Memmem, Find::Naive)] find: Find,
     ) {
         let cfg = SearchConfig {
             threads,
             backend,
+            find,
             time_limit: Some(Duration::from_secs(10)),
             ..SearchConfig::new(Some(Pattern::new(pattern, false).unwrap()))
         };
@@ -191,10 +213,10 @@ mod tests {
         assert!(out.stats.tries >= 1);
     }
 
-    /// 見つからない探索は、時間制限が来たらすぐ止まる
+    /// 見つからない探索（--bench で当たりを無視する場合も）は、時間制限が来たらすぐ止まる
     #[rstest]
     fn stops_at_time_limit(
-        #[values(Endless::Bench, Endless::Impossible)] endless: Endless,
+        #[values(Endless::NoPattern, Endless::Impossible, Endless::BenchWithHits)] endless: Endless,
         #[values(Backend::FAST, Backend::BASELINE)] backend: Backend,
         #[values(1, 2)] threads: usize,
     ) {
@@ -203,7 +225,7 @@ mod tests {
             threads,
             backend,
             time_limit: Some(limit),
-            ..SearchConfig::new(endless.pattern())
+            ..endless.config()
         };
         let out = run(&cfg, |_| {});
 
@@ -301,12 +323,14 @@ mod tests {
     #[rstest]
     fn found_key_really_matches(
         #[values(Backend::FAST, Backend::BASELINE)] backend: Backend,
+        #[values(Find::Memmem, Find::Naive)] find: Find,
         #[values(false, true)] case_sensitive: bool,
     ) {
         check(2, "[A-Za-z0-9+/]", |c| {
             let cfg = SearchConfig {
                 threads: 2,
                 backend,
+                find,
                 time_limit: Some(Duration::from_secs(10)),
                 ..SearchConfig::new(Some(Pattern::new(&c, case_sensitive).unwrap()))
             };

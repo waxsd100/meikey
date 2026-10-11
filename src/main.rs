@@ -1,5 +1,5 @@
 use clap::Parser;
-use meikey::{Compress, Mul, Pattern, SearchConfig, Stats, VanityKey, format, search};
+use meikey::{Compress, Find, Mul, Pattern, SearchConfig, Stats, VanityKey, format, search};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -45,6 +45,11 @@ struct Cli {
     /// --constant-time と両方付けると、ed25519-dalek で1鍵ずつ計算する高速化前と同じになる
     #[arg(long)]
     no_batch: bool,
+
+    /// 公開鍵の中を memmem（SIMD の部分文字列検索）で探さず、1文字ずつずらして比べる
+    /// （高速化前の検索。比較用）
+    #[arg(long)]
+    no_memmem: bool,
 }
 
 fn main() -> ExitCode {
@@ -71,6 +76,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.no_batch {
         config.backend.compress = Compress::Each;
     }
+    if cli.no_memmem {
+        config.find = Find::Naive;
+    }
 
     match cli.bench {
         Some(limit) => bench(config, &pattern, limit),
@@ -94,14 +102,16 @@ fn bench(
     pattern: &Pattern,
     limit: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    config.pattern = None;
+    // 文字列の判定まで含めて測る（当たっても止まらない）
+    config.bench = true;
     config.time_limit = Some(limit);
     config.progress_interval = Duration::from_secs(1);
 
     eprintln!(
-        "{}スレッド・{} で{}秒間計測します",
+        "{}スレッド・{}・{} で{}秒間計測します",
         config.threads,
         config.backend,
+        config.find,
         limit.as_secs_f64()
     );
     let mut last = Stats {
