@@ -86,27 +86,33 @@ mod tests {
     #[rstest]
     #[case::version(&["--version"], &["meikey 0."], &[])]
     #[case::short_version(&["-V"], &["meikey 0."], &[])]
-    #[case::help(&["--help"], &["Usage: meikey", "--constant-time", "--bench <SECS>"], &[])]
+    #[case::help(&["--help"], &["Usage: meikey", "--constant-time", "--no-batch", "--bench <SECS>"], &[])]
     #[case::short_help(&["-h"], &["Usage: meikey"], &[])]
-    #[case::bench_fast_1_thread(
+    // --bench は、どの組み合わせで測ったかを表示する
+    #[case::bench_fast(
         &["wakokara", "--bench", "0.1", "-j", "1"],
         &["鍵/秒（1スレッド）", "「wakokara」の期待時間"],
-        &["1スレッド・Fast で0.1秒間"]
+        &["1スレッド・倍算=テーブル・圧縮=まとめて で0.1秒間"]
     )]
     #[case::bench_fast_2_threads(
         &["wakokara", "--bench", "0.1", "-j", "2"],
         &["鍵/秒（2スレッド）", "「wakokara」の期待時間"],
-        &["2スレッド・Fast で0.1秒間"]
+        &["2スレッド・倍算=テーブル・圧縮=まとめて で0.1秒間"]
     )]
-    #[case::bench_constant_time_1_thread(
+    #[case::bench_no_batch(
+        &["wakokara", "--bench", "0.1", "-j", "1", "--no-batch"],
+        &["鍵/秒（1スレッド）"],
+        &["1スレッド・倍算=テーブル・圧縮=1鍵ずつ で0.1秒間"]
+    )]
+    #[case::bench_constant_time(
         &["wakokara", "--bench", "0.1", "-j", "1", "--constant-time"],
-        &["鍵/秒（1スレッド）", "「wakokara」の期待時間"],
-        &["1スレッド・ConstantTime で0.1秒間"]
+        &["鍵/秒（1スレッド）"],
+        &["1スレッド・倍算=定数時間・圧縮=まとめて で0.1秒間"]
     )]
-    #[case::bench_constant_time_2_threads(
-        &["wakokara", "--bench", "0.1", "-j", "2", "--constant-time"],
-        &["鍵/秒（2スレッド）", "「wakokara」の期待時間"],
-        &["2スレッド・ConstantTime で0.1秒間"]
+    #[case::bench_baseline(
+        &["wakokara", "--bench", "0.1", "-j", "1", "--constant-time", "--no-batch"],
+        &["鍵/秒（1スレッド）"],
+        &["1スレッド・倍算=定数時間・圧縮=1鍵ずつ で0.1秒間"]
     )]
     fn succeeds_without_writing(
         #[case] args: &[&str],
@@ -149,7 +155,7 @@ mod tests {
         #[case] pattern: &str,
         #[case] flags: &[&str],
         #[case] existing: &[&str],
-        #[values(Mode::Fast, Mode::ConstantTime)] mode: Mode,
+        #[values(Mode::Fast, Mode::ConstantTime, Mode::Baseline)] mode: Mode,
     ) {
         let mut args = vec![pattern, "-j", "2", "-C", COMMENT];
         args.extend(flags);

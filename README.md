@@ -49,7 +49,8 @@ ssh-keygen -p -f ~/.ssh/id_ed25519_wakokara
 | `-C TEXT` | 鍵のコメント |
 | `-f`, `--force` | 既存のファイルを置き換える |
 | `--bench SECS` | 探索せず速度だけ測る |
-| `--constant-time` | 定数時間の実装を使う（約3倍遅い。[安全性](#安全性)を参照） |
+| `--constant-time` | 基点倍算に定数時間の実装を使う（約3倍遅い。[安全性](#安全性)を参照） |
+| `--no-batch` | 圧縮の逆元を1鍵ずつ計算する（比較用） |
 
 ### 入れられる文字列
 
@@ -72,7 +73,7 @@ ssh-keygen -p -f ~/.ssh/id_ed25519_wakokara
 - **一括逆元**：圧縮に必要な 1/Z を256鍵ぶんまとめて1回の逆元で求めます
 
 当たりの鍵は書き出す前に ed25519-dalek で計算し直して確かめるので、高速化にバグがあっても誤った鍵は書きません。
-実装ごとの1鍵あたりの時間は `cargo make breakdown` で測れます。
+高速化の組み合わせごとの1鍵あたりの時間は `cargo make breakdown` で測れます。
 
 ## 安全性
 
@@ -91,7 +92,7 @@ ssh-keygen -p -f ~/.ssh/id_ed25519_wakokara
 | `cargo make mutants` | [cargo-mutants](https://mutants.rs/) でミューテーションテスト |
 | `cargo make run …` | 最適化ビルドで実行 |
 | `cargo make build` | 最適化ビルド（`target/release/meikey`） |
-| `cargo make breakdown` | 1鍵あたりの計算時間を実装ごとに比較 |
+| `cargo make breakdown` | 1鍵あたりの計算時間を高速化の組み合わせごとに比較 |
 
 `run`・`build`・`breakdown` は `-C target-cpu=native` でビルドします。配布用のバイナリは `cargo build --release` で作ってください。
 RustRover を使う場合は、Rustfmt の **Use rustfmt instead of built-in formatter** をオンにしてください（`rustfmt.toml` の書式に揃えるため）。

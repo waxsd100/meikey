@@ -4,7 +4,7 @@
 //! - [`pattern`] — 探す文字列と、公開鍵に含まれるかの判定
 //! - [`search`] — 全コアで鍵を生成して当たりを探す
 //! - [`format`] — 件数・時間の表示
-//! - [`derive`] — シードから公開鍵をまとめて計算する（高速版と定数時間版）
+//! - [`derive`] — シードから公開鍵をまとめて計算する（高速化ありと高速化前の計算を切り替えられる）
 
 mod comb;
 pub mod derive;
@@ -14,7 +14,7 @@ pub mod key;
 pub mod pattern;
 pub mod search;
 
-pub use derive::Backend;
+pub use derive::{Backend, Compress, Mul};
 pub use key::VanityKey;
 pub use pattern::{Pattern, PatternError};
 pub use search::{Outcome, SearchConfig, Stats};

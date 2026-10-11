@@ -1,4 +1,4 @@
-//! 1鍵あたりの計算時間を計測する: cargo make breakdown
+//! 1鍵あたりの計算時間を、高速化の組み合わせごとに計測する: cargo make breakdown
 use meikey::derive::{BATCH, Backend, Deriver, PublicKeys, Seeds};
 use std::hint::black_box;
 use std::time::Instant;
@@ -19,12 +19,11 @@ fn main() {
         );
     }
     let base = s.elapsed().as_secs_f64() * 1e6 / (rounds * BATCH) as f64;
-    println!(
-        "{:<34} {base:>6.2} µs/鍵",
-        "ed25519-dalek（1鍵ずつ・改善前）"
-    );
+    // 全角文字は {:<N} で揃わないので、名前は行末に置く
+    println!("{base:>6.2} µs/鍵  (基準)    ed25519-dalek の SigningKey で1鍵ずつ");
 
-    for backend in [Backend::ConstantTime, Backend::Fast] {
+    // 高速化前（両方なし）から、1つずつ足して、両方ありまで
+    for backend in Backend::ALL.into_iter().rev() {
         let mut d = Deriver::new(backend);
         let s = Instant::now();
         for r in 0..rounds {
@@ -36,10 +35,6 @@ fn main() {
             black_box(&out);
         }
         let us = s.elapsed().as_secs_f64() * 1e6 / (rounds * BATCH) as f64;
-        println!(
-            "{:<34} {us:>6.2} µs/鍵  ({:.2}倍)",
-            format!("{backend:?}（{BATCH}鍵まとめて）"),
-            base / us
-        );
+        println!("{us:>6.2} µs/鍵  ({:.2}倍)  {backend}", base / us);
     }
 }

@@ -34,8 +34,12 @@ pub fn meikey_in(dir: &Path, args: &[&str]) -> Output {
 /// 公開鍵の計算方法（meikey の引数で切り替える）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// 既定（高速化あり）
     Fast,
+    /// `--constant-time`（倍算だけ高速化前）
     ConstantTime,
+    /// `--constant-time --no-batch`（倍算も圧縮も高速化前）
+    Baseline,
 }
 
 impl Mode {
@@ -43,6 +47,7 @@ impl Mode {
         match self {
             Mode::Fast => &[],
             Mode::ConstantTime => &["--constant-time"],
+            Mode::Baseline => &["--constant-time", "--no-batch"],
         }
     }
 
@@ -50,7 +55,7 @@ impl Mode {
     pub fn other(self) -> Mode {
         match self {
             Mode::Fast => Mode::ConstantTime,
-            Mode::ConstantTime => Mode::Fast,
+            Mode::ConstantTime | Mode::Baseline => Mode::Fast,
         }
     }
 }

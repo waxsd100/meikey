@@ -15,14 +15,74 @@ pub const BATCH: usize = 256;
 pub type Seeds = [[u8; 32]; BATCH];
 pub type PublicKeys = [[u8; 32]; BATCH];
 
-/// 公開鍵の計算方法
+/// 公開鍵の計算方法。2つの高速化を別々に切り替えられる（既定は両方あり）。
+/// 両方なしにすると、ed25519-dalek で1鍵ずつ計算する高速化前と同じ計算になる
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Backend {
-    /// 自前の可変時間実装（速い）
+pub struct Backend {
+    /// 基点倍算
+    pub mul: Mul,
+    /// 圧縮（1/Z の計算）
+    pub compress: Compress,
+}
+
+/// 基点倍算 `s * B` の方法
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mul {
+    /// 自前の 8 ビット幅テーブルを直接引く（加算32回。可変時間なので探索専用）
     #[default]
-    Fast,
-    /// curve25519-dalek の定数時間実装（タイミング攻撃に強いが遅い）
+    Table,
+    /// curve25519-dalek の定数時間実装（加算64回 + テーブルの全走査。タイミング攻撃に強いが遅い）
     ConstantTime,
+}
+
+/// 圧縮に必要な 1/Z の計算方法
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compress {
+    /// [`BATCH`] 鍵ぶんの逆元を1回にまとめる（Montgomery の方法）
+    #[default]
+    Batch,
+    /// 1鍵ずつ逆元を計算する
+    Each,
+}
+
+impl Backend {
+    /// 両方の高速化あり（既定）
+    pub const FAST: Backend = Backend {
+        mul: Mul::Table,
+        compress: Compress::Batch,
+    };
+    /// 両方の高速化なし（ed25519-dalek で1鍵ずつ計算するのと同じ）
+    pub const BASELINE: Backend = Backend {
+        mul: Mul::ConstantTime,
+        compress: Compress::Each,
+    };
+    /// すべての組み合わせ
+    pub const ALL: [Backend; 4] = [
+        Backend::FAST,
+        Backend {
+            mul: Mul::Table,
+            compress: Compress::Each,
+        },
+        Backend {
+            mul: Mul::ConstantTime,
+            compress: Compress::Batch,
+        },
+        Backend::BASELINE,
+    ];
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mul = match self.mul {
+            Mul::Table => "テーブル",
+            Mul::ConstantTime => "定数時間",
+        };
+        let compress = match self.compress {
+            Compress::Batch => "まとめて",
+            Compress::Each => "1鍵ずつ",
+        };
+        write!(f, "倍算={mul}・圧縮={compress}")
+    }
 }
 
 /// スレッドごとに1つ持つ作業領域
@@ -35,7 +95,7 @@ pub struct Deriver {
 
 impl Deriver {
     pub fn new(backend: Backend) -> Self {
-        if backend == Backend::Fast {
+        if backend.mul == Mul::Table {
             Table::get(); // テーブル作成を探索開始前に済ませる
         }
         Self {
@@ -47,31 +107,43 @@ impl Deriver {
     }
 
     pub fn public_keys(&mut self, seeds: &Seeds, out: &mut PublicKeys) {
-        match self.backend {
-            Backend::Fast => self.fast(seeds, out),
-            Backend::ConstantTime => constant_time(seeds, out),
+        match self.backend.mul {
+            Mul::Table => self.table(seeds, out),
+            Mul::ConstantTime => constant_time(seeds, out, self.backend.compress),
         }
     }
 
-    fn fast(&mut self, seeds: &Seeds, out: &mut PublicKeys) {
+    fn table(&mut self, seeds: &Seeds, out: &mut PublicKeys) {
         let table = Table::get();
         for ((seed, p), z) in seeds.iter().zip(&mut self.points).zip(&mut self.zs) {
             *p = table.mul_base(&scalar(seed));
             *z = p.z;
         }
-        Fe::batch_invert(&mut self.zs[..], &mut self.scratch);
+        match self.backend.compress {
+            Compress::Batch => Fe::batch_invert(&mut self.zs[..], &mut self.scratch),
+            Compress::Each => self.zs.iter_mut().for_each(|z| *z = z.invert()),
+        }
         for ((p, z_inv), o) in self.points.iter().zip(&self.zs).zip(out) {
             *o = comb::compress_with_zinv(p, *z_inv);
         }
     }
 }
 
-fn constant_time(seeds: &Seeds, out: &mut PublicKeys) {
-    let points: [EdwardsPoint; BATCH] =
-        std::array::from_fn(|i| EdwardsPoint::mul_base_clamped(scalar(&seeds[i])));
-    let compressed = EdwardsPoint::compress_batch::<BATCH>(&points);
-    for (o, c) in out.iter_mut().zip(compressed.iter()) {
-        *o = c.to_bytes();
+fn constant_time(seeds: &Seeds, out: &mut PublicKeys, compress: Compress) {
+    let point = |seed| EdwardsPoint::mul_base_clamped(scalar(seed));
+    match compress {
+        Compress::Batch => {
+            let points: [EdwardsPoint; BATCH] = std::array::from_fn(|i| point(&seeds[i]));
+            let compressed = EdwardsPoint::compress_batch::<BATCH>(&points);
+            for (o, c) in out.iter_mut().zip(compressed.iter()) {
+                *o = c.to_bytes();
+            }
+        }
+        Compress::Each => {
+            for (o, seed) in out.iter_mut().zip(seeds) {
+                *o = point(seed).compress().to_bytes();
+            }
+        }
     }
 }
 
@@ -121,9 +193,10 @@ mod tests {
     #[case::mixed(&[Batch::Same([0; 32]), Batch::Random(4), Batch::Same([0xff; 32])])]
     fn batches_match_ed25519_dalek(
         #[case] batches: &[Batch],
-        #[values(Backend::Fast, Backend::ConstantTime)] backend: Backend,
+        #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
+        #[values(Compress::Batch, Compress::Each)] compress: Compress,
     ) {
-        let mut d = Deriver::new(backend);
+        let mut d = Deriver::new(Backend { mul, compress });
         let mut out: PublicKeys = [[0u8; 32]; BATCH];
         for (round, batch) in batches.iter().enumerate() {
             let seeds = batch.seeds();
@@ -136,6 +209,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// --bench の表示。既定は両方の高速化あり、BASELINE は両方なし、ALL は4通りを1回ずつ
+    #[rstest]
+    #[case::fast(Backend::FAST, "倍算=テーブル・圧縮=まとめて")]
+    #[case::no_batch(Backend { mul: Mul::Table, compress: Compress::Each }, "倍算=テーブル・圧縮=1鍵ずつ")]
+    #[case::constant_time(Backend { mul: Mul::ConstantTime, compress: Compress::Batch }, "倍算=定数時間・圧縮=まとめて")]
+    #[case::baseline(Backend::BASELINE, "倍算=定数時間・圧縮=1鍵ずつ")]
+    fn backend_display(#[case] backend: Backend, #[case] want: &str) {
+        assert_eq!(backend.to_string(), want);
+        assert_eq!(Backend::ALL.iter().filter(|&&b| b == backend).count(), 1);
+        assert_eq!(Backend::default(), Backend::FAST);
     }
 
     // ---- RFC 8032 Section 5.1.5 手順 1・2（SHA-512 とクランプ） ----
@@ -180,9 +265,9 @@ mod tests {
     mod conformance {
         use super::*;
 
-        fn derive(backend: Backend, seeds: &Seeds) -> PublicKeys {
+        fn derive(mul: Mul, compress: Compress, seeds: &Seeds) -> PublicKeys {
             let mut out: PublicKeys = [[0u8; 32]; BATCH];
-            Deriver::new(backend).public_keys(seeds, &mut out);
+            Deriver::new(Backend { mul, compress }).public_keys(seeds, &mut out);
             out
         }
 
@@ -199,50 +284,50 @@ mod tests {
         // RFC 8032 Section 7.1: 自前の高速版を含む、公開鍵を作る全経路がテストベクタどおり
         // ===========================================================================
 
-        /// 公開鍵を作る経路
-        #[derive(Debug, Clone, Copy)]
-        enum Via {
-            /// Deriver でバッチの指定の位置に入れる（一括逆元の先頭・途中・末尾を通す）
-            Deriver(Backend, usize),
-            /// 書き出しに使う VanityKey（ed25519-dalek）
-            VanityKey,
-        }
-
+        /// Deriver のバッチの指定の位置に入れても、テストベクタどおり。
+        /// 一括逆元は先頭・2番目・途中・末尾を通し、1鍵ずつの圧縮は先頭と末尾だけ
         #[rstest]
-        #[case::fast_first(Via::Deriver(Backend::Fast, 0))]
-        #[case::fast_second(Via::Deriver(Backend::Fast, 1))]
-        #[case::fast_middle(Via::Deriver(Backend::Fast, 128))]
-        #[case::fast_last(Via::Deriver(Backend::Fast, BATCH - 1))]
-        #[case::constant_time_first(Via::Deriver(Backend::ConstantTime, 0))]
-        #[case::constant_time_last(Via::Deriver(Backend::ConstantTime, BATCH - 1))]
-        #[case::vanity_key(Via::VanityKey)]
+        #[case::table_batch_first(Mul::Table, Compress::Batch, 0)]
+        #[case::table_batch_second(Mul::Table, Compress::Batch, 1)]
+        #[case::table_batch_middle(Mul::Table, Compress::Batch, 128)]
+        #[case::table_batch_last(Mul::Table, Compress::Batch, BATCH - 1)]
+        #[case::table_each_first(Mul::Table, Compress::Each, 0)]
+        #[case::table_each_last(Mul::Table, Compress::Each, BATCH - 1)]
+        #[case::constant_time_batch_first(Mul::ConstantTime, Compress::Batch, 0)]
+        #[case::constant_time_batch_last(Mul::ConstantTime, Compress::Batch, BATCH - 1)]
+        #[case::constant_time_each_first(Mul::ConstantTime, Compress::Each, 0)]
+        #[case::constant_time_each_last(Mul::ConstantTime, Compress::Each, BATCH - 1)]
         fn section_7_1_public_key(
-            #[case] via: Via,
+            #[case] mul: Mul,
+            #[case] compress: Compress,
+            #[case] position: usize,
             #[values("1", "2", "3", "1024", "SHA(abc)")] name: &str,
         ) {
             let v = rfc8032::vector(name);
-            let got = match via {
-                Via::Deriver(backend, position) => {
-                    let mut seeds = filler_seeds();
-                    seeds[position] = v.secret;
-                    derive(backend, &seeds)[position]
-                }
-                Via::VanityKey => *VanityKey::from_seed(v.secret).public_bytes(),
-            };
-            assert_eq!(got, v.public);
+            let mut seeds = filler_seeds();
+            seeds[position] = v.secret;
+            assert_eq!(derive(mul, compress, &seeds)[position], v.public);
+        }
+
+        /// 書き出しに使う VanityKey（ed25519-dalek）もテストベクタどおり
+        #[rstest]
+        fn section_7_1_vanity_key(#[values("1", "2", "3", "1024", "SHA(abc)")] name: &str) {
+            let v = rfc8032::vector(name);
+            assert_eq!(*VanityKey::from_seed(v.secret).public_bytes(), v.public);
         }
 
         /// 5本を1つのバッチに入れても、それぞれ正しい（一括逆元が混ざらない）
         #[rstest]
         fn section_7_1_all_vectors_in_one_batch(
-            #[values(Backend::Fast, Backend::ConstantTime)] backend: Backend,
+            #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
+            #[values(Compress::Batch, Compress::Each)] compress: Compress,
         ) {
             let vectors = rfc8032::vectors();
             let mut seeds = filler_seeds();
             for (i, v) in vectors.iter().enumerate() {
                 seeds[i * 50] = v.secret;
             }
-            let out = derive(backend, &seeds);
+            let out = derive(mul, compress, &seeds);
             for (i, v) in vectors.iter().enumerate() {
                 assert_eq!(out[i * 50], v.public, "TEST {}", v.name);
             }
@@ -252,11 +337,15 @@ mod tests {
         // RFC 8032 Section 5.1.2 / 5.1.3: 公開鍵は正規の符号化で、復号すると位数 L の点
         // ===========================================================================
 
-        /// バッチ全体が ed25519-dalek と一致し、抜き出した1件は RFC 8032 の参照実装とも一致する
+        /// バッチ全体が ed25519-dalek と一致し、抜き出した1件は RFC 8032 の参照実装とも一致する。
+        /// （1バッチ 256 鍵なので、4通りの組み合わせ × 16 バッチ = 16,384 鍵を確かめる）
         #[rstest]
-        fn implementations_agree(#[values(Backend::Fast, Backend::ConstantTime)] backend: Backend) {
-            check(32, (seeds_strategy(), 0..BATCH), |(seeds, pick)| {
-                let got = derive(backend, &seeds);
+        fn implementations_agree(
+            #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
+            #[values(Compress::Batch, Compress::Each)] compress: Compress,
+        ) {
+            check(16, (seeds_strategy(), 0..BATCH), |(seeds, pick)| {
+                let got = derive(mul, compress, &seeds);
                 for (i, (seed, pk)) in seeds.iter().zip(&got).enumerate() {
                     prop_assert_eq!(
                         *pk,
@@ -278,12 +367,13 @@ mod tests {
         /// しかも基点 B が生成する位数 L の部分群に入っている
         #[rstest]
         fn outputs_are_canonical_points_of_order_l(
-            #[values(Backend::Fast, Backend::ConstantTime)] backend: Backend,
+            #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
+            #[values(Compress::Batch, Compress::Each)] compress: Compress,
         ) {
-            check(32, (any::<[u8; 32]>(), 0..BATCH), |(seed, position)| {
+            check(16, (any::<[u8; 32]>(), 0..BATCH), |(seed, position)| {
                 let mut seeds = filler_seeds();
                 seeds[position] = seed;
-                let pk = derive(backend, &seeds)[position];
+                let pk = derive(mul, compress, &seeds)[position];
 
                 let point = rfc8032::point_decompress(&pk);
                 prop_assert!(point.is_some(), "Section 5.1.3 で復号できない: {:02x?}", pk);

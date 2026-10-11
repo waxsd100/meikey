@@ -1,5 +1,5 @@
 use clap::Parser;
-use meikey::{Backend, Pattern, SearchConfig, Stats, VanityKey, format, search};
+use meikey::{Compress, Mul, Pattern, SearchConfig, Stats, VanityKey, format, search};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,10 +36,15 @@ struct Cli {
     #[arg(long, value_name = "SECS", value_parser = parse_secs, allow_negative_numbers = true)]
     bench: Option<Duration>,
 
-    /// 定数時間の実装（curve25519-dalek）を使う。約3倍遅いが、同じマシン上の他プロセスから
-    /// キャッシュのタイミングで秘密鍵を推測される余地をなくす
+    /// 基点倍算に定数時間の実装（curve25519-dalek）を使う（高速化前の倍算）。約3倍遅いが、
+    /// 同じマシン上の他プロセスからキャッシュのタイミングで秘密鍵を推測される余地をなくす
     #[arg(long)]
     constant_time: bool,
+
+    /// 圧縮の逆元を256鍵でまとめず、1鍵ずつ計算する（高速化前の圧縮。比較用）。
+    /// --constant-time と両方付けると、ed25519-dalek で1鍵ずつ計算する高速化前と同じになる
+    #[arg(long)]
+    no_batch: bool,
 }
 
 fn main() -> ExitCode {
@@ -61,7 +66,10 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         config.threads = n.into();
     }
     if cli.constant_time {
-        config.backend = Backend::ConstantTime;
+        config.backend.mul = Mul::ConstantTime;
+    }
+    if cli.no_batch {
+        config.backend.compress = Compress::Each;
     }
 
     match cli.bench {
@@ -91,7 +99,7 @@ fn bench(
     config.progress_interval = Duration::from_secs(1);
 
     eprintln!(
-        "{}スレッド・{:?} で{}秒間計測します",
+        "{}スレッド・{} で{}秒間計測します",
         config.threads,
         config.backend,
         limit.as_secs_f64()

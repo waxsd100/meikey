@@ -176,7 +176,7 @@ mod tests {
     fn finds_matching_key(
         #[values("a", "Wa", "+/")] pattern: &str,
         #[values(1, 4)] threads: usize,
-        #[values(Backend::Fast, Backend::ConstantTime)] backend: Backend,
+        #[values(Backend::FAST, Backend::BASELINE)] backend: Backend,
     ) {
         let cfg = SearchConfig {
             threads,
@@ -195,7 +195,7 @@ mod tests {
     #[rstest]
     fn stops_at_time_limit(
         #[values(Endless::Bench, Endless::Impossible)] endless: Endless,
-        #[values(Backend::Fast, Backend::ConstantTime)] backend: Backend,
+        #[values(Backend::FAST, Backend::BASELINE)] backend: Backend,
         #[values(1, 2)] threads: usize,
     ) {
         let limit = Duration::from_millis(60);
@@ -300,7 +300,7 @@ mod tests {
     /// どの1文字でも、見つかった鍵は ed25519-dalek で計算し直しても一致する
     #[rstest]
     fn found_key_really_matches(
-        #[values(Backend::Fast, Backend::ConstantTime)] backend: Backend,
+        #[values(Backend::FAST, Backend::BASELINE)] backend: Backend,
         #[values(false, true)] case_sensitive: bool,
     ) {
         check(2, "[A-Za-z0-9+/]", |c| {
