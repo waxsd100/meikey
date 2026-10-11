@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 description = "Vanity ed25519 SSH key generator — 公開鍵に好きな文字列を刻む"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/waxsd100/meikey"
 keywords = ["ssh", "ed25519", "vanity", "keygen"]
 categories = ["command-line-utilities", "cryptography"]
 
