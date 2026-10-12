@@ -1,7 +1,7 @@
 //! 1鍵あたりの計算時間を、高速化の組み合わせごとに計測する: cargo make breakdown
-use meikey::derive::{BATCH, Backend, Deriver, PublicKeys, Seeds};
-use meikey::key::{PUBLIC_B64_LEN, encode_public_b64};
-use meikey::{Find, Pattern};
+use meikey::model::key::{PUBLIC_B64_LEN, encode_public_b64};
+use meikey::service::derive::{BATCH, Deriver, PublicKeys, Seeds};
+use meikey::{Backend, Find, Matcher, Pattern};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -59,7 +59,7 @@ fn main() {
         };
         println!("--- base64 化 + 「{needle}」を探す（大小文字{label}）");
         for find in [Find::Naive, Find::Memmem] {
-            let matcher = pattern.matcher(find);
+            let matcher = Matcher::new(&pattern, find);
             let mut b64 = [0u8; PUBLIC_B64_LEN];
             let s = Instant::now();
             let mut hits = 0usize;

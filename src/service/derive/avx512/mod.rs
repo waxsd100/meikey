@@ -1,4 +1,4 @@
-//! AVX-512 で8鍵の基点倍算を同時に進める（[`crate::comb`] の櫛形テーブルと同じ計算を8レーンで）
+//! AVX-512 で8鍵の基点倍算を同時に進める（[`crate::service::derive::comb`] の櫛形テーブルと同じ計算を8レーンで）
 //!
 //! 512 ビットレジスタの 64 ビットのレーン k に、k 番目の鍵の同じリムを入れる（8鍵を縦に並べる）。
 //! 体演算は、CPU が持っている乗算命令に合わせて2通り用意している。
@@ -10,7 +10,7 @@
 //!
 //! IFMA が AVX-512 で鍵の計算が速くなる本命で、52 ビットの積を1命令で作れるのでリムが半分になり、
 //! 乗算の命令数が約4分の1になる。IFMA の無い CPU では、乗算命令が AVX2 と同じ `vpmuludq` なので
-//! リムの切り方も同じ（[`crate::avx2`] と同じ式）だが、表引き・符号反転・レジスタの使い方は AVX-512 の
+//! リムの切り方も同じ（[`crate::service::derive::avx2`] と同じ式）だが、表引き・符号反転・レジスタの使い方は AVX-512 の
 //! 命令で書いている。
 //!
 //! 体演算以外（このファイル）は2通りで共通:
@@ -32,8 +32,8 @@
 pub mod f;
 pub mod ifma;
 
-use crate::comb::{COLS, Extended, ROWS, Table, signed_digits};
-use crate::field::Fe;
+use crate::service::derive::comb::{COLS, Extended, ROWS, Table, signed_digits};
+use crate::service::derive::field::Fe;
 use std::arch::x86_64::*;
 
 /// CPU が AVX-512 の F・BW・DQ・VL（x86-64-v4。Skylake-SP 以降の AVX-512 対応 CPU はすべて持っている）
@@ -111,7 +111,7 @@ pub(crate) struct Niels8<F> {
     xy2d: F,
 }
 
-/// 拡張座標に（[`crate::comb`] の `Niels::to_extended` と同じ: X = 2x, Y = 2y, Z = 2, T = XY/Z）。
+/// 拡張座標に（[`crate::service::derive::comb`] の `Niels::to_extended` と同じ: X = 2x, Y = 2y, Z = 2, T = XY/Z）。
 /// X, Y は次の加算で足し引きするので繰り上げておく
 #[inline(always)]
 unsafe fn to_extended<F: Field8>(n: &Niels8<F>) -> Ext8<F> {
@@ -134,7 +134,7 @@ unsafe fn to_extended<F: Field8>(n: &Niels8<F>) -> Ext8<F> {
     }
 }
 
-/// 拡張座標 + アフィン点（[`crate::comb`] の `add_niels_impl` と同じ式）。`WITH_T` が false なら
+/// 拡張座標 + アフィン点（[`crate::service::derive::comb`] の `add_niels_impl` と同じ式）。`WITH_T` が false なら
 /// T を計算しない（最後の加算用。結果の T は使えない）。
 ///
 /// 右の数字は [`f`] での各リムの大きさ（[`f::Fe10`] を参照）。`mul(a, b)` は a が 5 倍未満、
@@ -318,7 +318,7 @@ mod tests {
     }
 
     fn compress(p: &Extended) -> [u8; 32] {
-        crate::comb::compress_with_zinv(p, p.z.invert())
+        crate::service::derive::comb::compress_with_zinv(p, p.z.invert())
     }
 
     /// curve25519-dalek で `s * B`（s は 2^255 未満の任意の値）
@@ -410,7 +410,7 @@ mod tests {
     fn pack_unpack_blend_keep_values(#[values(Path::F, Path::Ifma)] path: Path) {
         let fe = any::<[u8; 32]>().prop_map(|mut b| {
             b[31] &= 0x7f;
-            crate::field::Fe::from_bytes(&b).reduce()
+            crate::service::derive::field::Fe::from_bytes(&b).reduce()
         });
         let lanes = prop::array::uniform8(fe);
         let ok = match path {

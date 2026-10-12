@@ -2,13 +2,13 @@
 //!
 //! この世代の 512 ビットの乗算は `vpmuludq`（32×32→64 ビット）だけなので、積の和が 64 ビットに
 //! 収まるようリムを 25.5 ビットにする（偶数番目のリムは 26 ビット、奇数番目は 25 ビット。値は
-//! `Σ l[i]·2^⌈25.5·i⌉`）。式は [`crate::avx2`] と同じで、1 命令で 8 鍵ぶん進む。
+//! `Σ l[i]·2^⌈25.5·i⌉`）。式は [`crate::service::derive::avx2`] と同じで、1 命令で 8 鍵ぶん進む。
 //! 表には隣り合う2リムを 64 ビットの1ワードに入れておき（下位 32 ビットに偶数番目、上位に奇数番目）、
 //! `vpgatherqq` 1 命令で8鍵の2リムを読む。
 
 use super::{Avx512, Field8, Table8};
-use crate::comb::Extended;
-use crate::field::Fe;
+use crate::service::derive::comb::Extended;
+use crate::service::derive::field::Fe;
 use std::arch::x86_64::*;
 use std::sync::LazyLock;
 
@@ -292,7 +292,7 @@ pub fn prepare(_: Avx512) {
     LazyLock::force(&TABLE);
 }
 
-/// [`crate::comb::Table::mul_base_batch`] と同じ計算を、8鍵ずつ AVX-512F で（`N` は 8 の倍数）
+/// [`crate::service::derive::comb::Table::mul_base_batch`] と同じ計算を、8鍵ずつ AVX-512F で（`N` は 8 の倍数）
 pub fn mul_base_batch<const N: usize>(
     avx512: Avx512,
     scalars: &[[u8; 32]; N],

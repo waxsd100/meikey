@@ -4,15 +4,36 @@
 //! 探索ではこれを [`BATCH`] 個ずつまとめて計算し、圧縮に必要な逆元を1回にまとめる。
 //! x86_64 では CPU に合わせて、SHA-512 とテーブルの倍算を AVX-512 で8鍵ずつ（IFMA があれば
 //! 52 ビットの積和で）、AVX2 で4鍵ずつ同時に計算する。
+//!
+//! 計算方法の型（[`Backend`] など）は [`crate::model::backend`] にあり、ここでは CPU が対応して
+//! いるかで決まる部分（[`Simd::effective`]・[`Backend::prepare`]・表示）を足している。
+//!
+//! 中の部品（crate の外には公開しない）:
+//! - `field` — GF(2^255 - 19) の体演算（51 ビット × 5 リム）
+//! - `comb` — 櫛形テーブルによる固定基点倍算
+//! - `avx2`・`avx512` — 倍算を4鍵・8鍵ずつ同時に
+//! - `sha512x4`・`sha512x8` — SHA-512 を4シード・8シードずつ同時に
 
 #[cfg(target_arch = "x86_64")]
-use crate::avx2::{Avx2, Table4};
+pub(crate) mod avx2;
 #[cfg(target_arch = "x86_64")]
-use crate::avx512::{self, Avx512, Ifma};
-use crate::comb::{self, Extended, Table};
-use crate::field::Fe;
+pub(crate) mod avx512;
+pub(crate) mod comb;
+pub(crate) mod field;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod sha512x4;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod sha512x8;
+
+use crate::model::backend::{Backend, Compress, Mul, Simd};
+#[cfg(target_arch = "x86_64")]
+use avx2::{Avx2, Table4};
+#[cfg(target_arch = "x86_64")]
+use avx512::{Avx512, Ifma};
+use comb::{Extended, Table};
 use curve25519_dalek::edwards::EdwardsPoint;
 use curve25519_dalek::scalar::clamp_integer;
+use field::Fe;
 use sha2::{Digest, Sha512};
 
 /// 一度にまとめて計算する鍵の数
@@ -21,66 +42,7 @@ pub const BATCH: usize = 256;
 pub type Seeds = [[u8; 32]; BATCH];
 pub type PublicKeys = [[u8; 32]; BATCH];
 
-/// 公開鍵の計算方法。高速化を別々に切り替えられる（既定は全部あり）。
-/// 全部なしにすると、ed25519-dalek で1鍵ずつ計算する高速化前と同じ計算になる
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Backend {
-    /// 基点倍算
-    pub mul: Mul,
-    /// 圧縮（1/Z の計算）
-    pub compress: Compress,
-    /// 何鍵ずつ同時に計算するか（使ってよい SIMD の上限）
-    pub simd: Simd,
-}
-
-/// 基点倍算 `s * B` の方法
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Mul {
-    /// 自前の櫛形テーブルを直接引く（可変時間なので探索専用）
-    #[default]
-    Table,
-    /// curve25519-dalek の定数時間実装（タイミング攻撃に強いが遅い）
-    ConstantTime,
-}
-
-/// 圧縮に必要な 1/Z の計算方法
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Compress {
-    /// [`BATCH`] 鍵ぶんの逆元を1回にまとめる（Montgomery の方法）
-    #[default]
-    Batch,
-    /// 1鍵ずつ逆元を計算する
-    Each,
-}
-
-/// 使ってよい SIMD の上限。CPU が対応していなければ、対応している中で一番上のものに下がる
-/// （上から Avx512Ifma → Avx512 → Avx2 → Off。x86_64 以外では常に Off）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub enum Simd {
-    /// 1鍵ずつ（高速化前）
-    Off,
-    /// AVX2 で4鍵ずつ（体演算は 25.5 ビット × 10 リム）
-    Avx2,
-    /// AVX-512F で8鍵ずつ（体演算は 25.5 ビット × 10 リム）
-    Avx512,
-    /// AVX-512 IFMA で8鍵ずつ（体演算は 51 ビット × 5 リムで、52 ビットの積和命令を使う）
-    #[default]
-    Avx512Ifma,
-}
-
 impl Simd {
-    /// 上から順に
-    pub const ALL: [Simd; 4] = [Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Simd::Avx512Ifma => "AVX-512 IFMA",
-            Simd::Avx512 => "AVX-512",
-            Simd::Avx2 => "AVX2",
-            Simd::Off => "なし",
-        }
-    }
-
     /// この CPU で使えるか
     pub fn supported(self) -> bool {
         Lanes::detect(self).simd() == self
@@ -143,35 +105,6 @@ impl Lanes {
 }
 
 impl Backend {
-    /// 全部の高速化あり（既定）
-    pub const FAST: Backend = Backend {
-        mul: Mul::Table,
-        compress: Compress::Batch,
-        simd: Simd::Avx512Ifma,
-    };
-    /// 全部の高速化なし（ed25519-dalek で1鍵ずつ計算するのと同じ）
-    pub const BASELINE: Backend = Backend {
-        mul: Mul::ConstantTime,
-        compress: Compress::Each,
-        simd: Simd::Off,
-    };
-    /// すべての組み合わせ（先頭が FAST、最後が BASELINE）
-    pub const ALL: [Backend; 16] = {
-        let muls = [Mul::Table, Mul::ConstantTime];
-        let compresses = [Compress::Batch, Compress::Each];
-        let mut all = [Backend::FAST; 16];
-        let mut i = 0;
-        while i < 16 {
-            all[i] = Backend {
-                mul: muls[i / 8],
-                compress: compresses[(i / 4) % 2],
-                simd: Simd::ALL[i % 4],
-            };
-            i += 1;
-        }
-        all
-    };
-
     /// 探索で使う表を作っておく（探索の時間に含めないため。2回目からは何もしない）
     pub fn prepare(&self) {
         if self.mul != Mul::Table {
@@ -193,6 +126,7 @@ impl Backend {
     }
 }
 
+/// 実際に使う SIMD を表示する（上限より下がったときは理由も添える）
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mul = match self.mul {
@@ -211,7 +145,6 @@ impl std::fmt::Display for Backend {
         Ok(())
     }
 }
-
 /// スレッドごとに1つ持つ作業領域
 pub struct Deriver {
     backend: Backend,
@@ -257,7 +190,7 @@ impl Deriver {
                     .iter_mut()
                     .zip(seeds.as_chunks::<4>().0)
                 {
-                    *o = crate::sha512x4::prefixes(a, s).map(clamp_integer);
+                    *o = crate::service::derive::sha512x4::prefixes(a, s).map(clamp_integer);
                 }
             }
             Lanes::Scalar => {
@@ -301,7 +234,7 @@ fn scalars_avx512(a: Avx512, seeds: &Seeds, out: &mut Seeds) {
         .iter_mut()
         .zip(seeds.as_chunks::<8>().0)
     {
-        *o = crate::sha512x8::prefixes(a, s).map(clamp_integer);
+        *o = crate::service::derive::sha512x8::prefixes(a, s).map(clamp_integer);
     }
 }
 

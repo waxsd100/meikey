@@ -1,13 +1,14 @@
-//! ed25519 鍵と OpenSSH 形式への書き出し
+//! ed25519 鍵と、公開鍵の base64・authorized_keys の1行（秘密鍵のファイルへの書き出しは
+//! [`crate::repository::key_file`]）
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::SigningKey;
 
-const KEY_TYPE: &[u8] = b"ssh-ed25519";
+pub(crate) const KEY_TYPE: &[u8] = b"ssh-ed25519";
 
 /// 公開鍵 blob（`string "ssh-ed25519"` + `string pubkey`）の長さ
-const BLOB_LEN: usize = 4 + KEY_TYPE.len() + 4 + 32;
+pub(crate) const BLOB_LEN: usize = 4 + KEY_TYPE.len() + 4 + 32;
 
 /// 公開鍵 blob の先頭（`string "ssh-ed25519"` + 公開鍵の長さ）。どの鍵でも同じ
 const BLOB_HEADER: [u8; BLOB_LEN - 32] = {
@@ -98,19 +99,17 @@ impl VanityKey {
         Self { seed, public }
     }
 
-    /// テストからだけ使う（本体のビルドには入らない）
-    #[cfg(test)]
+    /// 秘密鍵（シード）。秘密鍵のファイルを書くときにだけ使う
     pub(crate) fn seed(&self) -> &[u8; 32] {
         &self.seed
     }
 
-    /// テストからだけ使う（本体のビルドには入らない）
-    #[cfg(test)]
     pub(crate) fn public_bytes(&self) -> &[u8; 32] {
         &self.public
     }
 
-    fn public_blob(&self) -> [u8; BLOB_LEN] {
+    /// 公開鍵 blob（`string "ssh-ed25519"` + `string pubkey`）
+    pub(crate) fn public_blob(&self) -> [u8; BLOB_LEN] {
         let mut blob = [0u8; BLOB_LEN];
         blob[..BLOB_HEADER.len()].copy_from_slice(&BLOB_HEADER);
         blob[BLOB_HEADER.len()..].copy_from_slice(&self.public);
@@ -137,67 +136,6 @@ impl VanityKey {
             c => format!("ssh-ed25519 {b64} {c}"),
         }
     }
-
-    /// 暗号化なしの OpenSSH 秘密鍵（openssh-key-v1）
-    ///
-    /// `checkint` は復号確認用の乱数。テストで固定できるよう引数にしている。
-    pub fn private_openssh(&self, comment: &str, checkint: u32) -> String {
-        let mut keypair = [0u8; 64];
-        keypair[..32].copy_from_slice(&self.seed);
-        keypair[32..].copy_from_slice(&self.public);
-
-        let mut private = Vec::new();
-        SshWriter::new(&mut private)
-            .u32(checkint)
-            .u32(checkint)
-            .string(KEY_TYPE)
-            .string(self.public.as_slice())
-            .string(keypair.as_slice())
-            .string(comment.as_bytes());
-        // 8バイト境界まで 1, 2, 3, ... で埋める
-        let pad = private.len().next_multiple_of(8) - private.len();
-        private.extend(1..=pad as u8);
-
-        let mut body = b"openssh-key-v1\0".to_vec();
-        SshWriter::new(&mut body)
-            .string(b"none") // cipher
-            .string(b"none") // kdf
-            .string(b"") // kdf options
-            .u32(1) // 鍵の数
-            .string(self.public_blob().as_slice())
-            .string(private.as_slice());
-
-        let b64 = STANDARD.encode(body);
-        let lines: Vec<&str> = b64
-            .as_bytes()
-            .chunks(70)
-            .map(|c| std::str::from_utf8(c).expect("base64 は ASCII"))
-            .collect();
-        format!(
-            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
-            lines.join("\n")
-        )
-    }
-}
-
-/// SSH のワイヤ形式（RFC 4251）で書き込むヘルパー
-struct SshWriter<'a>(&'a mut Vec<u8>);
-
-impl<'a> SshWriter<'a> {
-    fn new(buf: &'a mut Vec<u8>) -> Self {
-        Self(buf)
-    }
-
-    fn u32(&mut self, v: u32) -> &mut Self {
-        self.0.extend_from_slice(&v.to_be_bytes());
-        self
-    }
-
-    fn string(&mut self, s: &[u8]) -> &mut Self {
-        self.u32(u32::try_from(s.len()).expect("4GiB 未満"));
-        self.0.extend_from_slice(s);
-        self
-    }
 }
 
 #[cfg(test)]
@@ -208,8 +146,8 @@ mod tests {
     use proptest::prelude::*;
     use rstest::rstest;
 
-    // 公開鍵の行・秘密鍵ファイル・base64 が仕様どおりかは、下の `conformance` の proptest で
-    // 独立実装と突き合わせている。ここではこのモジュールの細部だけを確かめる。
+    // 公開鍵の行・base64 が仕様どおりかは、下の `conformance` の proptest で独立実装と突き合わせている。
+    // ここではこのモジュールの細部だけを確かめる。
 
     /// 公開鍵の1行の完成形（RFC 8032 TEST 1 の鍵）。ssh-key クレートでも同じ鍵として読める
     #[rstest]
@@ -239,27 +177,6 @@ mod tests {
         assert_eq!(&BLOB_HEADER[range], want);
     }
 
-    /// RFC 4251 Section 5 に載っている例そのもの
-    #[rstest]
-    #[case::uint32_example(None, Some(699_921_578), &[0x29, 0xb7, 0xf4, 0xaa])]
-    #[case::string_example(Some(b"testing".as_slice()), None, b"\x00\x00\x00\x07testing")]
-    #[case::empty_string(Some(b"".as_slice()), None, &[0, 0, 0, 0])]
-    fn ssh_writer_matches_rfc_4251_examples(
-        #[case] string: Option<&[u8]>,
-        #[case] uint32: Option<u32>,
-        #[case] want: &[u8],
-    ) {
-        let mut buf = Vec::new();
-        let mut w = SshWriter::new(&mut buf);
-        if let Some(s) = string {
-            w.string(s);
-        }
-        if let Some(v) = uint32 {
-            w.u32(v);
-        }
-        assert_eq!(buf, want);
-    }
-
     /// コメントの検査。使えない文字なら、その文字とエラーメッセージ
     #[rstest]
     #[case::empty("", None)]
@@ -278,39 +195,6 @@ mod tests {
                 assert_eq!(e.to_string(), message);
             }
         }
-    }
-
-    #[derive(Debug, Clone)]
-    enum Op {
-        U32(u32),
-        Str(Vec<u8>),
-    }
-
-    /// どんな並びで書いても、仕様書から書いた独立実装（RFC 4251 Section 5）と同じバイト列になる
-    #[rstest]
-    fn ssh_writer_matches_independent_rfc_4251() {
-        let op = prop_oneof![
-            any::<u32>().prop_map(Op::U32),
-            prop::collection::vec(any::<u8>(), 0..300).prop_map(Op::Str),
-        ];
-        check(1024, prop::collection::vec(op, 0..12), |ops| {
-            let (mut ours, mut spec) = (Vec::new(), Vec::new());
-            let mut w = SshWriter::new(&mut ours);
-            for op in &ops {
-                match op {
-                    Op::U32(v) => {
-                        w.u32(*v);
-                        ssh_format::put_uint32(&mut spec, *v);
-                    }
-                    Op::Str(s) => {
-                        w.string(s);
-                        ssh_format::put_string(&mut spec, s);
-                    }
-                }
-            }
-            prop_assert_eq!(ours, spec);
-            Ok(())
-        });
     }
 
     /// Debug 表示は公開鍵だけで、どんな鍵でもシード（秘密鍵）が出ない
@@ -353,42 +237,10 @@ mod tests {
         });
     }
 
-    /// RFC・仕様への準拠（正解は tests/support/ の独立実装）。RFC 8032 の鍵の書き出し、公開鍵の1行
-    /// （RFC 8709・RFC 4648・authorized_keys）、秘密鍵ファイル（PROTOCOL.key・agent draft 3.2.3）
+    /// RFC・仕様への準拠（正解は tests/support/ の独立実装）: 公開鍵の1行（RFC 8709・RFC 4648・
+    /// authorized_keys）。秘密鍵ファイルは [`crate::repository::key_file`] のテスト
     mod conformance {
         use super::*;
-
-        /// RFC の鍵を OpenSSH 形式で書き出すと、仕様どおりのファイルになり、中身は RFC の値そのもの
-        #[rstest]
-        fn section_7_1_as_openssh_files(
-            #[values("1", "2", "3", "1024", "SHA(abc)")] name: &str,
-            #[values("", "rfc8032", "日本語のコメント")] comment: &str,
-        ) {
-            let v = rfc8032::vector(name);
-            let key = VanityKey::from_seed(v.secret);
-
-            // 公開鍵の1行（authorized_keys 形式 → RFC 4648 base64 → RFC 8709 blob）
-            let line = ssh_format::parse_authorized_key(&key.public_openssh(comment)).unwrap();
-            assert_eq!(line.public_key, v.public);
-            assert_eq!(
-                line.comment.as_deref(),
-                (!comment.is_empty()).then_some(comment)
-            );
-
-            // 秘密鍵ファイル（PROTOCOL.key + agent draft 3.2.3）
-            let file =
-                ssh_format::parse_private_key_file(&key.private_openssh(comment, 0x1234_5678))
-                    .unwrap();
-            assert_eq!(file.violations(), Vec::<String>::new());
-            let k = &file.keys[0];
-            assert_eq!(k.k, v.secret, "k は RFC 8032 の秘密鍵そのもの");
-            assert_eq!(k.enc_a, v.public, "ENC(A) は RFC 8032 の公開鍵");
-            assert_eq!(k.comment, comment.as_bytes());
-            assert_eq!((file.checkint1, file.checkint2), (0x1234_5678, 0x1234_5678));
-
-            // ファイルから取り出した k で、RFC の署名がそのまま再現できる
-            assert_eq!(rfc8032::sign(&k.k, &v.message), v.signature);
-        }
 
         // ===========================================================================
         // RFC 8709 / RFC 4648 / authorized_keys: 公開鍵の1行
@@ -447,49 +299,6 @@ mod tests {
             assert_eq!(&b64[..FIXED_PREFIX.len()], FIXED_PREFIX);
             // blob の 18 バイト目（鍵長 0x20 の最下位バイト）の下位2ビット = 0 と、鍵の先頭バイトの上位4ビット
             assert_eq!(b64.as_bytes()[FIXED_PREFIX.len()] as char, want);
-        }
-
-        // ===========================================================================
-        // PROTOCOL.key + agent draft 3.2.3: 秘密鍵ファイル
-        // ===========================================================================
-
-        /// 秘密鍵ファイルの各フィールドが仕様どおりで、別の実装（ssh-key クレート）でも同じ鍵として読める。
-        /// コメント（任意の Unicode）のバイト数を 8 で割った余りを変えて、パディング 0〜7 バイトをすべて通す
-        #[rstest]
-        fn private_key_file_follows_spec(#[values(0, 1, 2, 3, 4, 5, 6, 7)] remainder: usize) {
-            // 秘密鍵の部分は checkint 2つ（8）+ 鍵の種類（4 + 11）+ ENC(A)（4 + 32）+ k || ENC(A)（4 + 64）
-            // + コメント（4 + 長さ）で 131 + 長さ バイト。これをブロック長 8 の倍数にそろえる
-            let padding = (8 - (131 + remainder) % 8) % 8;
-            let comments = "(?s).{0,100}".prop_map(move |c: String| {
-                let fill = (remainder + 8 - c.len() % 8) % 8;
-                c + &"x".repeat(fill)
-            });
-            check(
-                32,
-                (any::<[u8; 32]>(), comments, any::<u32>()),
-                |(seed, comment, checkint)| {
-                    let key = VanityKey::from_seed(seed);
-                    let pem = key.private_openssh(&comment, checkint);
-                    let file =
-                        ssh_format::parse_private_key_file(&pem).map_err(TestCaseError::fail)?;
-                    prop_assert_eq!(file.violations(), Vec::<String>::new());
-                    prop_assert_eq!(file.padding.len(), padding);
-                    let k = &file.keys[0];
-                    prop_assert_eq!(k.k, seed);
-                    prop_assert_eq!(&k.enc_a, key.public_bytes());
-                    prop_assert_eq!(&k.comment, comment.as_bytes());
-                    prop_assert_eq!((file.checkint1, file.checkint2), (checkint, checkint));
-
-                    let parsed = ssh_key::PrivateKey::from_openssh(&pem)
-                        .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                    prop_assert_eq!(parsed.comment(), comment.as_str());
-                    prop_assert_eq!(
-                        parsed.key_data().ed25519().unwrap().private.to_bytes(),
-                        seed
-                    );
-                    Ok(())
-                },
-            );
         }
     }
 }

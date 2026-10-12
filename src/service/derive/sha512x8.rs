@@ -4,7 +4,7 @@
 //! 512 ビットレジスタの 64 ビットのレーン8つに8つのシードの同じワードを入れ、80 ラウンドを8つ同時に進める。
 //! スカラーには SHA-512 の前半 32 バイトだけを使うので、出力も前半だけ計算する。
 //!
-//! AVX-512 の命令で、AVX2 版（[`crate::sha512x4`]）では数命令かかっていた操作を1命令にしている:
+//! AVX-512 の命令で、AVX2 版（[`crate::service::derive::sha512x4`]）では数命令かかっていた操作を1命令にしている:
 //! - 64 ビットの回転: `vprorq`（AVX2 はシフト2回と OR）
 //! - 3入力の論理演算（Σ の XOR 3つ・Ch・Maj）: `vpternlogq`（AVX2 は2〜4命令）
 //! - 入力と出力の並べ替え: 8シードを 512 ビットずつ読み、`vpermt2q`（2レジスタからの任意の並べ替え）で
@@ -12,8 +12,8 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::avx512::Avx512;
-use crate::sha512x4::{IV, K};
+use crate::service::derive::avx512::Avx512;
+use crate::service::derive::sha512x4::{IV, K};
 use std::arch::x86_64::*;
 
 /// 8つのシードの `SHA-512(seed)[..32]`
@@ -25,7 +25,7 @@ pub fn prefixes(avx512: Avx512, seeds: &[[u8; 32]; 8]) -> [[u8; 32]; 8] {
 
 // 以下の unsafe fn は AVX-512（F・BW）の命令を呼ぶだけで、対応した CPU でだけ呼ぶこと。
 // `#[target_feature]` の関数は `#[inline(always)]` にできないので、入口（prefixes_avx512）だけに付けて
-// ほかは展開させる（[`crate::avx512`] と同じ）
+// ほかは展開させる（[`crate::service::derive::avx512`] と同じ）
 
 /// `vpternlogq` の真理値表（ビット `4a + 2b + c` が `f(a, b, c)`）
 const XOR3: i32 = 0x96;

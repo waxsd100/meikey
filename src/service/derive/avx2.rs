@@ -1,4 +1,4 @@
-//! AVX2 で4鍵の基点倍算を同時に進める（[`crate::comb`] の櫛形テーブルと同じ計算を4レーンで）
+//! AVX2 で4鍵の基点倍算を同時に進める（[`crate::service::derive::comb`] の櫛形テーブルと同じ計算を4レーンで）
 //!
 //! 体の元は 25.5 ビット × 10 リム（偶数番目のリムは 26 ビット、奇数番目は 25 ビット。値は
 //! `Σ l[i]·2^⌈25.5·i⌉`）で表し、256 ビットレジスタの 64 ビットのレーン4つに、4鍵の同じリムを入れる。
@@ -18,8 +18,8 @@
 // リムの添字の計算がそのまま式になるので、添字でループする
 #![allow(clippy::needless_range_loop)]
 
-use crate::comb::{COLS, Extended, ROWS, Table, signed_digits};
-use crate::field::Fe;
+use crate::service::derive::comb::{COLS, Extended, ROWS, Table, signed_digits};
+use crate::service::derive::field::Fe;
 use std::arch::x86_64::*;
 use std::sync::LazyLock;
 
@@ -271,7 +271,7 @@ unsafe fn carry_step(c: &mut [__m256i; 10], k: usize) {
     }
 }
 
-/// 拡張座標に（[`crate::comb`] の `Niels::to_extended` と同じ。X, Y は次の加算に渡すため繰り上げておく）
+/// 拡張座標に（[`crate::service::derive::comb`] の `Niels::to_extended` と同じ。X, Y は次の加算に渡すため繰り上げておく）
 #[inline(always)]
 unsafe fn to_extended(n: &Niels4) -> Ext4 {
     const TWO: [u64; 10] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -294,7 +294,7 @@ unsafe fn to_extended(n: &Niels4) -> Ext4 {
     }
 }
 
-/// 拡張座標 + アフィン点（[`crate::comb`] の `add_niels_impl` と同じ式）。
+/// 拡張座標 + アフィン点（[`crate::service::derive::comb`] の `add_niels_impl` と同じ式）。
 /// 入力の X, Y, Z, T は 1.01 倍未満（`mul` か `carry` の結果）、`q` は正規化した値か、その符号反転
 #[inline(always)]
 unsafe fn add_niels<const WITH_T: bool>(p: &Ext4, q: &Niels4) -> Ext4 {
@@ -636,7 +636,7 @@ mod tests {
     }
 
     fn compress(p: &Extended) -> [u8; 32] {
-        crate::comb::compress_with_zinv(p, p.z.invert())
+        crate::service::derive::comb::compress_with_zinv(p, p.z.invert())
     }
 
     fn dalek(s: &[u8; 32]) -> [u8; 32] {

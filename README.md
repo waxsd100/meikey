@@ -133,22 +133,39 @@ RustRover を使う場合は、Rustfmt の **Use rustfmt instead of built-in for
 
 ### 構成
 
+Model・Controller・Service・Repository の4つに分けています。
+
+- **model**：データの型（探す文字列・鍵・計算方法・探索の設定と結果）と、その型だけで完結する処理（検証・変換）。CPU や I/O には依存しません
+- **controller**：CLI。引数を読んで service と repository を呼び、結果を表示します
+- **service**：探索の処理（並列探索・文字列の判定・シードから公開鍵の計算）。体演算や SIMD の型は、公開鍵の計算の内部の部品として `service/derive/` に置いています
+- **repository**：鍵を OpenSSH 形式のファイルに保存します
+
 ```
 src/
-├── main.rs      CLI
-├── key.rs       シード → ed25519 鍵、OpenSSH 形式への書き出し
-├── pattern.rs   文字列の検証・検索・期待試行回数
-├── search.rs    並列探索
-├── derive.rs    シード → 公開鍵を256個ずつ計算
-├── comb.rs      櫛形テーブルによる固定基点倍算
-├── avx2.rs      AVX2 で4鍵同時の倍算
-├── avx512.rs    AVX-512 で8鍵同時の倍算（表・表引き・点の演算。体演算は下の2つ）
-│   ├── ifma.rs    IFMA の体演算（51ビット×5リム）
-│   └── f.rs       IFMA の無い CPU の体演算（25.5ビット×10リム）
-├── sha512x4.rs  AVX2 で4シード同時の SHA-512
-├── sha512x8.rs  AVX-512 で8シード同時の SHA-512
-├── field.rs     GF(2^255-19) の体演算
-└── format.rs    件数・時間の表示
+├── main.rs            起動するだけ（controller::cli を呼ぶ）
+├── model/
+│   ├── pattern.rs     探す文字列（検証・一致した位置・期待試行回数）
+│   ├── key.rs         シード → ed25519 鍵、公開鍵の base64・authorized_keys の1行
+│   ├── backend.rs     公開鍵の計算方法（倍算・圧縮・SIMD）
+│   └── search.rs      探索の設定と結果
+├── controller/
+│   ├── cli.rs         引数を読んで探索・保存を呼び、進捗と結果を表示する
+│   └── format.rs      件数・時間の表示
+├── service/
+│   ├── search.rs      全コアで鍵を作って当たりを探す
+│   ├── matcher.rs     探索ループでの文字列の判定（memmem・総当たり）
+│   └── derive/        シード → 公開鍵を256個ずつ計算
+│       ├── mod.rs       計算方法の切り替え（CPU の検出・表の準備）
+│       ├── field.rs     GF(2^255-19) の体演算
+│       ├── comb.rs      櫛形テーブルによる固定基点倍算
+│       ├── avx2.rs      AVX2 で4鍵同時の倍算
+│       ├── avx512/      AVX-512 で8鍵同時の倍算（mod.rs が表・表引き・点の演算）
+│       │   ├── ifma.rs    IFMA の体演算（51ビット×5リム）
+│       │   └── f.rs       IFMA の無い CPU の体演算（25.5ビット×10リム）
+│       ├── sha512x4.rs  AVX2 で4シード同時の SHA-512
+│       └── sha512x8.rs  AVX-512 で8シード同時の SHA-512
+└── repository/
+    └── key_file.rs    秘密鍵（openssh-key-v1、0600）と .pub の保存
 tests/
 ├── it/          IT（CLI の振る舞い、作った鍵が OpenSSH で使えるか）
 ├── data/        RFC 8032 のテストベクタ

@@ -140,7 +140,7 @@ impl KeyFiles {
     /// ライブラリで作った鍵（`ssh-keygen` に読ませる用）
     pub fn from_key(key: &meikey::VanityKey, comment: &str) -> Self {
         Self {
-            private: key.private_openssh(comment, 0xc0ffee),
+            private: meikey::repository::key_file::private_openssh(key, comment, 0xc0ffee),
             pub_line: key.public_openssh(comment),
         }
     }

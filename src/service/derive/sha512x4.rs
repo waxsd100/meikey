@@ -4,7 +4,7 @@
 //! 256 ビットレジスタの 64 ビットのレーン4つに4つのシードの同じワードを入れ、80 ラウンドを4つ同時に進める。
 //! スカラーには SHA-512 の前半 32 バイトだけを使うので、出力も前半だけ計算する。
 
-use crate::avx2::Avx2;
+use crate::service::derive::avx2::Avx2;
 use std::arch::x86_64::*;
 
 pub(crate) const K: [u64; 80] = [
@@ -120,7 +120,7 @@ macro_rules! rotr {
 
 // 以下の unsafe fn は AVX2 の命令を呼ぶだけで、AVX2 に対応した CPU でだけ呼ぶこと。
 // `#[target_feature]` の関数は `#[inline(always)]` にできないので、入口（prefixes_avx2）だけに付けて
-// ほかは展開させる（[`crate::avx2`] と同じ）
+// ほかは展開させる（[`crate::service::derive::avx2`] と同じ）
 
 #[inline(always)]
 unsafe fn xor3(a: __m256i, b: __m256i, c: __m256i) -> __m256i {

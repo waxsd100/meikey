@@ -1,8 +1,9 @@
-//! 全コアで鍵を生成して、当たりを探す
+//! 全コアで鍵を生成して、当たりを探す（設定と結果の型は [`crate::model::search`]）
 
-use crate::derive::{BATCH, Backend, Deriver, PublicKeys, Seeds};
-use crate::key::{self, PUBLIC_B64_LEN, VanityKey};
-use crate::pattern::{Find, Pattern};
+use crate::model::key::{self, PUBLIC_B64_LEN, VanityKey};
+use crate::model::search::{Outcome, SearchConfig, Stats};
+use crate::service::derive::{BATCH, Deriver, PublicKeys, Seeds};
+use crate::service::matcher::Matcher;
 use rand::Rng;
 use rand::rngs::ChaCha20Rng;
 use std::sync::OnceLock;
@@ -12,57 +13,6 @@ use std::time::{Duration, Instant};
 
 /// 進捗確認・停止確認の間隔（当たり・時間切れに気づくまでの最大の遅れ）
 const TICK: Duration = Duration::from_millis(10);
-
-#[derive(Debug, Clone)]
-pub struct SearchConfig {
-    /// `None` なら判定せずに鍵を作り続ける
-    pub pattern: Option<Pattern>,
-    pub threads: usize,
-    /// 公開鍵の計算方法
-    pub backend: Backend,
-    /// 公開鍵の中から文字列を探す方法
-    pub find: Find,
-    /// `true` なら当たっても止まらず、判定だけして回し続ける（判定込みの速度を測る `--bench` 用）
-    pub bench: bool,
-    /// この時間が経ったら打ち切る
-    pub time_limit: Option<Duration>,
-    /// 進捗コールバックを呼ぶ間隔
-    pub progress_interval: Duration,
-}
-
-impl SearchConfig {
-    pub fn new(pattern: Option<Pattern>) -> Self {
-        Self {
-            pattern,
-            threads: thread::available_parallelism().map_or(1, |n| n.get()),
-            backend: Backend::default(),
-            find: Find::default(),
-            bench: false,
-            time_limit: None,
-            progress_interval: Duration::from_secs(5),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Stats {
-    pub tries: u64,
-    pub elapsed: Duration,
-}
-
-impl Stats {
-    /// 平均の生成速度（鍵/秒）
-    pub fn rate(&self) -> f64 {
-        self.tries as f64 / self.elapsed.as_secs_f64().max(f64::EPSILON)
-    }
-}
-
-#[derive(Debug)]
-pub struct Outcome {
-    /// 見つかった鍵（打ち切り・ベンチマークなら `None`）
-    pub key: Option<VanityKey>,
-    pub stats: Stats,
-}
 
 /// 探索を実行する。`on_progress` は呼び出し元スレッドで定期的に呼ばれる。
 pub fn run(config: &SearchConfig, mut on_progress: impl FnMut(Stats)) -> Outcome {
@@ -120,7 +70,10 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
     let _guard = StopOnPanic(stop);
     let mut rng: ChaCha20Rng = rand::make_rng();
     let mut deriver = Deriver::new(config.backend);
-    let judge = config.pattern.as_ref().map(|p| (p, p.matcher(config.find)));
+    let judge = config
+        .pattern
+        .as_ref()
+        .map(|p| (p, Matcher::new(p, config.find)));
     let mut seeds: Seeds = [[0u8; 32]; BATCH];
     let mut publics: PublicKeys = [[0u8; 32]; BATCH];
     let mut b64 = [0u8; PUBLIC_B64_LEN];
@@ -163,6 +116,8 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::backend::Backend;
+    use crate::model::pattern::{Find, Pattern};
     use crate::property::check;
     use proptest::prelude::*;
     use rstest::rstest;
@@ -269,25 +224,6 @@ mod tests {
                 *t >= interval * (k as u32 + 1),
                 "{k} 回目が早すぎる: {at:?}"
             );
-        }
-    }
-
-    /// 速度は 試行回数 / 経過秒。経過時間 0 でも 0 除算せず有限
-    #[rstest]
-    #[case::per_second(1000, 1.0, Some(1000.0))]
-    #[case::half_second(150, 0.5, Some(300.0))]
-    #[case::zero_elapsed_no_tries(0, 0.0, None)]
-    #[case::zero_elapsed(1, 0.0, None)]
-    #[case::zero_elapsed_max_tries(u64::MAX, 0.0, None)]
-    fn rate(#[case] tries: u64, #[case] secs: f64, #[case] want: Option<f64>) {
-        let r = Stats {
-            tries,
-            elapsed: Duration::from_secs_f64(secs),
-        }
-        .rate();
-        assert!(r.is_finite());
-        if let Some(want) = want {
-            assert!((r - want).abs() < 1e-9, "{r}");
         }
     }
 

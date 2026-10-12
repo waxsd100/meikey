@@ -1,31 +1,20 @@
 //! meikey — 公開鍵に好きな文字列を刻む ed25519 バニティ鍵ジェネレーター
 //!
-//! - [`key`] — シードから鍵を作り、OpenSSH 形式に書き出す
-//! - [`pattern`] — 探す文字列と、公開鍵に含まれるかの判定（memmem と総当たりを切り替えられる）
-//! - [`search`] — 全コアで鍵を生成して当たりを探す
-//! - [`format`] — 件数・時間の表示
-//! - [`derive`] — シードから公開鍵をまとめて計算する（高速化ありと高速化前の計算を切り替えられる。x86_64 では AVX-512 で8鍵ずつ、AVX2 で4鍵ずつ同時に計算する）
+//! - [`model`] — データの型（探す文字列・鍵・計算方法・探索の設定と結果）と、その型だけで完結する処理
+//! - [`controller`] — CLI（引数を読んで service と repository を呼ぶ）と、件数・時間の表示
+//! - [`service`] — 並列探索・文字列の判定・シードから公開鍵の計算（AVX2・AVX-512 を含む）
+//! - [`repository`] — 鍵を OpenSSH 形式のファイルに保存する
 
-#[cfg(target_arch = "x86_64")]
-mod avx2;
-#[cfg(target_arch = "x86_64")]
-mod avx512;
-mod comb;
-pub mod derive;
-mod field;
-pub mod format;
-pub mod key;
-pub mod pattern;
-pub mod search;
-#[cfg(target_arch = "x86_64")]
-mod sha512x4;
-#[cfg(target_arch = "x86_64")]
-mod sha512x8;
+pub mod controller;
+pub mod model;
+pub mod repository;
+pub mod service;
 
-pub use derive::{Backend, Compress, Mul, Simd};
-pub use key::VanityKey;
-pub use pattern::{Find, Matcher, Pattern, PatternError};
-pub use search::{Outcome, SearchConfig, Stats};
+pub use model::backend::{Backend, Compress, Mul, Simd};
+pub use model::key::VanityKey;
+pub use model::pattern::{Find, Pattern, PatternError};
+pub use model::search::{Outcome, SearchConfig, Stats};
+pub use service::matcher::Matcher;
 
 // ---- テスト専用（tests/support/ の補助と独立実装を IT と共有する。テストは各ファイルの `mod tests`） ----
 #[cfg(test)]

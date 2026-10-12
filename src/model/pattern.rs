@@ -1,12 +1,11 @@
-//! 探す文字列と、公開鍵に含まれるかの判定
+//! 探す文字列と、公開鍵に含まれるかの判定（探索ループで速く判定するものは [`crate::service::matcher`]）
 
-use crate::key::{FIXED_PREFIX, PUBLIC_B64_LEN, PublicB64};
-use memchr::memmem;
+use crate::model::key::{FIXED_PREFIX, PUBLIC_B64_LEN, PublicB64};
 use std::fmt;
 use std::ops::Range;
 
 /// 判定に使う範囲の先頭（固定部分の直後）
-const SEARCH_START: usize = FIXED_PREFIX.len();
+pub(crate) const SEARCH_START: usize = FIXED_PREFIX.len();
 
 /// 固定部分の直後の1文字は A〜P しか出ないので、自由に変わるのはその次から
 const FREE_LEN: usize = PUBLIC_B64_LEN - SEARCH_START - 1;
@@ -63,6 +62,11 @@ impl Pattern {
         })
     }
 
+    /// 探す文字列のバイト列（検証済みの ASCII）
+    pub(crate) fn needle(&self) -> &[u8] {
+        &self.needle
+    }
+
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.needle[..]).expect("検証済みの ASCII")
     }
@@ -111,25 +115,6 @@ impl Pattern {
     pub fn expected_tries(&self) -> f64 {
         self.probability().recip()
     }
-
-    /// 探索ループで使う判定器を作る（スレッドごとに1つ）
-    pub fn matcher(&self, find: Find) -> Matcher {
-        Matcher(match find {
-            Find::Naive => Inner::Naive(self.clone()),
-            Find::Memmem => {
-                // 大小文字を区別しないなら、探す文字列も公開鍵も小文字にそろえてから探す
-                let needle: Vec<u8> = if self.case_sensitive {
-                    self.needle.to_vec()
-                } else {
-                    self.needle.iter().map(|&c| fold_case(c)).collect()
-                };
-                Inner::Memmem {
-                    finder: memmem::Finder::new(&needle).into_owned(),
-                    fold: !self.case_sensitive,
-                }
-            }
-        })
-    }
 }
 
 /// 公開鍵の中から文字列を探す方法
@@ -151,69 +136,17 @@ impl fmt::Display for Find {
     }
 }
 
-/// [`Pattern::matcher`] で作る判定器。結果は [`Pattern::find`] と同じ（最初に一致した位置）
-#[derive(Debug, Clone)]
-pub struct Matcher(Inner);
-
-// スレッドに1つしか作らないので大きさは問題にならない（Box にすると判定のたびに間接参照が増える）
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
-enum Inner {
-    Naive(Pattern),
-    Memmem {
-        finder: memmem::Finder<'static>,
-        /// 公開鍵を小文字にそろえてから探す（大小文字を区別しないとき）
-        fold: bool,
-    },
-}
-
-impl Matcher {
-    /// 公開鍵の base64 の中で一致した位置
-    #[inline]
-    pub fn find(&self, b64: &PublicB64) -> Option<Range<usize>> {
-        match &self.0 {
-            Inner::Naive(p) => p.find(b64),
-            Inner::Memmem { finder, fold } => {
-                let hay: &[u8; PUBLIC_B64_LEN - SEARCH_START] =
-                    b64[SEARCH_START..].try_into().expect("長さは定数");
-                let folded;
-                let hay = if *fold {
-                    folded = hay.map(fold_case);
-                    &folded
-                } else {
-                    hay
-                };
-                let i = SEARCH_START + finder.find(hay)?;
-                Some(i..i + finder.needle().len())
-            }
-        }
-    }
-
-    #[inline]
-    pub fn is_match(&self, b64: &PublicB64) -> bool {
-        self.find(b64).is_some()
-    }
-}
-
-/// base64 の文字を小文字にそろえる。base64 の文字表では、英大文字だけが 0x20 のビットを持たず、
-/// 英小文字・数字・`+`・`/` は持っているので、OR 1回で `to_ascii_lowercase` と同じになる
-/// （分岐がないので、43文字ぶんがまとめて SIMD 命令になる）
-#[inline(always)]
-fn fold_case(c: u8) -> u8 {
-    c | 0x20
-}
-
 fn is_base64_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '+' || c == '/'
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rstest::rstest;
 
     /// 実際に生成した鍵
-    const SAMPLE: &PublicB64 =
+    pub(crate) const SAMPLE: &PublicB64 =
         b"AAAAC3NzaC1lZDI1NTE5AAAAIIQK2/0eXLDku+cWkIDsqHQOwFFTEDDoWaKofXuV/Gy9";
 
     fn pat(s: &str, cs: bool) -> Pattern {
@@ -257,7 +190,7 @@ mod tests {
     }
 
     /// 固定部分（先頭25文字）だけで、後ろは全部 '0' の公開鍵
-    const PREFIX_ONLY: &PublicB64 =
+    pub(crate) const PREFIX_ONLY: &PublicB64 =
         b"AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000";
 
     #[rstest]
@@ -278,23 +211,10 @@ mod tests {
         #[case] s: &str,
         #[case] cs: bool,
         #[case] want: Option<Range<usize>>,
-        #[values(Find::Memmem, Find::Naive)] how: Find,
     ) {
         let p = pat(s, cs);
         assert_eq!(p.find(b64), want);
         assert_eq!(p.is_match(b64), want.is_some());
-        let m = p.matcher(how);
-        assert_eq!(m.find(b64), want);
-        assert_eq!(m.is_match(b64), want.is_some());
-    }
-
-    /// base64 の64文字すべてで、OR 0x20 は to_ascii_lowercase と同じ
-    #[rstest]
-    fn fold_case_is_lowercase_for_base64() {
-        for c in ALPHABET.bytes() {
-            assert_eq!(fold_case(c), c.to_ascii_lowercase(), "{}", c as char);
-        }
-        assert_eq!(ALPHABET.len(), 64);
     }
 
     /// --bench の表示。既定は memmem
@@ -332,7 +252,8 @@ mod tests {
     use crate::property::check;
     use proptest::prelude::*;
 
-    const ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    pub(crate) const ALPHABET: &str =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     /// 仕様: 1〜42 文字で、全部が base64 の文字表（RFC 4648 Table 1）の文字なら受け付ける
     fn expected_error(s: &str) -> Option<PatternError> {
@@ -366,7 +287,7 @@ mod tests {
 
     /// 公開鍵の base64 と同じ形（固定の 25 文字 + 任意の 43 文字）。
     /// `needle` を `pos` に埋め込むかどうかも選べるようにして、一致する例を十分に作る
-    fn b64_with(needle: &str, plant: Option<usize>, rest: &str) -> PublicB64 {
+    pub(crate) fn b64_with(needle: &str, plant: Option<usize>, rest: &str) -> PublicB64 {
         let mut free: Vec<u8> = rest.as_bytes().to_vec();
         if let Some(pos) = plant {
             let pos = pos % (free.len() - needle.len() + 1);
@@ -395,14 +316,13 @@ mod tests {
         });
     }
 
-    /// 単純な文字列検索と同じ結果になる（Pattern::find も、どちらの判定器も）。
-    /// `planted` なら探す文字列を必ずどこかに埋め込む。長い文字列は埋め込まないとまず一致しない
+    /// 単純な文字列検索と同じ結果になる。`planted` なら探す文字列を必ずどこかに埋め込む。
+    /// 長い文字列は埋め込まないとまず一致しない
     #[rstest]
     fn find_matches_naive_search(
         #[values("[A-Za-z0-9+/]{1,6}", "[A-Za-z0-9+/]{7,42}")] needles: &'static str,
         #[values(false, true)] cs: bool,
         #[values(false, true)] planted: bool,
-        #[values(Find::Memmem, Find::Naive)] how: Find,
     ) {
         let strategy = ("[A-Za-z0-9+/]{43}", needles, any::<usize>());
         check(1024, strategy, |(rest, needle, pos)| {
@@ -412,11 +332,8 @@ mod tests {
             let want = naive_find(s, &needle, cs);
             prop_assert_eq!(p.find(&b64), want.clone());
             prop_assert_eq!(p.is_match(&b64), want.is_some());
-            let m = p.matcher(how);
-            prop_assert_eq!(m.find(&b64), want.clone());
-            prop_assert_eq!(m.is_match(&b64), want.is_some());
             if planted {
-                prop_assert!(m.is_match(&b64), "埋め込んだのに見つからない");
+                prop_assert!(p.is_match(&b64), "埋め込んだのに見つからない");
             }
             Ok(())
         });

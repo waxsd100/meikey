@@ -1,4 +1,4 @@
-//! AVX-512 IFMA の体演算: 51 ビット × 5 リム（[`crate::field::Fe`] と同じ切り方）
+//! AVX-512 IFMA の体演算: 51 ビット × 5 リム（[`crate::service::derive::field::Fe`] と同じ切り方）
 //!
 //! `vpmadd52luq` / `vpmadd52huq` は、各レーンの下位 52 ビットどうしの積（104 ビット）の下位 52 ビット・
 //! 上位 52 ビットを 64 ビットのアキュムレータに足す。51 ビットのリムなら積を1組2命令で作れるので、
@@ -9,8 +9,8 @@
 //! `add`・`sub`・`mul` は結果を必ず繰り上げて 2^51 + 2^17 未満にする（[`Fe5`] を参照）。
 
 use super::{Field8, Ifma, Table8};
-use crate::comb::Extended;
-use crate::field::Fe;
+use crate::service::derive::comb::Extended;
+use crate::service::derive::field::Fe;
 use std::arch::x86_64::*;
 use std::sync::LazyLock;
 
@@ -107,7 +107,7 @@ impl Field8 for Fe5 {
         carry(r)
     }
 
-    /// 積 a[i]·b[j] = lo + hi·2^52 を、lo は 51·(i+j) ビット目、hi は 51·(i+j+1) + 1 ビット目に足す。
+    /// 積 `a[i]·b[j] = lo + hi·2^52` を、lo は `51·(i+j)` ビット目、hi は `51·(i+j+1) + 1` ビット目に足す。
     /// hi は1つ上のリムの位置から 1 ビットずれるので、まとめてから 2 倍する
     #[inline(always)]
     unsafe fn mul(&self, b: &Fe5) -> Fe5 {
@@ -178,7 +178,7 @@ pub fn prepare(_: Ifma) {
     LazyLock::force(&TABLE);
 }
 
-/// [`crate::comb::Table::mul_base_batch`] と同じ計算を、8鍵ずつ AVX-512 IFMA で（`N` は 8 の倍数）
+/// [`crate::service::derive::comb::Table::mul_base_batch`] と同じ計算を、8鍵ずつ AVX-512 IFMA で（`N` は 8 の倍数）
 pub fn mul_base_batch<const N: usize>(
     ifma: Ifma,
     scalars: &[[u8; 32]; N],

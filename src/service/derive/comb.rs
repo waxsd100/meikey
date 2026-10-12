@@ -7,7 +7,7 @@
 //! 複数の鍵をまとめて、表の1行ずつ処理する（[`Table::mul_base_batch`]）。表全体は数MBあるが、
 //! 同時に使うのは1行（数百KB）だけなので、全コアで回してもキャッシュに収まりやすい。
 
-use crate::field::Fe;
+use crate::service::derive::field::Fe;
 use std::sync::LazyLock;
 
 /// 1桁のビット数（8〜14 で計測して 12 に決めた。13 は全スレッドではわずかに速いが、1スレッドでは遅く、テーブルも倍近くになる）

@@ -14,17 +14,17 @@ slow-timeout = { period = "15s", terminate-after = 4 }
 # コアが多いと全体が 1 秒ほどで終わるので、遅いテストが最後に回ると、それだけを待つ時間ができる
 [[profile.default.overrides]]
 filter = '''
-    test(/^derive::tests::conformance::(implementations_agree|outputs_are_canonical_points_of_order_l)::/)
-    | test(/^field::tests::(arithmetic_matches_bigint|batch_invert_gives_inverses)::/)
-    | test(=field::tests::sums_of_results_can_be_multiplied)
-    | test(/^comb::tests::(add_niels_matches_rfc_point_add|mul_base_matches)::/)
+    test(/^service::derive::tests::conformance::(implementations_agree|outputs_are_canonical_points_of_order_l)::/)
+    | test(/^service::derive::field::tests::(arithmetic_matches_bigint|batch_invert_gives_inverses)::/)
+    | test(=service::derive::field::tests::sums_of_results_can_be_multiplied)
+    | test(/^service::derive::comb::tests::(add_niels_matches_rfc_point_add|mul_base_matches)::/)
     | test(/^keys_work::tests::(sshd_accepts_only_the_registered_key|ssh_keygen_restores_public_key_and_comment)::/)
 '''
 priority = 100
 
 # 時間を測るテスト（進捗の間隔・時間制限で止まるか）。マシンが混んでいると稀に外れるので、1 回だけやり直す
 [[profile.default.overrides]]
-filter = 'test(/^search::tests::(progress_timing|stops_at_time_limit)::/)'
+filter = 'test(/^service::search::tests::(progress_timing|stops_at_time_limit)::/)'
 retries = 1
 
 # CI 用（cargo nextest run --profile ci）: 失敗しても最後まで回し、結果を JUnit 形式でも残す

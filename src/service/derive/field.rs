@@ -303,9 +303,9 @@ mod tests {
     // proptest: 多倍長整数（num-bigint）で計算した値と比べる
     // ---------------------------------------------------------------------------
 
-    use crate::derive::BATCH;
     use crate::property::check;
     use crate::rfc8032;
+    use crate::service::derive::BATCH;
     use num_bigint::BigInt;
     use num_integer::Integer;
     use proptest::prelude::*;

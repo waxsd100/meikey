@@ -44,13 +44,13 @@ dependencies = ["install-nextest"]
 command = "cargo"
 args = ["nextest", "run", "--cargo-profile", "proptest", "--profile", "deep", "${@}"]
 
-# main.rs（CLI の配線）は IT で確かめているので対象外（変異ごとに IT まで回すと遅い）
+# CLI の配線（main.rs・controller/cli.rs）は IT で確かめているので対象外（変異ごとに IT まで回すと遅い）
 [tasks.mutants]
 description = "本体を少しずつ壊して、ユニットテストが検出できるか調べる"
 env = { MEIKEY_PROPTEST_SCALE = "0.1" }
 dependencies = ["install-nextest"]
 command = "cargo"
-args = ["mutants", "--test-tool", "nextest", "--jobs", "2", "--exclude", "src/main.rs", "${@}", "--", "--lib"]
+args = ["mutants", "--test-tool", "nextest", "--jobs", "2", "--exclude", "src/main.rs", "--exclude", "src/controller/cli.rs", "${@}", "--", "--lib"]
 
 # Intel SDE（Intel の命令エミュレーター）で CPU を3種類真似て、SIMD の経路のテストを回す。
 # AVX-512 に対応していない PC でも、AVX-512 IFMA・AVX-512F の経路を実際に実行して確かめられる。
@@ -75,7 +75,7 @@ for case in ${cases}
     set_env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER "${sde} -${cpu} --"
     set_env CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER "${sde} -${cpu} --"
     set_env MEIKEY_REQUIRE_SIMD ${need}
-    exec --fail-on-error cargo nextest run --cargo-profile proptest --lib -E "test(/^(avx2|avx512|sha512x4|sha512x8|derive)::/)"
+    exec --fail-on-error cargo nextest run --cargo-profile proptest --lib -E "test(/^service::derive::(avx2|avx512|sha512x4|sha512x8|tests)::/)"
 end
 '''
 
