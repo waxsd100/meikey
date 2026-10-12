@@ -136,7 +136,7 @@ RustRover を使う場合は、Rustfmt の **Use rustfmt instead of built-in for
 Model・Controller・Service・Repository の4つに分けています。
 
 - **model**：データの型（探す文字列・鍵・計算方法・探索の設定と結果）と、その型だけで完結する処理（検証・変換）。CPU や I/O には依存しません
-- **controller**：CLI。引数を読んで service と repository を呼び、結果を表示します
+- **controller**：CLI。引数を読んで service と repository を呼び、結果を表示します。探索（`Searcher`）と保存（`KeyRepository`）は trait 越しに受け取るので、テストでは [mockall](https://crates.io/crates/mockall) のモックに差し替えられます
 - **service**：探索の処理（並列探索・文字列の判定・シードから公開鍵の計算）。体演算や SIMD の型は、公開鍵の計算の内部の部品として `service/derive/` に置いています
 - **repository**：鍵を OpenSSH 形式のファイルに保存します
 
@@ -152,7 +152,7 @@ src/
 │   ├── cli.rs         引数を読んで探索・保存を呼び、進捗と結果を表示する
 │   └── format.rs      件数・時間の表示
 ├── service/
-│   ├── search.rs      全コアで鍵を作って当たりを探す
+│   ├── search.rs      全コアで鍵を作って当たりを探す（Searcher trait と本番の Parallel）
 │   ├── matcher.rs     探索ループでの文字列の判定（memmem・総当たり）
 │   └── derive/        シード → 公開鍵を256個ずつ計算
 │       ├── mod.rs       計算方法の切り替え（CPU の検出・表の準備）
@@ -165,7 +165,7 @@ src/
 │       ├── sha512x4.rs  AVX2 で4シード同時の SHA-512
 │       └── sha512x8.rs  AVX-512 で8シード同時の SHA-512
 └── repository/
-    └── key_file.rs    秘密鍵（openssh-key-v1、0600）と .pub の保存
+    └── key_file.rs    秘密鍵（openssh-key-v1、0600）と .pub の保存（KeyRepository trait と本番の KeyFiles）
 tests/
 ├── it/          IT（CLI の振る舞い、作った鍵が OpenSSH で使えるか）
 ├── data/        RFC 8032 のテストベクタ
@@ -175,6 +175,7 @@ tests/
 ### テスト
 
 - **ユニットテスト**：体演算・倍算・SHA-512・鍵の書き出しを、多倍長整数・RFC 8032 の参照実装・curve25519-dalek・ed25519-dalek と proptest で突き合わせます。RFC 8032 Section 7.1 のテストベクタもすべて通します
+- **モックテスト**：controller の配線を、探索と保存を mockall のモック（`MockSearcher`・`MockKeyRepository`）に差し替えて確かめます。鍵を計算せず・ファイルに触れずに、呼ぶ順番（既存ファイルの確認 → 探索 → 保存）、オプションが探索の設定に届くか、エラーのときに探索や保存をしないかを見ます
 - **IT**：meikey を実際に起動して鍵を作り、ssh-key・`ssh-keygen`・一時的に立てた sshd で、読み込み・署名・検証・ログインができることを確かめます。必要なツールがない環境ではその部分だけスキップします
 - **SIMD の経路**：CPU が対応していない命令セットのテストは飛ばします。環境変数 `MEIKEY_REQUIRE_SIMD`（例: `avx2,avx512,avx512-ifma`）に書いた命令セットは、飛ばさずに失敗させます。手元の CPU に無い命令セットは `cargo make sde` でエミュレートして確かめます
 - 正解には、本体とは別に仕様書（RFC 8032 / 8709 / 4251 / 4648、PROTOCOL.key / sshsig）から書いた独立実装（`tests/support/`）を使います

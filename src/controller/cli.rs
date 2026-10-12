@@ -1,12 +1,15 @@
-//! CLI: 引数を読んで、探索（[`crate::service::search`]）と保存（[`crate::repository::key_file`]）を呼ぶ
+//! CLI: 引数を読んで、探索（[`Searcher`]）と保存（[`KeyRepository`]）を呼ぶ
+//!
+//! 探索と保存は trait 越しに受け取るので、テストでは mockall のモックに差し替えて、
+//! 鍵を計算せず・ファイルに触れずに、呼ぶ順番・渡す設定・エラーの扱いを確かめられる
 
 use crate::controller::format;
 use crate::model::backend::{Compress, Mul, Simd};
 use crate::model::key::check_comment;
 use crate::model::pattern::{Find, Pattern};
 use crate::model::search::{SearchConfig, Stats};
-use crate::repository::key_file;
-use crate::service::search;
+use crate::repository::key_file::{self, KeyFiles, KeyRepository};
+use crate::service::search::{Parallel, Searcher};
 use clap::Parser;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -96,7 +99,7 @@ impl From<SimdArg> for Simd {
 /// 引数を読んで実行し、終了コードを返す
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(&cli) {
+    match run(&cli, &Parallel, &KeyFiles) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("エラー: {e}");
@@ -105,7 +108,11 @@ pub fn main() -> ExitCode {
     }
 }
 
-fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn run(
+    cli: &Cli,
+    searcher: &impl Searcher,
+    repo: &impl KeyRepository,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = SearchConfig::new(None);
     if let Some(n) = cli.threads {
         config.threads = n.into();
@@ -134,10 +141,11 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     check_features(&config);
 
     match cli.bench {
-        Some(limit) => bench(config, &pattern, limit),
-        None => generate(cli, config, &pattern),
+        Some(limit) => bench(searcher, config, &pattern, limit),
+        None => generate(cli, searcher, repo, config, &pattern),
     }
 }
+
 /// 0 より大きい秒数（小数可）
 fn parse_secs(s: &str) -> Result<Duration, String> {
     let secs: f64 = s
@@ -150,6 +158,7 @@ fn parse_secs(s: &str) -> Result<Duration, String> {
 }
 
 fn bench(
+    searcher: &impl Searcher,
     mut config: SearchConfig,
     pattern: &Pattern,
     limit: Duration,
@@ -170,11 +179,8 @@ fn bench(
         tries: 0,
         elapsed: Duration::ZERO,
     };
-    let out = search::run(&config, |now| {
-        let delta = Stats {
-            tries: now.tries - last.tries,
-            elapsed: now.elapsed - last.elapsed,
-        };
+    let out = searcher.run(&config, &mut |now: Stats| {
+        let delta = since(now, last);
         eprintln!(
             "{:>5.1}s  {} 鍵/秒",
             now.elapsed.as_secs_f64(),
@@ -199,11 +205,13 @@ fn bench(
 
 fn generate(
     cli: &Cli,
+    searcher: &impl Searcher,
+    repo: &impl KeyRepository,
     config: SearchConfig,
     pattern: &Pattern,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !cli.force
-        && let Some(p) = key_file::existing(&cli.output)?
+        && let Some(p) = repo.existing(&cli.output)?
     {
         // 何時間も回したあとで書き込めない、を防ぐため先に確認する
         // （書き込み時も確かめ、間に作られたファイルは上書きしない）
@@ -223,8 +231,8 @@ fn generate(
         format::count(expected),
     );
 
-    let out = search::run(&config, |s| {
-        let remaining = (expected - s.tries as f64).max(0.0) / s.rate();
+    let out = searcher.run(&config, &mut |s: Stats| {
+        let remaining = remaining_secs(expected, s);
         eprint!(
             "\r{}  試行 {}  {} 鍵/秒  期待値まで残り約 {}    ",
             format::duration(s.elapsed),
@@ -237,7 +245,7 @@ fn generate(
     eprintln!();
 
     let key = out.key.ok_or("鍵が見つかりませんでした")?;
-    key_file::save(&key, &cli.comment, &cli.output, cli.force)?;
+    repo.save(&key, &cli.comment, &cli.output, cli.force)?;
 
     eprintln!(
         "見つかりました！（{} 鍵、{}）",
@@ -260,6 +268,19 @@ fn generate(
     Ok(())
 }
 
+/// 前回の進捗 `last` から `now` までの増分（計測中、1秒ごとの速度に使う）
+fn since(now: Stats, last: Stats) -> Stats {
+    Stats {
+        tries: now.tries - last.tries,
+        elapsed: now.elapsed - last.elapsed,
+    }
+}
+
+/// 今の速さのまま、期待試行回数 `expected` に届くまでの残り秒数（もう超えていれば 0）
+fn remaining_secs(expected: f64, s: Stats) -> f64 {
+    (expected - s.tries as f64).max(0.0) / s.rate()
+}
+
 fn check_features(config: &SearchConfig) {
     eprintln!("高速化機能の対応状況:");
     let used = config.backend.simd.effective();
@@ -280,4 +301,291 @@ fn check_features(config: &SearchConfig) {
     eprintln!("- 計算バックエンド: {}", config.backend);
     eprintln!("- 検索アルゴリズム: {}", config.find);
     eprintln!();
+}
+
+#[cfg(test)]
+mod tests {
+    //! 探索（[`MockSearcher`]）と保存（[`MockKeyRepository`]）を mockall のモックに差し替えて、
+    //! controller の配線だけを確かめる。期待していない呼び出しが来ると、モックがその場でパニックする
+    use super::*;
+    use crate::model::backend::Backend;
+    use crate::model::key::VanityKey;
+    use crate::model::search::Outcome;
+    use crate::repository::key_file::MockKeyRepository;
+    use crate::service::search::MockSearcher;
+    use mockall::Sequence;
+    use mockall::predicate::eq;
+    use rstest::rstest;
+    use std::path::Path;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("meikey").chain(args.iter().copied())).unwrap()
+    }
+
+    /// 見つかったことにする鍵と、その公開鍵に含まれる文字列
+    fn found() -> (VanityKey, String) {
+        let key = VanityKey::from_seed([7; 32]);
+        let target = String::from_utf8(key.public_b64()[10..14].to_vec()).unwrap();
+        (key, target)
+    }
+
+    fn stats(tries: u64, millis: u64) -> Stats {
+        Stats {
+            tries,
+            elapsed: Duration::from_millis(millis),
+        }
+    }
+
+    /// 計測中の1秒ごとの速度は、前回からの増分で出す
+    #[rstest]
+    #[case::first(stats(1_000, 1_000), stats(0, 0), stats(1_000, 1_000))]
+    #[case::later(stats(5_000, 3_000), stats(2_000, 2_000), stats(3_000, 1_000))]
+    fn since_is_delta(#[case] now: Stats, #[case] last: Stats, #[case] want: Stats) {
+        assert_eq!(since(now, last), want);
+    }
+
+    /// 残り時間 = 期待試行回数までの残り ÷ 今の速さ。超えていれば 0
+    #[rstest]
+    #[case::half_way(1_000.0, stats(500, 1_000), 1.0)]
+    #[case::just_started(1_000.0, stats(100, 2_000), 18.0)]
+    #[case::reached(1_000.0, stats(1_000, 1_000), 0.0)]
+    #[case::beyond(1_000.0, stats(3_000, 1_000), 0.0)]
+    fn remaining_secs_at_current_rate(
+        #[case] expected: f64,
+        #[case] now: Stats,
+        #[case] want: f64,
+    ) {
+        let got = remaining_secs(expected, now);
+        assert!((got - want).abs() < 1e-9, "{got}");
+    }
+
+    /// 既存ファイルの確認（--force なら省く）→ 探索 → 保存 の順に呼び、見つかった鍵を
+    /// 指定どおりのパス・コメント・上書き指定で保存する
+    #[rstest]
+    fn generate_saves_found_key(#[values(false, true)] force: bool) {
+        let (key, target) = found();
+        let mut args = vec![target.as_str(), "-o", "out/id_test", "-C", "コメント"];
+        if force {
+            args.push("--force");
+        }
+        let cli = parse(&args);
+        let mut seq = Sequence::new();
+        let mut repo = MockKeyRepository::new();
+        let mut searcher = MockSearcher::new();
+
+        repo.expect_existing()
+            .with(eq(Path::new("out/id_test")))
+            .times(usize::from(!force))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(None));
+        let (want, t) = (key.clone(), target.clone());
+        searcher
+            .expect_run()
+            .withf(move |c, _| {
+                c.pattern.as_ref().is_some_and(|p| p.as_str() == t)
+                    && !c.bench
+                    && c.time_limit.is_none()
+            })
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(move |_, on_progress| {
+                // 進捗表示も通す（時間・試行回数が増えていく普通の呼ばれ方）
+                on_progress.report(stats(1_000, 100));
+                on_progress.report(stats(5_000, 200));
+                Outcome {
+                    key: Some(want.clone()),
+                    stats: stats(5_100, 210),
+                }
+            });
+        repo.expect_save()
+            .withf(move |k, comment, private, overwrite| {
+                *k == key
+                    && comment == "コメント"
+                    && private == Path::new("out/id_test")
+                    && *overwrite == force
+            })
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _, _| Ok(()));
+
+        run(&cli, &searcher, &repo).unwrap();
+    }
+
+    /// 出力先が既にあれば（--force なし）、何時間も探す前に止まり、探索も保存もしない
+    #[rstest]
+    fn existing_output_stops_before_search(
+        #[values("id_test", "id_test.pub")] already: &'static str,
+    ) {
+        let cli = parse(&["abc", "-o", "id_test"]);
+        let mut repo = MockKeyRepository::new();
+        repo.expect_existing()
+            .times(1)
+            .returning(move |_| Ok(Some(PathBuf::from(already))));
+        repo.expect_save().never();
+        let mut searcher = MockSearcher::new();
+        searcher.expect_run().never();
+
+        let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
+        assert!(e.contains(already) && e.contains("--force"), "{e}");
+    }
+
+    /// 既存ファイルを確かめられなければ（権限など）、そのエラーで止まり、探索しない
+    #[rstest]
+    fn existing_check_error_stops_before_search() {
+        let cli = parse(&["abc"]);
+        let mut repo = MockKeyRepository::new();
+        repo.expect_existing()
+            .returning(|_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "読めない")));
+        let mut searcher = MockSearcher::new();
+        searcher.expect_run().never();
+
+        let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
+        assert_eq!(e, "読めない");
+    }
+
+    /// 見つからずに終わった（時間切れ・パニック後の停止など）なら、エラーにして何も保存しない
+    #[rstest]
+    fn not_found_saves_nothing() {
+        let cli = parse(&["abc"]);
+        let mut repo = MockKeyRepository::new();
+        repo.expect_existing().returning(|_| Ok(None));
+        repo.expect_save().never();
+        let mut searcher = MockSearcher::new();
+        searcher.expect_run().returning(|_, _| Outcome {
+            key: None,
+            stats: stats(10, 5),
+        });
+
+        let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
+        assert_eq!(e, "鍵が見つかりませんでした");
+    }
+
+    /// 保存に失敗したら（探索中に作られたファイル・書き込み権限など）、そのエラーを返す
+    #[rstest]
+    #[case::created_meanwhile(io::ErrorKind::AlreadyExists)]
+    #[case::permission(io::ErrorKind::PermissionDenied)]
+    fn save_error_is_returned(#[case] kind: io::ErrorKind) {
+        let (key, target) = found();
+        let cli = parse(&[&target]);
+        let mut repo = MockKeyRepository::new();
+        repo.expect_existing().returning(|_| Ok(None));
+        repo.expect_save()
+            .times(1)
+            .returning(move |_, _, _, _| Err(io::Error::new(kind, "書けない")));
+        let mut searcher = MockSearcher::new();
+        searcher.expect_run().returning(move |_, _| Outcome {
+            key: Some(key.clone()),
+            stats: stats(10, 5),
+        });
+
+        let e = run(&cli, &searcher, &repo).unwrap_err();
+        let e = e.downcast_ref::<io::Error>().expect("io::Error のまま返す");
+        assert_eq!(e.kind(), kind);
+    }
+
+    /// --bench は「当たっても止まらない・時間で止まる・1秒ごとに進捗」の設定で探索し、
+    /// ファイルには一切触れない（`repo` に期待を書いていないので、呼べばパニックする）
+    #[rstest]
+    #[case::half_second("0.5", 500)]
+    #[case::two_seconds("2", 2_000)]
+    fn bench_measures_without_files(#[case] secs: &str, #[case] millis: u64) {
+        let cli = parse(&["--bench", secs, "abc", "--force"]);
+        let repo = MockKeyRepository::new();
+        let mut searcher = MockSearcher::new();
+        searcher
+            .expect_run()
+            .withf(move |c, _| {
+                c.bench
+                    && c.time_limit == Some(Duration::from_millis(millis))
+                    && c.progress_interval == Duration::from_secs(1)
+                    && c.pattern.is_some()
+            })
+            .times(1)
+            .returning(move |_, on_progress| {
+                on_progress.report(stats(1_000, 1_000));
+                on_progress.report(stats(2_500, 2_000));
+                Outcome {
+                    key: None,
+                    stats: stats(3_000, millis),
+                }
+            });
+
+        run(&cli, &searcher, &repo).unwrap();
+    }
+
+    /// --check は対応状況を表示するだけで、探索も保存もしない（文字列も要らない）
+    #[rstest]
+    #[case::alone(&["--check"])]
+    #[case::with_target(&["--check", "abc", "--bench", "1"])]
+    fn check_only_reports(#[case] args: &[&str]) {
+        run(
+            &parse(args),
+            &MockSearcher::new(),
+            &MockKeyRepository::new(),
+        )
+        .unwrap();
+    }
+
+    /// 文字列・コメントがおかしければ、ファイルを確かめる前・探索する前に止まる
+    #[rstest]
+    #[case::invalid_char(&["ab-c"], "'-' は使えません")]
+    #[case::too_long(&["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "長すぎます")]
+    #[case::newline_in_comment(&["abc", "-C", "a\nb"], "")]
+    #[case::nul_in_comment(&["abc", "-C", "a\0b", "--bench", "1"], "")]
+    fn invalid_input_stops_early(#[case] args: &[&str], #[case] message: &str) {
+        let e = run(
+            &parse(args),
+            &MockSearcher::new(),
+            &MockKeyRepository::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains(message), "{e}");
+    }
+
+    /// 各オプションが探索の設定（[`SearchConfig`]）にそのまま届く
+    #[rstest]
+    #[case::defaults(&[], |c: &SearchConfig| {
+        c.backend == Backend::FAST
+            && c.find == Find::Memmem
+            && !c.pattern.as_ref().unwrap().case_sensitive()
+    })]
+    #[case::threads(&["-j", "3"], |c: &SearchConfig| c.threads == 3)]
+    #[case::case_sensitive(&["-s"], |c: &SearchConfig| c.pattern.as_ref().unwrap().case_sensitive())]
+    #[case::constant_time(&["--constant-time"], |c: &SearchConfig| c.backend.mul == Mul::ConstantTime)]
+    #[case::no_batch(&["--no-batch"], |c: &SearchConfig| c.backend.compress == Compress::Each)]
+    #[case::simd_avx512(&["--simd", "avx512"], |c: &SearchConfig| c.backend.simd == Simd::Avx512)]
+    #[case::simd_avx2(&["--simd", "avx2"], |c: &SearchConfig| c.backend.simd == Simd::Avx2)]
+    #[case::simd_off(&["--simd", "off"], |c: &SearchConfig| c.backend.simd == Simd::Off)]
+    #[case::no_memmem(&["--no-memmem"], |c: &SearchConfig| c.find == Find::Naive)]
+    #[case::baseline(
+        &["--constant-time", "--no-batch", "--simd", "off", "--no-memmem"],
+        |c: &SearchConfig| c.backend == Backend::BASELINE && c.find == Find::Naive
+    )]
+    fn options_reach_search_config(
+        #[case] options: &[&str],
+        #[case] want: fn(&SearchConfig) -> bool,
+        #[values(false, true)] bench: bool,
+    ) {
+        let mut args = vec!["abc"];
+        args.extend(options);
+        if bench {
+            args.extend(["--bench", "1"]);
+        }
+        let mut repo = MockKeyRepository::new();
+        repo.expect_existing().returning(|_| Ok(None));
+        let mut searcher = MockSearcher::new();
+        searcher
+            .expect_run()
+            .withf(move |c, _| want(c))
+            .times(1)
+            .returning(|_, _| Outcome {
+                key: None,
+                stats: stats(10, 5),
+            });
+
+        let result = run(&parse(&args), &searcher, &repo);
+        // 見つからない結果を返しているので、生成ならエラー・計測なら成功
+        assert_eq!(result.is_ok(), bench);
+    }
 }

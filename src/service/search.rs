@@ -14,6 +14,36 @@ use std::time::{Duration, Instant};
 /// 進捗確認・停止確認の間隔（当たり・時間切れに気づくまでの最大の遅れ）
 const TICK: Duration = Duration::from_millis(10);
 
+/// 進捗の受け取り先（`FnMut(Stats)` のクロージャならそのまま使える）。
+/// mockall はクロージャ（`dyn FnMut`）の引数をモックにできないので、この trait で包む
+pub trait Progress {
+    fn report(&mut self, stats: Stats);
+}
+
+impl<F: FnMut(Stats)> Progress for F {
+    fn report(&mut self, stats: Stats) {
+        self(stats)
+    }
+}
+
+/// 鍵の探索。controller はこの trait 越しに探索するので、テストでは mockall の
+/// `MockSearcher` に差し替えて、鍵を計算せずに好きな結果（見つかった・見つからない）を返せる
+#[cfg_attr(test, mockall::automock)]
+pub trait Searcher {
+    /// 探索を実行する。`on_progress` は呼び出し元スレッドで定期的に呼ばれる。
+    fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome;
+}
+
+/// 全コアで総当たりする [`Searcher`]（本番で使うもの。中身は [`run`]）
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Parallel;
+
+impl Searcher for Parallel {
+    fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome {
+        run(config, |s| on_progress.report(s))
+    }
+}
+
 /// 探索を実行する。`on_progress` は呼び出し元スレッドで定期的に呼ばれる。
 pub fn run(config: &SearchConfig, mut on_progress: impl FnMut(Stats)) -> Outcome {
     // 表（最適化ビルドで数十ミリ秒、テスト用のビルドでは数百ミリ秒）は計測の前に作っておく。
@@ -225,6 +255,23 @@ mod tests {
                 "{k} 回目が早すぎる: {at:?}"
             );
         }
+    }
+
+    /// 本番の [`Parallel`]（trait 越し）も、進捗を [`Progress`] に渡し、時間制限で止まる
+    #[rstest]
+    fn parallel_searcher_reports_progress() {
+        let cfg = SearchConfig {
+            threads: 1,
+            time_limit: Some(Duration::from_millis(150)),
+            progress_interval: Duration::from_millis(40),
+            ..SearchConfig::new(None)
+        };
+        let mut reported = Vec::new();
+        let out = Parallel.run(&cfg, &mut |s: Stats| reported.push(s));
+
+        assert!(out.key.is_none());
+        assert!(!reported.is_empty(), "進捗が届いていない");
+        assert!(reported.iter().all(|s| s.elapsed <= out.stats.elapsed));
     }
 
     /// 1つのスレッドがパニックしたら、ほかのスレッドも呼び出し元もすぐ止まる。

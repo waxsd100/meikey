@@ -44,13 +44,15 @@ dependencies = ["install-nextest"]
 command = "cargo"
 args = ["nextest", "run", "--cargo-profile", "proptest", "--profile", "deep", "${@}"]
 
-# CLI の配線（main.rs・controller/cli.rs）は IT で確かめているので対象外（変異ごとに IT まで回すと遅い）
+# controller/cli.rs の配線は mockall のモックを使ったユニットテストで確かめる。
+# 表示するだけの部分（main.rs・cli.rs の main と check_features）は IT で確かめているので対象外
+# （変異ごとに IT まで回すと遅い）
 [tasks.mutants]
 description = "本体を少しずつ壊して、ユニットテストが検出できるか調べる"
 env = { MEIKEY_PROPTEST_SCALE = "0.1" }
 dependencies = ["install-nextest"]
 command = "cargo"
-args = ["mutants", "--test-tool", "nextest", "--jobs", "2", "--exclude", "src/main.rs", "--exclude", "src/controller/cli.rs", "${@}", "--", "--lib"]
+args = ["mutants", "--test-tool", "nextest", "--jobs", "2", "--exclude", "src/main.rs", "--exclude-re", "^src/controller/cli\\.rs:.*\\b(main|check_features)\\b", "${@}", "--", "--lib"]
 
 # Intel SDE（Intel の命令エミュレーター）で CPU を3種類真似て、SIMD の経路のテストを回す。
 # AVX-512 に対応していない PC でも、AVX-512 IFMA・AVX-512F の経路を実際に実行して確かめられる。

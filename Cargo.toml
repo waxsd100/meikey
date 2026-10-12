@@ -19,6 +19,7 @@ rand = { version = "0.10.3", features = ["chacha"] }
 sha2 = "0.11"
 
 [dev-dependencies]
+mockall = "0.15.0"
 num-bigint = "0.5.1"
 num-integer = "0.1.46"
 num-traits = "0.2.19"

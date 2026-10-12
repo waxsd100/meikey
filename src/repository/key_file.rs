@@ -8,6 +8,44 @@ use base64::engine::general_purpose::STANDARD;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// 鍵の保存先。controller はこの trait 越しに保存するので、テストでは mockall の
+/// `MockKeyRepository` に差し替えて、ファイルに触れずに呼ばれ方を確かめられる
+#[cfg_attr(test, mockall::automock)]
+pub trait KeyRepository {
+    /// 秘密鍵と公開鍵のうち、既にあるほうのパス（両方なければ None）
+    fn existing(&self, private: &Path) -> io::Result<Option<PathBuf>>;
+
+    /// 秘密鍵を `private`、公開鍵を `<private>.pub` に書く。
+    /// `overwrite` でなければ、どちらかが既にあると書かずに失敗する（[`io::ErrorKind::AlreadyExists`]）
+    fn save(
+        &self,
+        key: &VanityKey,
+        comment: &str,
+        private: &Path,
+        overwrite: bool,
+    ) -> io::Result<()>;
+}
+
+/// ファイルシステムに OpenSSH 形式で保存する [`KeyRepository`]（本番で使うもの）
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyFiles;
+
+impl KeyRepository for KeyFiles {
+    fn existing(&self, private: &Path) -> io::Result<Option<PathBuf>> {
+        existing(private)
+    }
+
+    fn save(
+        &self,
+        key: &VanityKey,
+        comment: &str,
+        private: &Path,
+        overwrite: bool,
+    ) -> io::Result<()> {
+        save(key, comment, private, overwrite)
+    }
+}
+
 /// 秘密鍵 `private` と組になる公開鍵のパス（`<private>.pub`）
 pub fn pub_path(private: &Path) -> PathBuf {
     private.with_added_extension("pub")
@@ -236,10 +274,11 @@ mod tests {
         .into_iter()
         .find(|(e, _)| *e)
         .map(|(_, p)| p.clone());
-        assert_eq!(existing(&private).unwrap(), first);
+        // 本番の KeyFiles（trait 越し）で確かめる
+        assert_eq!(KeyFiles.existing(&private).unwrap(), first);
 
         let key = VanityKey::from_seed([7; 32]);
-        let result = save(&key, "c", &private, overwrite);
+        let result = KeyFiles.save(&key, "c", &private, overwrite);
         if first.is_some() && !overwrite {
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
             // 片方だけ書かれることはなく、元のファイルもそのまま
