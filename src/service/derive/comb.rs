@@ -191,8 +191,8 @@ impl Table {
         &self.0.as_chunks::<COLS>().0[i]
     }
 
-    /// `i` 行目の `k` 番目のエントリ `[y+x, y-x, 2dxy]`（AVX2・AVX-512 用のテーブルを作るときに使う）
-    #[cfg(target_arch = "x86_64")]
+    /// `i` 行目の `k` 番目のエントリ `[y+x, y-x, 2dxy]`（AVX2・AVX-512・GPU 用のテーブルを作るときに使う）
+    #[cfg(any(target_arch = "x86_64", feature = "cuda"))]
     pub(crate) fn entry(&self, i: usize, k: usize) -> [Fe; 3] {
         let n = self.row(i)[k];
         [n.ypx, n.ymx, n.xy2d]

@@ -21,7 +21,7 @@ skip_core_tasks = true
 alias = "ci"
 
 [tasks.ci]
-description = "整形の確認・clippy・全テスト（nextest は doctest を回さないので cargo test --doc も）。feature amx を有効にした clippy と AMX のテストも"
+description = "整形の確認・clippy・全テスト（nextest は doctest を回さないので cargo test --doc も）。feature amx・cuda を有効にした clippy と、AMX・GPU・CLI のテストも"
 dependencies = ["install-nextest"]
 # 警告が1つでもあれば失敗させる（Cargo の build.warnings。-D warnings と違って rustc のフラグが
 # 変わらないので、普段のビルドのキャッシュをそのまま使える。テストのビルドの警告も対象）
@@ -30,9 +30,9 @@ script_runner = "@duckscript"
 script = '''
 exec --fail-on-error cargo fmt --all --check
 exec --fail-on-error cargo clippy --all-targets
-exec --fail-on-error cargo clippy --all-targets --features amx
+exec --fail-on-error cargo clippy --all-targets --all-features
 exec --fail-on-error cargo nextest run
-exec --fail-on-error cargo nextest run --features amx --lib -E "test(/^service::derive::amx::/)"
+exec --fail-on-error cargo nextest run --all-features -E "test(/^service::(derive::amx|gpu)::/) | test(/^controller::/)"
 exec --fail-on-error cargo test --doc
 '''
 

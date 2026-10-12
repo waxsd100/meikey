@@ -182,7 +182,7 @@ mod tests {
                 .find(|l| l.starts_with(&format!("- {}（", simd.name())))
                 .unwrap_or_else(|| panic!("{} の行が無い: {err}", simd.name()));
             let want = match (simd == used, simd.supported()) {
-                (true, _) => "対応（使います）",
+                (true, _) => "対応 ✓",
                 (false, true) => ": 対応",
                 (false, false) => "非対応",
             };

@@ -32,6 +32,12 @@ impl<F: FnMut(Stats)> Progress for F {
 pub trait Searcher {
     /// 探索を実行する。`on_progress` は呼び出し元スレッドで定期的に呼ばれる。
     fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome;
+
+    /// 何で探すか（表示用の短い名前。例: 「8スレッド」「GPU NVIDIA H100 80GB HBM3」）
+    fn label(&self, config: &SearchConfig) -> String;
+
+    /// 何で探すか（表示用の詳しい説明。例: 「8スレッド・倍算=テーブル・圧縮=まとめて・SIMD=AVX2・検索=memmem」）
+    fn detail(&self, config: &SearchConfig) -> String;
 }
 
 /// 全コアで総当たりする [`Searcher`]（本番で使うもの。中身は [`run`]）
@@ -41,6 +47,19 @@ pub struct Parallel;
 impl Searcher for Parallel {
     fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome {
         run(config, |s| on_progress.report(s))
+    }
+
+    fn label(&self, config: &SearchConfig) -> String {
+        format!("{}スレッド", config.threads)
+    }
+
+    fn detail(&self, config: &SearchConfig) -> String {
+        format!(
+            "{}・{}・{}",
+            self.label(config),
+            config.backend,
+            config.find
+        )
     }
 }
 

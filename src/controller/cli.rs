@@ -17,7 +17,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 /// 公開鍵に好きな文字列を刻む ed25519 SSH 鍵ジェネレーター
-#[expect(
+// 非公開の型なので、--document-private-items のときだけ検査される。expect だとそれ以外で未達になるので allow
+#[allow(
     rustdoc::invalid_html_tags,
     reason = "ヘルプの文面（`<OUTPUT>` など）は clap がそのまま表示するので、HTML として書かない"
 )]
@@ -77,6 +78,11 @@ struct Cli {
     /// （高速化前の検索。比較用）
     #[arg(long)]
     no_memmem: bool,
+
+    /// GPU（CUDA）で探す。--threads・--constant-time・--no-batch・--simd・--no-memmem は使わない
+    #[cfg(feature = "cuda")]
+    #[arg(long)]
+    gpu: bool,
 }
 
 /// `--simd` の値
@@ -107,13 +113,24 @@ impl From<SimdArg> for Simd {
 /// 引数を読んで実行し、終了コードを返す
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(&cli, &Parallel, &KeyFiles) {
+    match execute(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("エラー: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// 探す手段（CPU か GPU）を決めて実行する
+fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "cuda")]
+    if cli.gpu {
+        let gpu = crate::service::gpu::Gpu::new(0)?;
+        eprintln!("GPU: {}", gpu.info());
+        return run(cli, &gpu, &KeyFiles);
+    }
+    run(cli, &Parallel, &KeyFiles)
 }
 
 fn run(
@@ -177,10 +194,8 @@ fn bench(
     config.progress_interval = Duration::from_secs(1);
 
     eprintln!(
-        "{}スレッド・{}・{} で{}秒間計測します",
-        config.threads,
-        config.backend,
-        config.find,
+        "{} で{}秒間計測します",
+        searcher.detail(&config),
         limit.as_secs_f64()
     );
     let mut last = Stats {
@@ -199,9 +214,9 @@ fn bench(
 
     let rate = out.stats.rate();
     println!(
-        "速度: {} 鍵/秒（{}スレッド）",
+        "速度: {} 鍵/秒（{}）",
         format::count(rate),
-        config.threads
+        searcher.label(&config)
     );
     println!(
         "「{}」の期待時間: 約 {}",
@@ -228,14 +243,14 @@ fn generate(
 
     let expected = pattern.expected_tries();
     eprintln!(
-        "「{}」（大小文字{}）を{}スレッドで探します。期待試行回数: 約{}",
+        "「{}」（大小文字{}）を{}で探します。期待試行回数: 約{}",
         pattern.as_str(),
         if pattern.case_sensitive() {
             "区別あり"
         } else {
             "区別なし"
         },
-        config.threads,
+        searcher.label(&config),
         format::count(expected),
     );
 
@@ -301,7 +316,7 @@ fn check_features(config: &SearchConfig) {
             Simd::Off => continue,
         };
         let state = match (simd == used, simd.supported()) {
-            (true, _) => "対応（使います）",
+            (true, _) => "対応 ✓",
             (false, true) => "対応",
             (false, false) => "非対応",
         };
@@ -326,6 +341,14 @@ mod tests {
     use mockall::predicate::eq;
     use rstest::rstest;
     use std::path::Path;
+
+    /// 表示用の名前だけ答える探索のモック（run の期待は各テストで書く）
+    fn mock_searcher() -> MockSearcher {
+        let mut s = MockSearcher::new();
+        s.expect_label().return_const("テスト用".to_string());
+        s.expect_detail().return_const("テスト用の探索".to_string());
+        s
+    }
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("meikey").chain(args.iter().copied())).unwrap()
@@ -380,7 +403,7 @@ mod tests {
         let cli = parse(&args);
         let mut seq = Sequence::new();
         let mut repo = MockKeyRepository::new();
-        let mut searcher = MockSearcher::new();
+        let mut searcher = mock_searcher();
 
         repo.expect_existing()
             .with(eq(Path::new("out/id_test")))
@@ -431,7 +454,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(Some(PathBuf::from(already))));
         repo.expect_save().never();
-        let mut searcher = MockSearcher::new();
+        let mut searcher = mock_searcher();
         searcher.expect_run().never();
 
         let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
@@ -445,7 +468,7 @@ mod tests {
         let mut repo = MockKeyRepository::new();
         repo.expect_existing()
             .returning(|_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "読めない")));
-        let mut searcher = MockSearcher::new();
+        let mut searcher = mock_searcher();
         searcher.expect_run().never();
 
         let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
@@ -459,7 +482,7 @@ mod tests {
         let mut repo = MockKeyRepository::new();
         repo.expect_existing().returning(|_| Ok(None));
         repo.expect_save().never();
-        let mut searcher = MockSearcher::new();
+        let mut searcher = mock_searcher();
         searcher.expect_run().returning(|_, _| Outcome {
             key: None,
             stats: stats(10, 5),
@@ -481,7 +504,7 @@ mod tests {
         repo.expect_save()
             .times(1)
             .returning(move |_, _, _, _| Err(io::Error::new(kind, "書けない")));
-        let mut searcher = MockSearcher::new();
+        let mut searcher = mock_searcher();
         searcher.expect_run().returning(move |_, _| Outcome {
             key: Some(key.clone()),
             stats: stats(10, 5),
@@ -500,7 +523,7 @@ mod tests {
     fn bench_measures_without_files(#[case] secs: &str, #[case] millis: u64) {
         let cli = parse(&["--bench", secs, "abc", "--force"]);
         let repo = MockKeyRepository::new();
-        let mut searcher = MockSearcher::new();
+        let mut searcher = mock_searcher();
         searcher
             .expect_run()
             .withf(move |c, _| {
@@ -527,12 +550,7 @@ mod tests {
     #[case::alone(&["--check"])]
     #[case::with_target(&["--check", "abc", "--bench", "1"])]
     fn check_only_reports(#[case] args: &[&str]) {
-        run(
-            &parse(args),
-            &MockSearcher::new(),
-            &MockKeyRepository::new(),
-        )
-        .unwrap();
+        run(&parse(args), &mock_searcher(), &MockKeyRepository::new()).unwrap();
     }
 
     /// 文字列・コメントがおかしければ、ファイルを確かめる前・探索する前に止まる
@@ -542,13 +560,9 @@ mod tests {
     #[case::newline_in_comment(&["abc", "-C", "a\nb"], "")]
     #[case::nul_in_comment(&["abc", "-C", "a\0b", "--bench", "1"], "")]
     fn invalid_input_stops_early(#[case] args: &[&str], #[case] message: &str) {
-        let e = run(
-            &parse(args),
-            &MockSearcher::new(),
-            &MockKeyRepository::new(),
-        )
-        .unwrap_err()
-        .to_string();
+        let e = run(&parse(args), &mock_searcher(), &MockKeyRepository::new())
+            .unwrap_err()
+            .to_string();
         assert!(e.contains(message), "{e}");
     }
 
@@ -559,6 +573,16 @@ mod tests {
         #[cfg(feature = "amx")]
         assert_eq!(Simd::from(parsed.unwrap().simd), Simd::Amx);
         #[cfg(not(feature = "amx"))]
+        assert!(parsed.is_err());
+    }
+
+    /// --gpu は feature cuda が有効なときだけ受け付ける
+    #[rstest]
+    fn gpu_flag_needs_feature() {
+        let parsed = Cli::try_parse_from(["meikey", "abc", "--gpu"]);
+        #[cfg(feature = "cuda")]
+        assert!(parsed.unwrap().gpu);
+        #[cfg(not(feature = "cuda"))]
         assert!(parsed.is_err());
     }
 
@@ -593,7 +617,7 @@ mod tests {
         }
         let mut repo = MockKeyRepository::new();
         repo.expect_existing().returning(|_| Ok(None));
-        let mut searcher = MockSearcher::new();
+        let mut searcher = mock_searcher();
         searcher
             .expect_run()
             .withf(move |c, _| want(c))

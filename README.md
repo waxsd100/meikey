@@ -13,6 +13,7 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAiytFbrDh3MEGkK6xS5oe22CBkwAkOiHqOUBG+RECKz
 
 - 鍵はメモリ上で生成し、全コアで並列に探索します。`ssh-keygen` を繰り返し呼ぶ方式より桁違いに速く回ります
 - 公開鍵の計算を探索専用に実装していて、ed25519-dalek をそのまま使うより約7倍速く回ります（[速度](#速度)）
+- NVIDIA の GPU（CUDA）でも探せます。Google Colab 用のノートブックもあります（[Google Colab の GPU で動かす](#google-colab-の-gpu-で動かす)）
 - 出力は通常の OpenSSH 形式の ed25519 鍵です。OpenSSH・[ssh-key](https://crates.io/crates/ssh-key)・RFC 8032 の参照実装で読み書き・署名・ログインできることをテストしています
 
 ## 必要なもの
@@ -54,6 +55,37 @@ ssh-keygen -p -f ~/.ssh/id_ed25519_wakokara
 | `--simd LEVEL` | 使う SIMD の上限（`amx`・`avx512-ifma`・`avx512`・`avx2`・`off`。比較用）。既定は `avx512-ifma`（CPU が対応していなければ下がる）。`amx` は実験的な経路で、feature `amx` を有効にしてビルドしたときだけ指定できます（[下記](#amx実験的)） |
 | `--check` | 使える SIMD と、実際に使うものを表示して終わる |
 | `--no-memmem` | 文字列を memmem で探さず総当たりで比べる（比較用） |
+| `--gpu` | GPU（CUDA）で探す。feature `cuda` を有効にしてビルドしたときだけ指定できる（[下記](#gpucuda)） |
+
+### GPU（CUDA）
+
+NVIDIA の GPU で探すときは、feature `cuda` を有効にしてビルドします。
+
+```sh
+cargo build --release --features cuda
+target/release/meikey --gpu --bench 10 wakokara
+target/release/meikey --gpu wakokara -C wakokara -o ~/.ssh/id_ed25519_wakokara
+```
+
+- CUDA のライブラリ（ドライバの libcuda と NVRTC の libnvrtc）は実行時に読み込むので、ビルドに CUDA Toolkit は要りません
+  （C++ コンパイラは要ります）。libnvrtc が見つからないときは、`LD_LIBRARY_PATH` に libnvrtc.so のあるディレクトリを足してください
+- GPU 向けのプログラム（`src/service/gpu/kernel.cu`）は、起動時にその GPU の世代向けにコンパイルします（10 秒ほど）。
+  Turing（T4）から Blackwell（RTX PRO 6000）まで動きます
+- 1スレッドが鍵 8 本ずつ、シードの生成（ChaCha20）・SHA-512・櫛形テーブルの倍算・逆元をまとめた圧縮・base64 の判定まで
+  GPU で行います。体演算は AVX2 版と同じ 25.5 ビット × 10 リムです
+- 当たりは通し番号だけを受け取り、CPU で同じシードを作り直して ed25519-dalek で計算し、文字列が含まれることを確かめてから書き出します
+
+### Google Colab の GPU で動かす
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/waxsd100/meikey/blob/master/colab/meikey.ipynb)
+
+[`colab/meikey.ipynb`](colab/meikey.ipynb) を Colab で開き、上のセルから順に実行します（GPU の確認 → Rust を入れる →
+ビルド → 速さを測る → 鍵を探す → ダウンロード）。
+
+- ランタイムのタイプで GPU を選んでください。この計算は 32 ビット整数の掛け算が中心なので、整数演算の多い GPU ほど速い見込みです
+  （目安: RTX PRO 6000（G4） > H100 > A100 > L4 > T4。どれが使えるかはプランと空き状況によります）
+- Google AI Ultra ではプレミアム GPU とバックグラウンド実行が使えるので、長い探索もブラウザを閉じたまま続けられます
+- 秘密鍵は Colab の VM の上で作られます。ダウンロードしたら VM から消し、手元でパスフレーズを付けてください
 
 ### 入れられる文字列
 
@@ -183,17 +215,21 @@ src/
 │   ├── search.rs      全コアで鍵を作って当たりを探す（Searcher trait と本番の Parallel）
 │   ├── matcher.rs     探索ループでの文字列の判定（memmem・総当たり）
 │   ├── derive.rs      シード → 公開鍵を256個ずつ計算（計算方法の切り替え・CPU の検出・表の準備）
-│   └── derive/
-│       ├── field.rs     GF(2^255-19) の体演算
-│       ├── comb.rs      櫛形テーブルによる固定基点倍算
-│       ├── amx.rs       AMX のタイル演算で体の乗算をする倍算（実験的）
-│       ├── avx2.rs      AVX2 で4鍵同時の倍算
-│       ├── avx512.rs    AVX-512 で8鍵同時の倍算（表・表引き・点の演算）
-│       ├── avx512/
-│       │   ├── ifma.rs    IFMA の体演算（51ビット×5リム）
-│       │   └── f.rs       IFMA の無い CPU の体演算（25.5ビット×10リム）
-│       ├── sha512x4.rs  AVX2 で4シード同時の SHA-512
-│       └── sha512x8.rs  AVX-512 で8シード同時の SHA-512
+│   ├── derive/
+│   │   ├── field.rs     GF(2^255-19) の体演算
+│   │   ├── comb.rs      櫛形テーブルによる固定基点倍算
+│   │   ├── amx.rs       AMX のタイル演算で体の乗算をする倍算（実験的）
+│   │   ├── avx2.rs      AVX2 で4鍵同時の倍算
+│   │   ├── avx512.rs    AVX-512 で8鍵同時の倍算（表・表引き・点の演算）
+│   │   ├── avx512/
+│   │   │   ├── ifma.rs    IFMA の体演算（51ビット×5リム）
+│   │   │   └── f.rs       IFMA の無い CPU の体演算（25.5ビット×10リム）
+│   │   ├── sha512x4.rs  AVX2 で4シード同時の SHA-512
+│   │   └── sha512x8.rs  AVX-512 で8シード同時の SHA-512
+│   ├── gpu.rs         GPU（CUDA）で探す（feature cuda。カーネルのコンパイル・起動・当たりの確認）
+│   └── gpu/
+│       ├── kernel.cu    GPU のカーネル（シードの生成から文字列の判定まで）
+│       └── host.cpp     テスト用に kernel.cu を CPU 向けにコンパイルする（build.rs）
 ├── repository.rs
 └── repository/
     └── key_file.rs    秘密鍵（openssh-key-v1、0600）と .pub の保存（KeyRepository trait と本番の KeyFiles）
@@ -201,6 +237,8 @@ tests/
 ├── it/          IT（CLI の振る舞い、作った鍵が OpenSSH で使えるか）
 ├── data/        RFC 8032 のテストベクタ
 └── support/     テスト用の独立実装（RFC 8032 の参照実装、SSH 形式）と補助
+colab/
+└── meikey.ipynb Google Colab の GPU で動かすノートブック
 ```
 
 ### テスト
@@ -208,6 +246,7 @@ tests/
 - **ユニットテスト**：体演算・倍算・SHA-512・鍵の書き出しを、多倍長整数・RFC 8032 の参照実装・curve25519-dalek・ed25519-dalek と proptest で突き合わせます。RFC 8032 Section 7.1 のテストベクタもすべて通します
 - **モックテスト**：controller の配線を、探索と保存を mockall のモック（`MockSearcher`・`MockKeyRepository`）に差し替えて確かめます。鍵を計算せず・ファイルに触れずに、呼ぶ順番（既存ファイルの確認 → 探索 → 保存）、オプションが探索の設定に届くか、エラーのときに探索や保存をしないかを見ます
 - **IT**：meikey を実際に起動して鍵を作り、ssh-key・`ssh-keygen`・一時的に立てた sshd で、読み込み・署名・検証・ログインができることを確かめます。必要なツールがない環境ではその部分だけスキップします
+- **GPU**：カーネル（`kernel.cu`）を C++ として CPU 向けにもコンパイルし、ChaCha20・SHA-512・体演算・倍算・base64 の判定・探索全体を rand・sha2・curve25519-dalek・ed25519-dalek・`Pattern` と突き合わせます（GPU が無くても回ります）。NVRTC があれば Turing〜Blackwell の各世代向けにコンパイルできることを、GPU があれば実機で計算した 8,000 鍵ほどが ed25519-dalek と一致し、探索で鍵が見つかることを確かめます（`cargo test --features cuda`）
 - **SIMD の経路**：CPU が対応していない命令セットのテストは飛ばします。環境変数 `MEIKEY_REQUIRE_SIMD`（例: `avx2,avx512,avx512-ifma,amx`）に書いた命令セットは、飛ばさずに失敗させます。手元の CPU に無い命令セットは `cargo make sde` でエミュレートして確かめます
 - 正解には、本体とは別に仕様書（RFC 8032 / 8709 / 4251 / 4648、PROTOCOL.key / sshsig）から書いた独立実装（`tests/support/`）を使います
 

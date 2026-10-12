@@ -1,7 +1,7 @@
 //! テストで、CPU が SIMD の命令セットに対応しているかを確かめる
 //!
 //! 対応していない命令セットのテストは飛ばす（そのまま成功になる）。ただし環境変数 `MEIKEY_REQUIRE_SIMD`
-//! に名前（`avx2`・`avx512`・`avx512-ifma`・`amx` をカンマ区切り）があれば、飛ばさずに失敗させる。
+//! に名前（`avx2`・`avx512`・`avx512-ifma`・`amx`・GPU の `nvrtc`・`cuda` をカンマ区切り）があれば、飛ばさずに失敗させる。
 //! 対応した CI や Intel SDE（命令のエミュレーター）で回すときに、黙って飛ばされないようにするため。
 
 /// `token` が None（CPU が対応していない）ならテストを飛ばす旨を表示して None を返す。
@@ -13,7 +13,7 @@ pub fn available<T>(name: &str, token: Option<T>) -> Option<T> {
             !required.split(',').any(|r| r.trim() == name),
             "MEIKEY_REQUIRE_SIMD に {name} があるのに、この CPU は {name} に対応していません"
         );
-        eprintln!("{name} に対応していない CPU なので飛ばします");
+        eprintln!("{name} が使えない環境なので飛ばします");
     }
     token
 }

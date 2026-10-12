@@ -12,8 +12,12 @@ categories = ["command-line-utilities", "cryptography"]
 [features]
 # 体の乗算を AMX のタイル演算でする実験的な経路（--simd amx）。IFMA より遅いので既定では無効
 amx = []
+# GPU（CUDA）で探す（--gpu）。CUDA のライブラリは実行時に読み込むので、ビルドに CUDA は要らない
+# （テスト用にカーネルを C++ としてコンパイルするので、C++ コンパイラは要る）
+cuda = ["dep:cudarc", "dep:cc"]
 
 [dependencies]
+cudarc = { version = "0.19.10", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12000"] }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 curve25519-dalek = "5.0.0"
@@ -21,6 +25,9 @@ ed25519-dalek = "3.0.0"
 memchr = "2.8.3"
 rand = { version = "0.10.3", features = ["chacha"] }
 sha2 = "0.11"
+
+[build-dependencies]
+cc = { version = "1.2", optional = true }
 
 [dev-dependencies]
 mockall = "0.15.0"
