@@ -23,10 +23,13 @@ alias = "ci"
 [tasks.ci]
 description = "整形の確認・clippy・全テスト（nextest は doctest を回さないので cargo test --doc も）"
 dependencies = ["install-nextest"]
+# 警告が1つでもあれば失敗させる（Cargo の build.warnings。-D warnings と違って rustc のフラグが
+# 変わらないので、普段のビルドのキャッシュをそのまま使える。テストのビルドの警告も対象）
+env = { CARGO_BUILD_WARNINGS = "deny" }
 script_runner = "@duckscript"
 script = '''
 exec --fail-on-error cargo fmt --all --check
-exec --fail-on-error cargo clippy --all-targets -- -D warnings
+exec --fail-on-error cargo clippy --all-targets
 exec --fail-on-error cargo nextest run
 exec --fail-on-error cargo test --doc
 '''

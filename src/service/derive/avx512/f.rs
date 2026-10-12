@@ -54,57 +54,65 @@ pub(crate) struct Fe10([__m512i; 10]);
 
 #[inline(always)]
 unsafe fn splat10(l: [u64; 10]) -> [__m512i; 10] {
-    let mut r = [_mm512_setzero_si512(); 10];
-    for i in 0..10 {
-        r[i] = _mm512_set1_epi64(l[i] as i64);
+    unsafe {
+        let mut r = [_mm512_setzero_si512(); 10];
+        for i in 0..10 {
+            r[i] = _mm512_set1_epi64(l[i].cast_signed());
+        }
+        r
     }
-    r
 }
 
 /// `c[k] += a·bs[k]`（a は k が偶数なら `a_even`、奇数なら `a_odd`）
 #[inline(always)]
 unsafe fn row(c: &mut [__m512i; 10], a_even: __m512i, a_odd: __m512i, bs: [__m512i; 10]) {
-    for k in 0..10usize {
-        let a = if k.is_multiple_of(2) { a_even } else { a_odd };
-        c[k] = _mm512_add_epi64(c[k], _mm512_mul_epu32(a, bs[k]));
+    unsafe {
+        for k in 0..10usize {
+            let a = if k.is_multiple_of(2) { a_even } else { a_odd };
+            c[k] = _mm512_add_epi64(c[k], _mm512_mul_epu32(a, bs[k]));
+        }
     }
 }
 
 /// 各リムを 26/25 ビット + α に収める（ref10 と同じ順に、2本の繰り上がりの列を交互に進める）
 #[inline(always)]
 unsafe fn carry(mut c: [__m512i; 10]) -> Fe10 {
-    // ループにすると展開されず、添字の範囲検査と分岐が残るので書き下す
-    carry_step(&mut c, 0);
-    carry_step(&mut c, 4);
-    carry_step(&mut c, 1);
-    carry_step(&mut c, 5);
-    carry_step(&mut c, 2);
-    carry_step(&mut c, 6);
-    carry_step(&mut c, 3);
-    carry_step(&mut c, 7);
-    carry_step(&mut c, 4);
-    carry_step(&mut c, 8);
-    carry_step(&mut c, 9);
-    carry_step(&mut c, 0);
-    Fe10(c)
+    unsafe {
+        // ループにすると展開されず、添字の範囲検査と分岐が残るので書き下す
+        carry_step(&mut c, 0);
+        carry_step(&mut c, 4);
+        carry_step(&mut c, 1);
+        carry_step(&mut c, 5);
+        carry_step(&mut c, 2);
+        carry_step(&mut c, 6);
+        carry_step(&mut c, 3);
+        carry_step(&mut c, 7);
+        carry_step(&mut c, 4);
+        carry_step(&mut c, 8);
+        carry_step(&mut c, 9);
+        carry_step(&mut c, 0);
+        Fe10(c)
+    }
 }
 
 #[inline(always)]
 unsafe fn carry_step(c: &mut [__m512i; 10], k: usize) {
-    let (hi, lo) = if k.is_multiple_of(2) {
-        let mask = _mm512_set1_epi64(MASK26 as i64);
-        (_mm512_srli_epi64::<26>(c[k]), _mm512_and_si512(c[k], mask))
-    } else {
-        let mask = _mm512_set1_epi64(MASK25 as i64);
-        (_mm512_srli_epi64::<25>(c[k]), _mm512_and_si512(c[k], mask))
-    };
-    c[k] = lo;
-    if k == 9 {
-        // 繰り上がりは 32 ビットを超えうるので、乗算ではなく 19 = 1 + 2 + 16 で
-        let t = _mm512_add_epi64(hi, _mm512_slli_epi64::<1>(hi));
-        c[0] = _mm512_add_epi64(c[0], _mm512_add_epi64(t, _mm512_slli_epi64::<4>(hi)));
-    } else {
-        c[k + 1] = _mm512_add_epi64(c[k + 1], hi);
+    unsafe {
+        let (hi, lo) = if k.is_multiple_of(2) {
+            let mask = _mm512_set1_epi64(MASK26.cast_signed());
+            (_mm512_srli_epi64::<26>(c[k]), _mm512_and_si512(c[k], mask))
+        } else {
+            let mask = _mm512_set1_epi64(MASK25.cast_signed());
+            (_mm512_srli_epi64::<25>(c[k]), _mm512_and_si512(c[k], mask))
+        };
+        c[k] = lo;
+        if k == 9 {
+            // 繰り上がりは 32 ビットを超えうるので、乗算ではなく 19 = 1 + 2 + 16 で
+            let t = _mm512_add_epi64(hi, _mm512_slli_epi64::<1>(hi));
+            c[0] = _mm512_add_epi64(c[0], _mm512_add_epi64(t, _mm512_slli_epi64::<4>(hi)));
+        } else {
+            c[k + 1] = _mm512_add_epi64(c[k + 1], hi);
+        }
     }
 }
 
@@ -117,158 +125,170 @@ impl Field8 for Fe10 {
 
     #[inline(always)]
     unsafe fn unpack(w: &[__m512i; 5]) -> Fe10 {
-        let lo = _mm512_set1_epi64(0xffff_ffff);
-        let mut r = [_mm512_setzero_si512(); 10];
-        for i in 0..5 {
-            r[2 * i] = _mm512_and_si512(w[i], lo);
-            r[2 * i + 1] = _mm512_srli_epi64::<32>(w[i]);
+        unsafe {
+            let lo = _mm512_set1_epi64(0xffff_ffff);
+            let mut r = [_mm512_setzero_si512(); 10];
+            for i in 0..5 {
+                r[2 * i] = _mm512_and_si512(w[i], lo);
+                r[2 * i + 1] = _mm512_srli_epi64::<32>(w[i]);
+            }
+            Fe10(r)
         }
-        Fe10(r)
     }
 
     #[inline(always)]
     unsafe fn splat(l: [u64; 5]) -> Fe10 {
-        Fe10(splat10(split(l)))
+        unsafe { Fe10(splat10(split(l))) }
     }
 
     #[inline(always)]
     unsafe fn add(&self, b: &Fe10) -> Fe10 {
-        let mut r = self.0;
-        for i in 0..10 {
-            r[i] = _mm512_add_epi64(self.0[i], b.0[i]);
+        unsafe {
+            let mut r = self.0;
+            for i in 0..10 {
+                r[i] = _mm512_add_epi64(self.0[i], b.0[i]);
+            }
+            Fe10(r)
         }
-        Fe10(r)
     }
 
     /// a + 2p - b
     #[inline(always)]
     unsafe fn sub(&self, b: &Fe10) -> Fe10 {
-        let p2 = splat10(P2);
-        let mut r = self.0;
-        for i in 0..10 {
-            r[i] = _mm512_sub_epi64(_mm512_add_epi64(self.0[i], p2[i]), b.0[i]);
+        unsafe {
+            let p2 = splat10(P2);
+            let mut r = self.0;
+            for i in 0..10 {
+                r[i] = _mm512_sub_epi64(_mm512_add_epi64(self.0[i], p2[i]), b.0[i]);
+            }
+            Fe10(r)
         }
-        Fe10(r)
     }
 
     #[inline(always)]
     unsafe fn mul(&self, b: &Fe10) -> Fe10 {
-        let (a, b) = (&self.0, &b.0);
-        // 2^255 = 19 (mod p) なので、桁あふれ分は 19 倍して下に回す。
-        // 奇数番目のリムどうしの積は、桁の位置が半ビットずつずれるので 2 倍して合わせる。
-        // c[k] = Σ a[i]·b[k-i]（k-i < 0 なら b[k-i+10]·19）。ループだと展開されないので書き下す
-        let nineteen = _mm512_set1_epi64(19);
-        let mut b19 = [_mm512_setzero_si512(); 10];
-        for j in 1..10 {
-            b19[j] = _mm512_mul_epu32(b[j], nineteen);
+        unsafe {
+            let (a, b) = (&self.0, &b.0);
+            // 2^255 = 19 (mod p) なので、桁あふれ分は 19 倍して下に回す。
+            // 奇数番目のリムどうしの積は、桁の位置が半ビットずつずれるので 2 倍して合わせる。
+            // c[k] = Σ a[i]·b[k-i]（k-i < 0 なら b[k-i+10]·19）。ループだと展開されないので書き下す
+            let nineteen = _mm512_set1_epi64(19);
+            let mut b19 = [_mm512_setzero_si512(); 10];
+            for j in 1..10 {
+                b19[j] = _mm512_mul_epu32(b[j], nineteen);
+            }
+            let mut a2 = [_mm512_setzero_si512(); 10];
+            for i in (1..10).step_by(2) {
+                a2[i] = _mm512_add_epi64(a[i], a[i]);
+            }
+            let mut c = [_mm512_setzero_si512(); 10];
+            row(
+                &mut c,
+                a[0],
+                a[0],
+                [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9]],
+            );
+            row(
+                &mut c,
+                a2[1],
+                a[1],
+                [b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]],
+            );
+            row(
+                &mut c,
+                a[2],
+                a[2],
+                [
+                    b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ],
+            );
+            row(
+                &mut c,
+                a2[3],
+                a[3],
+                [
+                    b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6],
+                ],
+            );
+            row(
+                &mut c,
+                a[4],
+                a[4],
+                [
+                    b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5],
+                ],
+            );
+            row(
+                &mut c,
+                a2[5],
+                a[5],
+                [
+                    b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4],
+                ],
+            );
+            row(
+                &mut c,
+                a[6],
+                a[6],
+                [
+                    b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3],
+                ],
+            );
+            row(
+                &mut c,
+                a2[7],
+                a[7],
+                [
+                    b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2],
+                ],
+            );
+            row(
+                &mut c,
+                a[8],
+                a[8],
+                [
+                    b19[2], b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1],
+                ],
+            );
+            row(
+                &mut c,
+                a2[9],
+                a[9],
+                [
+                    b19[1], b19[2], b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0],
+                ],
+            );
+            carry(c)
         }
-        let mut a2 = [_mm512_setzero_si512(); 10];
-        for i in (1..10).step_by(2) {
-            a2[i] = _mm512_add_epi64(a[i], a[i]);
-        }
-        let mut c = [_mm512_setzero_si512(); 10];
-        row(
-            &mut c,
-            a[0],
-            a[0],
-            [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9]],
-        );
-        row(
-            &mut c,
-            a2[1],
-            a[1],
-            [b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]],
-        );
-        row(
-            &mut c,
-            a[2],
-            a[2],
-            [
-                b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ],
-        );
-        row(
-            &mut c,
-            a2[3],
-            a[3],
-            [
-                b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6],
-            ],
-        );
-        row(
-            &mut c,
-            a[4],
-            a[4],
-            [
-                b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5],
-            ],
-        );
-        row(
-            &mut c,
-            a2[5],
-            a[5],
-            [
-                b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4],
-            ],
-        );
-        row(
-            &mut c,
-            a[6],
-            a[6],
-            [
-                b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3],
-            ],
-        );
-        row(
-            &mut c,
-            a2[7],
-            a[7],
-            [
-                b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2],
-            ],
-        );
-        row(
-            &mut c,
-            a[8],
-            a[8],
-            [
-                b19[2], b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1],
-            ],
-        );
-        row(
-            &mut c,
-            a2[9],
-            a[9],
-            [
-                b19[1], b19[2], b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0],
-            ],
-        );
-        carry(c)
     }
 
     #[inline(always)]
     unsafe fn carry(&self) -> Fe10 {
-        carry(self.0)
+        unsafe { carry(self.0) }
     }
 
     #[inline(always)]
     unsafe fn blend(k: __mmask8, a: &Fe10, b: &Fe10) -> Fe10 {
-        let mut r = a.0;
-        for i in 0..10 {
-            r[i] = _mm512_mask_blend_epi64(k, a.0[i], b.0[i]);
+        unsafe {
+            let mut r = a.0;
+            for i in 0..10 {
+                r[i] = _mm512_mask_blend_epi64(k, a.0[i], b.0[i]);
+            }
+            Fe10(r)
         }
-        Fe10(r)
     }
 
     /// k のレーンだけ 2p - x
     #[inline(always)]
     unsafe fn neg_masked(&self, k: __mmask8) -> Fe10 {
-        let p2 = splat10(P2);
-        let mut r = self.0;
-        for i in 0..10 {
-            r[i] = _mm512_mask_sub_epi64(self.0[i], k, p2[i], self.0[i]);
+        unsafe {
+            let p2 = splat10(P2);
+            let mut r = self.0;
+            for i in 0..10 {
+                r[i] = _mm512_mask_sub_epi64(self.0[i], k, p2[i], self.0[i]);
+            }
+            Fe10(r)
         }
-        Fe10(r)
     }
 
     /// 隣り合う2リムをまとめて 51 ビットのリムにする（`l[2i] + l[2i+1]·2^26`）
@@ -304,8 +324,8 @@ pub fn mul_base_batch<const N: usize>(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl")]
-unsafe fn run<const N: usize>(table: &Table8, scalars: &[[u8; 32]; N], out: &mut [Extended; N]) {
-    // SAFETY: 呼び出し元が CPU の対応を確かめている
+fn run<const N: usize>(table: &Table8, scalars: &[[u8; 32]; N], out: &mut [Extended; N]) {
+    // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
     unsafe { super::mul_base_batch::<Fe10, N>(table, scalars, out) }
 }
 

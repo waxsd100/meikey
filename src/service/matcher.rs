@@ -11,8 +11,11 @@ use std::ops::Range;
 #[derive(Debug, Clone)]
 pub struct Matcher(Inner);
 
-// スレッドに1つしか作らないので大きさは問題にならない（Box にすると判定のたびに間接参照が増える）
-#[allow(clippy::large_enum_variant)]
+// memmem::Finder の大きさはターゲットで変わり、警告が出ない環境もあるので expect ではなく allow
+#[allow(
+    clippy::large_enum_variant,
+    reason = "スレッドに1つしか作らないので大きさは問題にならない（Box にすると判定のたびに間接参照が増える）"
+)]
 #[derive(Debug, Clone)]
 enum Inner {
     Naive(Pattern),
@@ -50,7 +53,7 @@ impl Matcher {
             Inner::Naive(p) => p.find(b64),
             Inner::Memmem { finder, fold } => {
                 let hay: &[u8; PUBLIC_B64_LEN - SEARCH_START] =
-                    b64[SEARCH_START..].try_into().expect("長さは定数");
+                    b64[SEARCH_START..].as_array().expect("長さは定数");
                 let folded;
                 let hay = if *fold {
                     folded = hay.map(fold_case);

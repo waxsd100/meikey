@@ -11,7 +11,9 @@
 //! meikey 本体と同じ部品（base64 クレートなど）は使わず、仕様の文章から直接書いている。
 //! 本体と同じ部品で検証すると、同じ間違いを見逃すため。
 
-#![allow(dead_code)] // 読み込む側によって使う関数が違う
+// 読み込む側（ユニットテスト・IT）によって使う関数が違い、未使用が出るかどうかも読み込む側で変わるので
+// expect ではなく allow
+#![allow(dead_code, reason = "読み込む側によって使う関数が違う")]
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -236,8 +238,7 @@ pub struct Ed25519PrivateKey {
 
 pub fn parse_private_key_file(pem: &str) -> Result<PrivateKeyFile> {
     let body = pem
-        .strip_prefix(PEM_BEGIN)
-        .and_then(|s| s.strip_suffix(PEM_END))
+        .strip_circumfix(PEM_BEGIN, PEM_END)
         .ok_or("BEGIN / END 行が無い")?;
     let lines: Vec<&str> = body.split_terminator('\n').collect();
     let line_lengths = lines.iter().map(|l| l.len()).collect();
@@ -285,8 +286,8 @@ pub fn parse_private_key_file(pem: &str) -> Result<PrivateKeyFile> {
         let comment = p.string()?.to_vec();
         keys.push(Ed25519PrivateKey {
             enc_a,
-            k: k_enc_a[..32].try_into().unwrap(),
-            k_enc_a_tail: k_enc_a[32..].try_into().unwrap(),
+            k: *k_enc_a.first_chunk().expect("64 バイト"),
+            k_enc_a_tail: *k_enc_a.last_chunk().expect("64 バイト"),
             comment,
         });
     }
@@ -383,8 +384,8 @@ pub struct SshSig {
 
 pub fn parse_sshsig(armored: &str) -> Result<SshSig> {
     let body = armored
-        .strip_prefix(SSHSIG_BEGIN)
-        .and_then(|s| s.trim_end_matches('\n').strip_suffix(SSHSIG_END))
+        .trim_end_matches('\n')
+        .strip_circumfix(SSHSIG_BEGIN, SSHSIG_END)
         .ok_or("BEGIN / END 行が無い")?;
     let blob = b64_decode(&body.split_terminator('\n').collect::<String>())?;
 

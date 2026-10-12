@@ -12,7 +12,9 @@
 //!
 //! meikey 本体（src/）のユニットテストと IT の両方から `#[path]` で読み込んでいる。
 
-#![allow(dead_code)] // 読み込む側によって使う関数が違う
+// 読み込む側（ユニットテスト・IT）によって使う関数が違い、未使用が出るかどうかも読み込む側で変わるので
+// expect ではなく allow
+#![allow(dead_code, reason = "読み込む側によって使う関数が違う")]
 
 use num_bigint::{BigInt, Sign};
 use num_integer::Integer;

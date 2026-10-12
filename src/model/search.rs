@@ -3,6 +3,7 @@
 use crate::model::backend::Backend;
 use crate::model::key::VanityKey;
 use crate::model::pattern::{Find, Pattern};
+use std::num::NonZero;
 use std::thread;
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ impl SearchConfig {
     pub fn new(pattern: Option<Pattern>) -> Self {
         Self {
             pattern,
-            threads: thread::available_parallelism().map_or(1, |n| n.get()),
+            threads: thread::available_parallelism().map_or(1, NonZero::get),
             backend: Backend::default(),
             find: Find::default(),
             bench: false,

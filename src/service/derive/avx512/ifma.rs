@@ -37,16 +37,18 @@ const CARRIED: u64 = (1 << 51) + (1 << 17);
 
 #[inline(always)]
 unsafe fn splat5(l: [u64; 5]) -> [__m512i; 5] {
-    l.map(|x| _mm512_set1_epi64(x as i64))
+    unsafe { l.map(|x| _mm512_set1_epi64(x.cast_signed())) }
 }
 
 /// 19·x（x < 2^59。シフト2回と加算2回: 19 = 16 + 2 + 1）
 #[inline(always)]
 unsafe fn times19(x: __m512i) -> __m512i {
-    _mm512_add_epi64(
-        _mm512_add_epi64(x, _mm512_slli_epi64::<1>(x)),
-        _mm512_slli_epi64::<4>(x),
-    )
+    unsafe {
+        _mm512_add_epi64(
+            _mm512_add_epi64(x, _mm512_slli_epi64::<1>(x)),
+            _mm512_slli_epi64::<4>(x),
+        )
+    }
 }
 
 /// 各リムの 51 ビットより上をまとめて1つ上のリムへ送る（5 リム同時。最上位からの繰り上がりは
@@ -54,22 +56,24 @@ unsafe fn times19(x: __m512i) -> __m512i {
 /// その 19 倍は 2^17 未満なので、結果のリムは 2^51 + 2^17 未満
 #[inline(always)]
 unsafe fn carry(r: [__m512i; 5]) -> Fe5 {
-    let mask = _mm512_set1_epi64(MASK as i64);
-    let mut l = [_mm512_setzero_si512(); 5];
-    let mut c = [_mm512_setzero_si512(); 5];
-    for i in 0..5 {
-        l[i] = _mm512_and_si512(r[i], mask);
-        c[i] = _mm512_srli_epi64::<51>(r[i]);
+    unsafe {
+        let mask = _mm512_set1_epi64(MASK.cast_signed());
+        let mut l = [_mm512_setzero_si512(); 5];
+        let mut c = [_mm512_setzero_si512(); 5];
+        for i in 0..5 {
+            l[i] = _mm512_and_si512(r[i], mask);
+            c[i] = _mm512_srli_epi64::<51>(r[i]);
+        }
+        // 最上位からの繰り上がり（2^12 未満）の 19 倍は 52 ビットに収まるので、IFMA 1命令で足せる
+        let nineteen = _mm512_set1_epi64(19);
+        Fe5([
+            _mm512_madd52lo_epu64(l[0], c[4], nineteen),
+            _mm512_add_epi64(l[1], c[0]),
+            _mm512_add_epi64(l[2], c[1]),
+            _mm512_add_epi64(l[3], c[2]),
+            _mm512_add_epi64(l[4], c[3]),
+        ])
     }
-    // 最上位からの繰り上がり（2^12 未満）の 19 倍は 52 ビットに収まるので、IFMA 1命令で足せる
-    let nineteen = _mm512_set1_epi64(19);
-    Fe5([
-        _mm512_madd52lo_epu64(l[0], c[4], nineteen),
-        _mm512_add_epi64(l[1], c[0]),
-        _mm512_add_epi64(l[2], c[1]),
-        _mm512_add_epi64(l[3], c[2]),
-        _mm512_add_epi64(l[4], c[3]),
-    ])
 }
 
 impl Field8 for Fe5 {
@@ -84,56 +88,62 @@ impl Field8 for Fe5 {
 
     #[inline(always)]
     unsafe fn splat(l: [u64; 5]) -> Fe5 {
-        Fe5(splat5(l))
+        unsafe { Fe5(splat5(l)) }
     }
 
     #[inline(always)]
     unsafe fn add(&self, b: &Fe5) -> Fe5 {
-        let mut r = self.0;
-        for i in 0..5 {
-            r[i] = _mm512_add_epi64(self.0[i], b.0[i]);
+        unsafe {
+            let mut r = self.0;
+            for i in 0..5 {
+                r[i] = _mm512_add_epi64(self.0[i], b.0[i]);
+            }
+            carry(r)
         }
-        carry(r)
     }
 
     /// a + 2p - b
     #[inline(always)]
     unsafe fn sub(&self, b: &Fe5) -> Fe5 {
-        let p2 = splat5(P2);
-        let mut r = self.0;
-        for i in 0..5 {
-            r[i] = _mm512_sub_epi64(_mm512_add_epi64(self.0[i], p2[i]), b.0[i]);
+        unsafe {
+            let p2 = splat5(P2);
+            let mut r = self.0;
+            for i in 0..5 {
+                r[i] = _mm512_sub_epi64(_mm512_add_epi64(self.0[i], p2[i]), b.0[i]);
+            }
+            carry(r)
         }
-        carry(r)
     }
 
     /// 積 `a[i]·b[j] = lo + hi·2^52` を、lo は `51·(i+j)` ビット目、hi は `51·(i+j+1) + 1` ビット目に足す。
     /// hi は1つ上のリムの位置から 1 ビットずれるので、まとめてから 2 倍する
     #[inline(always)]
     unsafe fn mul(&self, b: &Fe5) -> Fe5 {
-        let (a, b) = (&self.0, &b.0);
-        // lo[k] = Σ_{i+j=k} lo52(a[i]·b[j])、hi[k] = Σ_{i+j=k} hi52(a[i]·b[j])。
-        // どちらも 5 項以下で、各項は 2^52 未満なので 5·2^52 未満
-        let z = _mm512_setzero_si512();
-        let (mut lo, mut hi) = ([z; 9], [z; 9]);
-        for i in 0..5 {
-            for j in 0..5 {
-                lo[i + j] = _mm512_madd52lo_epu64(lo[i + j], a[i], b[j]);
-                hi[i + j] = _mm512_madd52hi_epu64(hi[i + j], a[i], b[j]);
+        unsafe {
+            let (a, b) = (&self.0, &b.0);
+            // lo[k] = Σ_{i+j=k} lo52(a[i]·b[j])、hi[k] = Σ_{i+j=k} hi52(a[i]·b[j])。
+            // どちらも 5 項以下で、各項は 2^52 未満なので 5·2^52 未満
+            let z = _mm512_setzero_si512();
+            let (mut lo, mut hi) = ([z; 9], [z; 9]);
+            for i in 0..5 {
+                for j in 0..5 {
+                    lo[i + j] = _mm512_madd52lo_epu64(lo[i + j], a[i], b[j]);
+                    hi[i + j] = _mm512_madd52hi_epu64(hi[i + j], a[i], b[j]);
+                }
             }
+            // c[k] = lo[k] + 2·hi[k-1]（< 15·2^52 < 2^56）は 51·k ビット目の値。
+            // 2^255 = 19 (mod p) なので、c[k+5] は 19 倍して c[k] に足す（< 20·2^56 < 2^61）
+            let c = |k: usize| match k {
+                0 => lo[0],
+                9 => _mm512_add_epi64(hi[8], hi[8]),
+                _ => _mm512_add_epi64(lo[k], _mm512_add_epi64(hi[k - 1], hi[k - 1])),
+            };
+            let mut r = [z; 5];
+            for k in 0..5 {
+                r[k] = _mm512_add_epi64(c(k), times19(c(k + 5)));
+            }
+            carry(r)
         }
-        // c[k] = lo[k] + 2·hi[k-1]（< 15·2^52 < 2^56）は 51·k ビット目の値。
-        // 2^255 = 19 (mod p) なので、c[k+5] は 19 倍して c[k] に足す（< 20·2^56 < 2^61）
-        let c = |k: usize| match k {
-            0 => lo[0],
-            9 => _mm512_add_epi64(hi[8], hi[8]),
-            _ => _mm512_add_epi64(lo[k], _mm512_add_epi64(hi[k - 1], hi[k - 1])),
-        };
-        let mut r = [z; 5];
-        for k in 0..5 {
-            r[k] = _mm512_add_epi64(c(k), times19(c(k + 5)));
-        }
-        carry(r)
     }
 
     /// `add`・`sub`・`mul` の結果は繰り上げ済みなので何もしない
@@ -144,22 +154,26 @@ impl Field8 for Fe5 {
 
     #[inline(always)]
     unsafe fn blend(k: __mmask8, a: &Fe5, b: &Fe5) -> Fe5 {
-        let mut r = a.0;
-        for i in 0..5 {
-            r[i] = _mm512_mask_blend_epi64(k, a.0[i], b.0[i]);
+        unsafe {
+            let mut r = a.0;
+            for i in 0..5 {
+                r[i] = _mm512_mask_blend_epi64(k, a.0[i], b.0[i]);
+            }
+            Fe5(r)
         }
-        Fe5(r)
     }
 
     /// k のレーンだけ 2p - x
     #[inline(always)]
     unsafe fn neg_masked(&self, k: __mmask8) -> Fe5 {
-        let p2 = splat5(P2);
-        let mut r = self.0;
-        for i in 0..5 {
-            r[i] = _mm512_mask_sub_epi64(self.0[i], k, p2[i], self.0[i]);
+        unsafe {
+            let p2 = splat5(P2);
+            let mut r = self.0;
+            for i in 0..5 {
+                r[i] = _mm512_mask_sub_epi64(self.0[i], k, p2[i], self.0[i]);
+            }
+            Fe5(r)
         }
-        Fe5(r)
     }
 
     fn lanes(&self) -> [Fe; 8] {
@@ -190,8 +204,8 @@ pub fn mul_base_batch<const N: usize>(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512ifma")]
-unsafe fn run<const N: usize>(table: &Table8, scalars: &[[u8; 32]; N], out: &mut [Extended; N]) {
-    // SAFETY: 呼び出し元が CPU の対応を確かめている
+fn run<const N: usize>(table: &Table8, scalars: &[[u8; 32]; N], out: &mut [Extended; N]) {
+    // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
     unsafe { super::mul_base_batch::<Fe5, N>(table, scalars, out) }
 }
 

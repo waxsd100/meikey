@@ -184,7 +184,7 @@ impl Mul for Fe {
     fn mul(self, b: Fe) -> Fe {
         #[inline(always)]
         fn m(x: u64, y: u64) -> u128 {
-            x as u128 * y as u128
+            u128::from(x) * u128::from(y)
         }
         let (a, b) = (self.0, b.0);
         // 2^255 = 19 (mod p) なので、桁あふれ分は 19 倍して下に回す
@@ -199,13 +199,13 @@ impl Mul for Fe {
         let mut c3 = m(a[3], b[0]) + m(a[2], b[1]) + m(a[1], b[2]) + m(a[0], b[3]) + m(a[4], b4);
         let mut c4 = m(a[4], b[0]) + m(a[3], b[1]) + m(a[2], b[2]) + m(a[1], b[3]) + m(a[0], b[4]);
 
-        c1 += (c0 >> 51) as u64 as u128;
+        c1 += u128::from((c0 >> 51) as u64);
         let mut l0 = (c0 as u64) & MASK;
-        c2 += (c1 >> 51) as u64 as u128;
+        c2 += u128::from((c1 >> 51) as u64);
         let l1 = (c1 as u64) & MASK;
-        c3 += (c2 >> 51) as u64 as u128;
+        c3 += u128::from((c2 >> 51) as u64);
         let l2 = (c2 as u64) & MASK;
-        c4 += (c3 >> 51) as u64 as u128;
+        c4 += u128::from((c3 >> 51) as u64);
         let l3 = (c3 as u64) & MASK;
         let carry = (c4 >> 51) as u64;
         let l4 = (c4 as u64) & MASK;

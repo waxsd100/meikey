@@ -189,7 +189,7 @@ fn remove_old_runs(root: &Path, current: &str) {
         let old = entry
             .metadata()
             .and_then(|m| m.modified())
-            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > Duration::from_secs(3600)));
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > Duration::from_hours(1)));
         if old && entry.file_name().to_str() != Some(current) {
             let _ = std::fs::remove_dir_all(entry.path());
         }

@@ -158,7 +158,7 @@ unsafe fn round(s: &mut [__m256i; 8], w: &mut [__m256i; 16], t: usize) {
         let [a, b, c, d, e, f, g, h] = *s;
         let sum1 = xor3(rotr!(e, 14), rotr!(e, 18), rotr!(e, 41));
         let ch = _mm256_xor_si256(_mm256_and_si256(e, f), _mm256_andnot_si256(e, g));
-        let k = _mm256_set1_epi64x(K[t] as i64);
+        let k = _mm256_set1_epi64x(K[t].cast_signed());
         let t1 = add(add(h, sum1), add(add(ch, k), w[t % 16]));
         let sum0 = xor3(rotr!(a, 28), rotr!(a, 34), rotr!(a, 39));
         let maj = _mm256_or_si256(
@@ -181,16 +181,14 @@ fn prefixes_avx2(seeds: &[[u8; 32]; 4]) -> [[u8; 32]; 4] {
     // メッセージ: シード 32 バイト（ビッグエンディアンの 64 ビット × 4）、0x80、0 埋め、長さ 256 ビット
     let mut w = [_mm256_setzero_si256(); 16];
     for (j, wj) in w.iter_mut().take(4).enumerate() {
-        let word = |k: usize| {
-            let b: [u8; 8] = *seeds[k][8 * j..].first_chunk().expect("32 バイト");
-            u64::from_be_bytes(b) as i64
-        };
+        let word =
+            |k: usize| i64::from_be_bytes(*seeds[k][8 * j..].first_chunk().expect("32 バイト"));
         *wj = _mm256_set_epi64x(word(3), word(2), word(1), word(0));
     }
     w[4] = _mm256_set1_epi64x(1 << 63);
     w[15] = _mm256_set1_epi64x(256);
 
-    let mut s = IV.map(|h| _mm256_set1_epi64x(h as i64));
+    let mut s = IV.map(|h| _mm256_set1_epi64x(h.cast_signed()));
     // SAFETY: この関数は AVX2 を有効にしてコンパイルされ、AVX2 に対応した CPU でだけ呼ばれる
     unsafe {
         rounds!(s, w;
@@ -204,7 +202,7 @@ fn prefixes_avx2(seeds: &[[u8; 32]; 4]) -> [[u8; 32]; 4] {
     // 前半 32 バイト = H0〜H3（ビッグエンディアン）
     let mut out = [[0u8; 32]; 4];
     for j in 0..4 {
-        let h = _mm256_add_epi64(s[j], _mm256_set1_epi64x(IV[j] as i64));
+        let h = _mm256_add_epi64(s[j], _mm256_set1_epi64x(IV[j].cast_signed()));
         // SAFETY: __m256i と [u64; 4] は同じ大きさで、どんなビット列も有効な値
         let lanes = unsafe { std::mem::transmute::<__m256i, [u64; 4]>(h) };
         for (o, v) in out.iter_mut().zip(lanes) {

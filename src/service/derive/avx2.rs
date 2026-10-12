@@ -9,14 +9,16 @@
 //! テーブルのアクセス位置が秘密に依存する（定数時間ではない）ので、探索の高速化専用。
 //!
 //! `#[target_feature]` の付いた関数は `#[inline(always)]` にできず、体演算が関数呼び出しのまま
-//! 残って遅くなる。そこで `#[target_feature]` は入口（[`Table4::mul_base_batch`]）だけに付け、
-//! 中で使う関数はすべて `#[inline(always)]` の `unsafe fn` にして入口に展開させる。
-//! これらの `unsafe fn` は、AVX2 に対応した CPU でだけ呼ぶこと（中身は AVX2 の命令を呼ぶだけなので、
-//! 本体ごと unsafe として扱う）。
+//! 残って遅くなる。そこで `#[target_feature]` は入口（[`Table4::mul_base_batch`] の中の safe な
+//! `#[target_feature] fn`）だけに付け、中で使う関数はすべて `#[inline(always)]` の `unsafe fn` にして
+//! 入口に展開させる。これらの `unsafe fn` は、AVX2 に対応した CPU でだけ呼ぶこと。
+//! `#[target_feature]` の無い関数の中では AVX2 の命令が unsafe なので、本体を `unsafe` ブロックで囲む
+//! （入口の中では命令そのものは safe で、`unsafe` が要るのは `unsafe fn` の呼び出しとポインタの読み書きだけ）。
 
-#![allow(unsafe_op_in_unsafe_fn)]
-// リムの添字の計算がそのまま式になるので、添字でループする
-#![allow(clippy::needless_range_loop)]
+#![expect(
+    clippy::needless_range_loop,
+    reason = "リムの添字の計算がそのまま式になるので、添字でループする"
+)]
 
 use crate::service::derive::comb::{COLS, Extended, ROWS, Table, signed_digits};
 use crate::service::derive::field::Fe;
@@ -93,204 +95,222 @@ struct Niels4 {
 /// 全レーンに同じ値
 #[inline(always)]
 unsafe fn splat(l: [u64; 10]) -> Fe4 {
-    let mut r = [_mm256_setzero_si256(); 10];
-    for i in 0..10 {
-        r[i] = _mm256_set1_epi64x(l[i] as i64);
+    unsafe {
+        let mut r = [_mm256_setzero_si256(); 10];
+        for i in 0..10 {
+            r[i] = _mm256_set1_epi64x(l[i].cast_signed());
+        }
+        Fe4(r)
     }
-    Fe4(r)
 }
 
 #[inline(always)]
 unsafe fn add(a: &Fe4, b: &Fe4) -> Fe4 {
-    let mut r = a.0;
-    for i in 0..10 {
-        r[i] = _mm256_add_epi64(a.0[i], b.0[i]);
+    unsafe {
+        let mut r = a.0;
+        for i in 0..10 {
+            r[i] = _mm256_add_epi64(a.0[i], b.0[i]);
+        }
+        Fe4(r)
     }
-    Fe4(r)
 }
 
 /// a + 2p - b
 #[inline(always)]
 unsafe fn sub(a: &Fe4, b: &Fe4) -> Fe4 {
-    let p2 = splat(P2);
-    let mut r = a.0;
-    for i in 0..10 {
-        r[i] = _mm256_sub_epi64(_mm256_add_epi64(a.0[i], p2.0[i]), b.0[i]);
+    unsafe {
+        let p2 = splat(P2);
+        let mut r = a.0;
+        for i in 0..10 {
+            r[i] = _mm256_sub_epi64(_mm256_add_epi64(a.0[i], p2.0[i]), b.0[i]);
+        }
+        Fe4(r)
     }
-    Fe4(r)
 }
 
 /// `mask` のレーンは a、それ以外は b
 #[inline(always)]
 unsafe fn select(mask: __m256i, a: &Fe4, b: &Fe4) -> Fe4 {
-    let mut r = a.0;
-    for i in 0..10 {
-        r[i] = _mm256_blendv_epi8(b.0[i], a.0[i], mask);
+    unsafe {
+        let mut r = a.0;
+        for i in 0..10 {
+            r[i] = _mm256_blendv_epi8(b.0[i], a.0[i], mask);
+        }
+        Fe4(r)
     }
-    Fe4(r)
 }
 
 /// `c[k] += a·bs[k]`（a は k が偶数なら `a_even`、奇数なら `a_odd`）
 #[inline(always)]
 unsafe fn row(c: &mut [__m256i; 10], a_even: __m256i, a_odd: __m256i, bs: [__m256i; 10]) {
-    for k in 0..10usize {
-        let a = if k.is_multiple_of(2) { a_even } else { a_odd };
-        c[k] = _mm256_add_epi64(c[k], _mm256_mul_epu32(a, bs[k]));
+    unsafe {
+        for k in 0..10usize {
+            let a = if k.is_multiple_of(2) { a_even } else { a_odd };
+            c[k] = _mm256_add_epi64(c[k], _mm256_mul_epu32(a, bs[k]));
+        }
     }
 }
 
 #[inline(always)]
 unsafe fn mul(a: &Fe4, b: &Fe4) -> Fe4 {
-    let (a, b) = (&a.0, &b.0);
-    // 2^255 = 19 (mod p) なので、桁あふれ分は 19 倍して下に回す。
-    // 奇数番目のリムどうしの積は、桁の位置が半ビットずつずれるので 2 倍して合わせる。
-    // c[k] = Σ a[i]·b[k-i]（k-i < 0 なら b[k-i+10]·19）。ループだと展開されないので書き下す
-    let nineteen = _mm256_set1_epi64x(19);
-    let mut b19 = [_mm256_setzero_si256(); 10];
-    for j in 1..10 {
-        b19[j] = _mm256_mul_epu32(b[j], nineteen);
+    unsafe {
+        let (a, b) = (&a.0, &b.0);
+        // 2^255 = 19 (mod p) なので、桁あふれ分は 19 倍して下に回す。
+        // 奇数番目のリムどうしの積は、桁の位置が半ビットずつずれるので 2 倍して合わせる。
+        // c[k] = Σ a[i]·b[k-i]（k-i < 0 なら b[k-i+10]·19）。ループだと展開されないので書き下す
+        let nineteen = _mm256_set1_epi64x(19);
+        let mut b19 = [_mm256_setzero_si256(); 10];
+        for j in 1..10 {
+            b19[j] = _mm256_mul_epu32(b[j], nineteen);
+        }
+        let mut a2 = [_mm256_setzero_si256(); 10];
+        for i in (1..10).step_by(2) {
+            a2[i] = _mm256_add_epi64(a[i], a[i]);
+        }
+        let mut c = [_mm256_setzero_si256(); 10];
+        row(
+            &mut c,
+            a[0],
+            a[0],
+            [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9]],
+        );
+        row(
+            &mut c,
+            a2[1],
+            a[1],
+            [b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]],
+        );
+        row(
+            &mut c,
+            a[2],
+            a[2],
+            [
+                b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ],
+        );
+        row(
+            &mut c,
+            a2[3],
+            a[3],
+            [
+                b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6],
+            ],
+        );
+        row(
+            &mut c,
+            a[4],
+            a[4],
+            [
+                b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5],
+            ],
+        );
+        row(
+            &mut c,
+            a2[5],
+            a[5],
+            [
+                b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4],
+            ],
+        );
+        row(
+            &mut c,
+            a[6],
+            a[6],
+            [
+                b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3],
+            ],
+        );
+        row(
+            &mut c,
+            a2[7],
+            a[7],
+            [
+                b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2],
+            ],
+        );
+        row(
+            &mut c,
+            a[8],
+            a[8],
+            [
+                b19[2], b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1],
+            ],
+        );
+        row(
+            &mut c,
+            a2[9],
+            a[9],
+            [
+                b19[1], b19[2], b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0],
+            ],
+        );
+        carry(c)
     }
-    let mut a2 = [_mm256_setzero_si256(); 10];
-    for i in (1..10).step_by(2) {
-        a2[i] = _mm256_add_epi64(a[i], a[i]);
-    }
-    let mut c = [_mm256_setzero_si256(); 10];
-    row(
-        &mut c,
-        a[0],
-        a[0],
-        [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9]],
-    );
-    row(
-        &mut c,
-        a2[1],
-        a[1],
-        [b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]],
-    );
-    row(
-        &mut c,
-        a[2],
-        a[2],
-        [
-            b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ],
-    );
-    row(
-        &mut c,
-        a2[3],
-        a[3],
-        [
-            b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6],
-        ],
-    );
-    row(
-        &mut c,
-        a[4],
-        a[4],
-        [
-            b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4], b[5],
-        ],
-    );
-    row(
-        &mut c,
-        a2[5],
-        a[5],
-        [
-            b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3], b[4],
-        ],
-    );
-    row(
-        &mut c,
-        a[6],
-        a[6],
-        [
-            b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2], b[3],
-        ],
-    );
-    row(
-        &mut c,
-        a2[7],
-        a[7],
-        [
-            b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1], b[2],
-        ],
-    );
-    row(
-        &mut c,
-        a[8],
-        a[8],
-        [
-            b19[2], b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0], b[1],
-        ],
-    );
-    row(
-        &mut c,
-        a2[9],
-        a[9],
-        [
-            b19[1], b19[2], b19[3], b19[4], b19[5], b19[6], b19[7], b19[8], b19[9], b[0],
-        ],
-    );
-    carry(c)
 }
 
 /// 各リムを 26/25 ビット + α に収める（ref10 と同じ順に、2本の繰り上がりの列を交互に進める）
 #[inline(always)]
 unsafe fn carry(mut c: [__m256i; 10]) -> Fe4 {
-    carry_step(&mut c, 0);
-    carry_step(&mut c, 4);
-    carry_step(&mut c, 1);
-    carry_step(&mut c, 5);
-    carry_step(&mut c, 2);
-    carry_step(&mut c, 6);
-    carry_step(&mut c, 3);
-    carry_step(&mut c, 7);
-    carry_step(&mut c, 4);
-    carry_step(&mut c, 8);
-    carry_step(&mut c, 9);
-    carry_step(&mut c, 0);
-    Fe4(c)
+    unsafe {
+        carry_step(&mut c, 0);
+        carry_step(&mut c, 4);
+        carry_step(&mut c, 1);
+        carry_step(&mut c, 5);
+        carry_step(&mut c, 2);
+        carry_step(&mut c, 6);
+        carry_step(&mut c, 3);
+        carry_step(&mut c, 7);
+        carry_step(&mut c, 4);
+        carry_step(&mut c, 8);
+        carry_step(&mut c, 9);
+        carry_step(&mut c, 0);
+        Fe4(c)
+    }
 }
 
 #[inline(always)]
 unsafe fn carry_step(c: &mut [__m256i; 10], k: usize) {
-    let (hi, lo) = if k.is_multiple_of(2) {
-        let mask = _mm256_set1_epi64x(MASK26 as i64);
-        (_mm256_srli_epi64::<26>(c[k]), _mm256_and_si256(c[k], mask))
-    } else {
-        let mask = _mm256_set1_epi64x(MASK25 as i64);
-        (_mm256_srli_epi64::<25>(c[k]), _mm256_and_si256(c[k], mask))
-    };
-    c[k] = lo;
-    if k == 9 {
-        // 繰り上がりは 32 ビットを超えうるので、乗算ではなく 19 = 1 + 2 + 16 で
-        let t = _mm256_add_epi64(hi, _mm256_slli_epi64::<1>(hi));
-        c[0] = _mm256_add_epi64(c[0], _mm256_add_epi64(t, _mm256_slli_epi64::<4>(hi)));
-    } else {
-        c[k + 1] = _mm256_add_epi64(c[k + 1], hi);
+    unsafe {
+        let (hi, lo) = if k.is_multiple_of(2) {
+            let mask = _mm256_set1_epi64x(MASK26.cast_signed());
+            (_mm256_srli_epi64::<26>(c[k]), _mm256_and_si256(c[k], mask))
+        } else {
+            let mask = _mm256_set1_epi64x(MASK25.cast_signed());
+            (_mm256_srli_epi64::<25>(c[k]), _mm256_and_si256(c[k], mask))
+        };
+        c[k] = lo;
+        if k == 9 {
+            // 繰り上がりは 32 ビットを超えうるので、乗算ではなく 19 = 1 + 2 + 16 で
+            let t = _mm256_add_epi64(hi, _mm256_slli_epi64::<1>(hi));
+            c[0] = _mm256_add_epi64(c[0], _mm256_add_epi64(t, _mm256_slli_epi64::<4>(hi)));
+        } else {
+            c[k + 1] = _mm256_add_epi64(c[k + 1], hi);
+        }
     }
 }
 
 /// 拡張座標に（[`crate::service::derive::comb`] の `Niels::to_extended` と同じ。X, Y は次の加算に渡すため繰り上げておく）
 #[inline(always)]
 unsafe fn to_extended(n: &Niels4) -> Ext4 {
-    const TWO: [u64; 10] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    // 1/2
-    const INV2: [u64; 10] = split([
-        2251799813685239,
-        2251799813685247,
-        2251799813685247,
-        2251799813685247,
-        1125899906842623,
-    ]);
-    let x = carry(sub(&n.ypx, &n.ymx).0);
-    let y = carry(add(&n.ypx, &n.ymx).0);
-    let t = mul(&mul(&x, &y), &splat(INV2));
-    Ext4 {
-        x,
-        y,
-        z: splat(TWO),
-        t,
+    unsafe {
+        const TWO: [u64; 10] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // 1/2
+        const INV2: [u64; 10] = split([
+            2251799813685239,
+            2251799813685247,
+            2251799813685247,
+            2251799813685247,
+            1125899906842623,
+        ]);
+        let x = carry(sub(&n.ypx, &n.ymx).0);
+        let y = carry(add(&n.ypx, &n.ymx).0);
+        let t = mul(&mul(&x, &y), &splat(INV2));
+        Ext4 {
+            x,
+            y,
+            z: splat(TWO),
+            t,
+        }
     }
 }
 
@@ -298,17 +318,19 @@ unsafe fn to_extended(n: &Niels4) -> Ext4 {
 /// 入力の X, Y, Z, T は 1.01 倍未満（`mul` か `carry` の結果）、`q` は正規化した値か、その符号反転
 #[inline(always)]
 unsafe fn add_niels<const WITH_T: bool>(p: &Ext4, q: &Niels4) -> Ext4 {
-    let pp = mul(&add(&p.y, &p.x), &q.ypx); // 2.02 倍 × 1 倍
-    let mm = mul(&sub(&p.y, &p.x), &q.ymx); // 3.01 倍 × 1 倍
-    let txy = mul(&p.t, &q.xy2d); // 1.01 倍 × 2 倍
-    let z2 = add(&p.z, &p.z);
-    let (x, y) = (sub(&pp, &mm), add(&pp, &mm)); // 3.01 倍, 2.02 倍
-    let (z, t) = (add(&z2, &txy), sub(&z2, &txy)); // 3.03 倍, 4.02 倍
-    Ext4 {
-        x: mul(&t, &x),
-        y: mul(&y, &z),
-        z: mul(&t, &z),
-        t: if WITH_T { mul(&x, &y) } else { p.t },
+    unsafe {
+        let pp = mul(&add(&p.y, &p.x), &q.ypx); // 2.02 倍 × 1 倍
+        let mm = mul(&sub(&p.y, &p.x), &q.ymx); // 3.01 倍 × 1 倍
+        let txy = mul(&p.t, &q.xy2d); // 1.01 倍 × 2 倍
+        let z2 = add(&p.z, &p.z);
+        let (x, y) = (sub(&pp, &mm), add(&pp, &mm)); // 3.01 倍, 2.02 倍
+        let (z, t) = (add(&z2, &txy), sub(&z2, &txy)); // 3.03 倍, 4.02 倍
+        Ext4 {
+            x: mul(&t, &x),
+            y: mul(&y, &z),
+            z: mul(&t, &z),
+            t: if WITH_T { mul(&x, &y) } else { p.t },
+        }
     }
 }
 
@@ -440,61 +462,67 @@ impl Table4 {
 /// 4鍵ぶんの表の値 `d[k] * 2^(W*i) * B` を引き、レーンにそろえる（負の桁は符号を反転する）
 #[inline(always)]
 unsafe fn gather(row: &[Entry; COLS], d: &[i16; 4]) -> Niels4 {
-    let e = d.map(|x| &row[usize::from(x.unsigned_abs())].0);
-    // 各エントリの4リムずつを 64 ビットに広げて読み、4×4 を転置してレーンにそろえる
-    let mut l = [_mm256_setzero_si256(); 32];
-    for q in 0..8 {
-        let v = [
-            load4(e[0], q),
-            load4(e[1], q),
-            load4(e[2], q),
-            load4(e[3], q),
-        ];
-        let (t0, t1) = (
-            _mm256_unpacklo_epi64(v[0], v[1]),
-            _mm256_unpackhi_epi64(v[0], v[1]),
+    unsafe {
+        let e = d.map(|x| &row[usize::from(x.unsigned_abs())].0);
+        // 各エントリの4リムずつを 64 ビットに広げて読み、4×4 を転置してレーンにそろえる
+        let mut l = [_mm256_setzero_si256(); 32];
+        for q in 0..8 {
+            let v = [
+                load4(e[0], q),
+                load4(e[1], q),
+                load4(e[2], q),
+                load4(e[3], q),
+            ];
+            let (t0, t1) = (
+                _mm256_unpacklo_epi64(v[0], v[1]),
+                _mm256_unpackhi_epi64(v[0], v[1]),
+            );
+            let (t2, t3) = (
+                _mm256_unpacklo_epi64(v[2], v[3]),
+                _mm256_unpackhi_epi64(v[2], v[3]),
+            );
+            l[4 * q] = _mm256_permute2x128_si256::<0x20>(t0, t2);
+            l[4 * q + 1] = _mm256_permute2x128_si256::<0x20>(t1, t3);
+            l[4 * q + 2] = _mm256_permute2x128_si256::<0x31>(t0, t2);
+            l[4 * q + 3] = _mm256_permute2x128_si256::<0x31>(t1, t3);
+        }
+        let fe = |r: usize| Fe4(*l[r..].first_chunk().expect("32 リムのうち 10 個"));
+        let (ypx, ymx, xy2d) = (fe(0), fe(10), fe(20));
+        // -P = (-x, y): y+x と y-x を入れ替え、2dxy を反転する
+        let d = d.map(i64::from);
+        let neg = _mm256_cmpgt_epi64(
+            _mm256_setzero_si256(),
+            _mm256_set_epi64x(d[3], d[2], d[1], d[0]),
         );
-        let (t2, t3) = (
-            _mm256_unpacklo_epi64(v[2], v[3]),
-            _mm256_unpackhi_epi64(v[2], v[3]),
-        );
-        l[4 * q] = _mm256_permute2x128_si256::<0x20>(t0, t2);
-        l[4 * q + 1] = _mm256_permute2x128_si256::<0x20>(t1, t3);
-        l[4 * q + 2] = _mm256_permute2x128_si256::<0x31>(t0, t2);
-        l[4 * q + 3] = _mm256_permute2x128_si256::<0x31>(t1, t3);
-    }
-    let fe = |r: usize| Fe4(*l[r..].first_chunk().expect("32 リムのうち 10 個"));
-    let (ypx, ymx, xy2d) = (fe(0), fe(10), fe(20));
-    // -P = (-x, y): y+x と y-x を入れ替え、2dxy を反転する
-    let d = d.map(i64::from);
-    let neg = _mm256_cmpgt_epi64(
-        _mm256_setzero_si256(),
-        _mm256_set_epi64x(d[3], d[2], d[1], d[0]),
-    );
-    let zero = splat([0; 10]);
-    Niels4 {
-        ypx: select(neg, &ymx, &ypx),
-        ymx: select(neg, &ypx, &ymx),
-        xy2d: select(neg, &sub(&zero, &xy2d), &xy2d),
+        let zero = splat([0; 10]);
+        Niels4 {
+            ypx: select(neg, &ymx, &ypx),
+            ymx: select(neg, &ypx, &ymx),
+            xy2d: select(neg, &sub(&zero, &xy2d), &xy2d),
+        }
     }
 }
 
 /// 4鍵ぶんの表の値（1エントリ = 64 バイトの行2つ）を L1 に読み込み始める
 #[inline(always)]
 unsafe fn prefetch(row: &[Entry; COLS], d: &[i16; 4]) {
-    for &x in d {
-        let p: *const i8 = (&row[usize::from(x.unsigned_abs())] as *const Entry).cast();
-        _mm_prefetch::<_MM_HINT_T0>(p);
-        _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64));
+    unsafe {
+        for &x in d {
+            let p: *const i8 = (&raw const row[usize::from(x.unsigned_abs())]).cast();
+            _mm_prefetch::<_MM_HINT_T0>(p);
+            _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64));
+        }
     }
 }
 
 /// エントリの `4q`〜`4q+3` 番目のリムを 64 ビットのレーンに広げて読む
 #[inline(always)]
 unsafe fn load4(e: &[u32; 32], q: usize) -> __m256i {
-    let s: &[u32; 4] = e[4 * q..].first_chunk().expect("エントリは 32 リム");
-    // s は 16 バイトの有効な参照（_mm_loadu_si128 は境界をそろえなくてよい）
-    _mm256_cvtepu32_epi64(_mm_loadu_si128(s.as_ptr().cast()))
+    unsafe {
+        let s: &[u32; 4] = e[4 * q..].first_chunk().expect("エントリは 32 リム");
+        // s は 16 バイトの有効な参照（_mm_loadu_si128 は境界をそろえなくてよい）
+        _mm256_cvtepu32_epi64(_mm_loadu_si128(s.as_ptr().cast()))
+    }
 }
 #[cfg(test)]
 mod tests {

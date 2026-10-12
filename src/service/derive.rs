@@ -14,22 +14,24 @@
 //! - `avx2`・`avx512` — 倍算を4鍵・8鍵ずつ同時に
 //! - `sha512x4`・`sha512x8` — SHA-512 を4シード・8シードずつ同時に
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) mod avx2;
-#[cfg(target_arch = "x86_64")]
-pub(crate) mod avx512;
 pub(crate) mod comb;
 pub(crate) mod field;
-#[cfg(target_arch = "x86_64")]
-pub(crate) mod sha512x4;
-#[cfg(target_arch = "x86_64")]
-pub(crate) mod sha512x8;
+
+// SIMD の部品は x86_64 だけ
+cfg_select! {
+    target_arch = "x86_64" => {
+        pub(crate) mod avx2;
+        pub(crate) mod avx512;
+        pub(crate) mod sha512x4;
+        pub(crate) mod sha512x8;
+
+        use avx2::{Avx2, Table4};
+        use avx512::{Avx512, Ifma};
+    }
+    _ => {}
+}
 
 use crate::model::backend::{Backend, Compress, Mul, Simd};
-#[cfg(target_arch = "x86_64")]
-use avx2::{Avx2, Table4};
-#[cfg(target_arch = "x86_64")]
-use avx512::{Avx512, Ifma};
 use comb::{Extended, Table};
 use curve25519_dalek::edwards::EdwardsPoint;
 use curve25519_dalek::scalar::clamp_integer;
@@ -69,26 +71,29 @@ enum Lanes {
 impl Lanes {
     /// `limit` 以下で、CPU が対応している中で一番上のもの
     fn detect(limit: Simd) -> Lanes {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if limit >= Simd::Avx512Ifma
-                && let Some(i) = Ifma::detect()
-            {
-                return Lanes::Ifma(i);
+        cfg_select! {
+            target_arch = "x86_64" => {
+                if limit >= Simd::Avx512Ifma
+                    && let Some(i) = Ifma::detect()
+                {
+                    Lanes::Ifma(i)
+                } else if limit >= Simd::Avx512
+                    && let Some(a) = Avx512::detect()
+                {
+                    Lanes::Avx512(a)
+                } else if limit >= Simd::Avx2
+                    && let Some(a) = Avx2::detect()
+                {
+                    Lanes::Avx2(a)
+                } else {
+                    Lanes::Scalar
+                }
             }
-            if limit >= Simd::Avx512
-                && let Some(a) = Avx512::detect()
-            {
-                return Lanes::Avx512(a);
-            }
-            if limit >= Simd::Avx2
-                && let Some(a) = Avx2::detect()
-            {
-                return Lanes::Avx2(a);
+            _ => {
+                let _ = limit;
+                Lanes::Scalar
             }
         }
-        let _ = limit;
-        Lanes::Scalar
     }
 
     fn simd(self) -> Simd {

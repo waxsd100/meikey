@@ -22,12 +22,15 @@
 //!
 //! `#[target_feature]` の付いた関数は `#[inline(always)]` にできず、体演算が関数呼び出しのまま
 //! 残って遅くなる。そこで `#[target_feature]` は入口（[`ifma::mul_base_batch`]・[`f::mul_base_batch`]
-//! の中の関数）だけに付け、中で使う関数はすべて `#[inline(always)]` の `unsafe fn` にして入口に展開させる。
-//! これらの `unsafe fn` は、[`Avx512::detect`]（IFMA の命令は [`Ifma::detect`]）が通った CPU でだけ呼ぶこと。
+//! の中の safe な `#[target_feature] fn`）だけに付け、中で使う関数はすべて `#[inline(always)]` の
+//! `unsafe fn` にして入口に展開させる。これらの `unsafe fn` は、[`Avx512::detect`]（IFMA の命令は
+//! [`Ifma::detect`]）が通った CPU でだけ呼ぶこと。`#[target_feature]` の無い関数の中では AVX-512 の
+//! 命令が unsafe なので、本体を `unsafe` ブロックで囲む。
 
-#![allow(unsafe_op_in_unsafe_fn)]
-// リムの添字の計算がそのまま式になるので、添字でループする
-#![allow(clippy::needless_range_loop)]
+#![expect(
+    clippy::needless_range_loop,
+    reason = "リムの添字の計算がそのまま式になるので、添字でループする"
+)]
 
 pub mod f;
 pub mod ifma;
@@ -115,22 +118,24 @@ pub(crate) struct Niels8<F> {
 /// X, Y は次の加算で足し引きするので繰り上げておく
 #[inline(always)]
 unsafe fn to_extended<F: Field8>(n: &Niels8<F>) -> Ext8<F> {
-    const TWO: [u64; 5] = [2, 0, 0, 0, 0];
-    // 1/2
-    const INV2: [u64; 5] = [
-        2251799813685239,
-        2251799813685247,
-        2251799813685247,
-        2251799813685247,
-        1125899906842623,
-    ];
-    let x = n.ypx.sub(&n.ymx).carry();
-    let y = n.ypx.add(&n.ymx).carry();
-    Ext8 {
-        x,
-        y,
-        z: F::splat(TWO),
-        t: x.mul(&y).mul(&F::splat(INV2)),
+    unsafe {
+        const TWO: [u64; 5] = [2, 0, 0, 0, 0];
+        // 1/2
+        const INV2: [u64; 5] = [
+            2251799813685239,
+            2251799813685247,
+            2251799813685247,
+            2251799813685247,
+            1125899906842623,
+        ];
+        let x = n.ypx.sub(&n.ymx).carry();
+        let y = n.ypx.add(&n.ymx).carry();
+        Ext8 {
+            x,
+            y,
+            z: F::splat(TWO),
+            t: x.mul(&y).mul(&F::splat(INV2)),
+        }
     }
 }
 
@@ -144,17 +149,19 @@ unsafe fn to_extended<F: Field8>(n: &Niels8<F>) -> Ext8<F> {
 /// 結果は `p` に上書きする（点8つは [`f`] で 2.5KB あり、値で返すと memcpy の呼び出しになるため）
 #[inline(always)]
 unsafe fn add_niels<F: Field8, const WITH_T: bool>(p: &mut Ext8<F>, q: &Niels8<F>) {
-    let pp = p.y.add(&p.x).mul(&q.ypx); // 2.02 倍 × 1 倍
-    let mm = p.y.sub(&p.x).mul(&q.ymx); // 3.01 倍 × 1 倍
-    let txy = p.t.mul(&q.xy2d); // 1.01 倍 × 2 倍（符号反転した値）
-    let z2 = p.z.add(&p.z); // 2.02 倍
-    let (x, y) = (pp.sub(&mm), pp.add(&mm)); // 3.01 倍, 2.02 倍
-    let (z, t) = (z2.add(&txy), z2.sub(&txy)); // 3.03 倍, 4.02 倍
-    p.x = t.mul(&x);
-    p.y = y.mul(&z);
-    p.z = t.mul(&z);
-    if WITH_T {
-        p.t = x.mul(&y);
+    unsafe {
+        let pp = p.y.add(&p.x).mul(&q.ypx); // 2.02 倍 × 1 倍
+        let mm = p.y.sub(&p.x).mul(&q.ymx); // 3.01 倍 × 1 倍
+        let txy = p.t.mul(&q.xy2d); // 1.01 倍 × 2 倍（符号反転した値）
+        let z2 = p.z.add(&p.z); // 2.02 倍
+        let (x, y) = (pp.sub(&mm), pp.add(&mm)); // 3.01 倍, 2.02 倍
+        let (z, t) = (z2.add(&txy), z2.sub(&txy)); // 3.03 倍, 4.02 倍
+        p.x = t.mul(&x);
+        p.y = y.mul(&z);
+        p.z = t.mul(&z);
+        if WITH_T {
+            p.t = x.mul(&y);
+        }
     }
 }
 
@@ -189,33 +196,37 @@ impl Table8 {
 /// 8鍵ぶんの表の値 `d[k] * 2^(W*i) * B` を集め、レーンにそろえる（負の桁は符号を反転する）
 #[inline(always)]
 unsafe fn gather<F: Field8>(row: &[Entry; COLS], d: &[i16; 8]) -> Niels8<F> {
-    let d = _mm512_cvtepi16_epi64(_mm_loadu_si128(d.as_ptr().cast()));
-    // 桁の符号ビットがそのまま「負のレーン」のマスクになる
-    let neg = _mm512_cmplt_epi64_mask(d, _mm512_setzero_si512());
-    // エントリの番号 × 16 ワード（gather の位置は 8 バイト単位）。|d| ≤ 2^(W-1) < COLS なので行の中
-    let idx = _mm512_slli_epi64::<4>(_mm512_abs_epi64(d));
-    let base: *const i64 = row.as_ptr().cast();
-    let mut w = [_mm512_setzero_si512(); 15];
-    for q in 0..15 {
-        w[q] = _mm512_i64gather_epi64::<8>(idx, base.add(q));
-    }
-    let field = |r: usize| F::unpack(w[r..].first_chunk().expect("15 ワードのうち 5 個"));
-    let (ypx, ymx, xy2d) = (field(0), field(5), field(10));
-    // -P = (-x, y): y+x と y-x を入れ替え、2dxy を反転する
-    Niels8 {
-        ypx: F::blend(neg, &ypx, &ymx),
-        ymx: F::blend(neg, &ymx, &ypx),
-        xy2d: xy2d.neg_masked(neg),
+    unsafe {
+        let d = _mm512_cvtepi16_epi64(_mm_loadu_si128(d.as_ptr().cast()));
+        // 桁の符号ビットがそのまま「負のレーン」のマスクになる
+        let neg = _mm512_cmplt_epi64_mask(d, _mm512_setzero_si512());
+        // エントリの番号 × 16 ワード（gather の位置は 8 バイト単位）。|d| ≤ 2^(W-1) < COLS なので行の中
+        let idx = _mm512_slli_epi64::<4>(_mm512_abs_epi64(d));
+        let base: *const i64 = row.as_ptr().cast();
+        let mut w = [_mm512_setzero_si512(); 15];
+        for q in 0..15 {
+            w[q] = _mm512_i64gather_epi64::<8>(idx, base.add(q));
+        }
+        let field = |r: usize| F::unpack(w[r..].first_chunk().expect("15 ワードのうち 5 個"));
+        let (ypx, ymx, xy2d) = (field(0), field(5), field(10));
+        // -P = (-x, y): y+x と y-x を入れ替え、2dxy を反転する
+        Niels8 {
+            ypx: F::blend(neg, &ypx, &ymx),
+            ymx: F::blend(neg, &ymx, &ypx),
+            xy2d: xy2d.neg_masked(neg),
+        }
     }
 }
 
 /// 8鍵ぶんの表の値（1エントリ = キャッシュライン2本）を L1 に読み込み始める
 #[inline(always)]
 unsafe fn prefetch(row: &[Entry; COLS], d: &[i16; 8]) {
-    for &x in d {
-        let p: *const i8 = std::ptr::from_ref(&row[usize::from(x.unsigned_abs())]).cast();
-        _mm_prefetch::<_MM_HINT_T0>(p);
-        _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64));
+    unsafe {
+        for &x in d {
+            let p: *const i8 = (&raw const row[usize::from(x.unsigned_abs())]).cast();
+            _mm_prefetch::<_MM_HINT_T0>(p);
+            _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64));
+        }
     }
 }
 
@@ -229,13 +240,15 @@ unsafe fn prefetch_next<const N: usize>(
     i: usize,
     g: usize,
 ) {
-    let (i, g) = if g + 1 < N / 8 {
-        (i, g + 1)
-    } else {
-        (i + 1, 0)
-    };
-    if i < ROWS {
-        prefetch(table.row(i), &digits[i].as_chunks::<8>().0[g]);
+    unsafe {
+        let (i, g) = if g + 1 < N / 8 {
+            (i, g + 1)
+        } else {
+            (i + 1, 0)
+        };
+        if i < ROWS {
+            prefetch(table.row(i), &digits[i].as_chunks::<8>().0[g]);
+        }
     }
 }
 
@@ -246,41 +259,43 @@ unsafe fn mul_base_batch<F: Field8, const N: usize>(
     scalars: &[[u8; 32]; N],
     out: &mut [Extended; N],
 ) {
-    const { assert!(N > 0 && N.is_multiple_of(8)) };
-    // digits[i][k] = k 番目の鍵の i 桁目
-    let mut digits = [[0i16; N]; ROWS];
-    for (k, s) in scalars.iter().enumerate() {
-        for (i, d) in signed_digits(s).into_iter().enumerate() {
-            digits[i][k] = d;
+    unsafe {
+        const { assert!(N > 0 && N.is_multiple_of(8)) };
+        // digits[i][k] = k 番目の鍵の i 桁目
+        let mut digits = [[0i16; N]; ROWS];
+        for (k, s) in scalars.iter().enumerate() {
+            for (i, d) in signed_digits(s).into_iter().enumerate() {
+                digits[i][k] = d;
+            }
         }
-    }
-    // 1行目は単位元への加算なので、表の値をそのまま座標にする
-    let mut acc: Vec<Ext8<F>> = Vec::with_capacity(N / 8);
-    let row = table.row(0);
-    for (g, d) in digits[0].as_chunks::<8>().0.iter().enumerate() {
-        prefetch_next(table, &digits, 0, g);
-        acc.push(to_extended(&gather::<F>(row, d)));
-    }
-    // 桁が 0 のレーンは単位元（表の0列目）を足す。8レーンまとめて計算するので飛ばさない
-    for i in 1..ROWS - 1 {
-        let row = table.row(i);
-        for (g, (a, d)) in acc.iter_mut().zip(digits[i].as_chunks::<8>().0).enumerate() {
-            prefetch_next(table, &digits, i, g);
-            add_niels::<F, true>(a, &gather(row, d));
+        // 1行目は単位元への加算なので、表の値をそのまま座標にする
+        let mut acc: Vec<Ext8<F>> = Vec::with_capacity(N / 8);
+        let row = table.row(0);
+        for (g, d) in digits[0].as_chunks::<8>().0.iter().enumerate() {
+            prefetch_next(table, &digits, 0, g);
+            acc.push(to_extended(&gather::<F>(row, d)));
         }
-    }
-    let row = table.row(ROWS - 1);
-    let last = digits[ROWS - 1].as_chunks::<8>().0;
-    for ((p, d), o) in acc.iter_mut().zip(last).zip(out.as_chunks_mut::<8>().0) {
-        add_niels::<F, false>(p, &gather(row, d));
-        let (x, y, z) = (p.x.lanes(), p.y.lanes(), p.z.lanes());
-        for k in 0..8 {
-            o[k] = Extended {
-                x: x[k],
-                y: y[k],
-                z: z[k],
-                t: Fe::ZERO,
-            };
+        // 桁が 0 のレーンは単位元（表の0列目）を足す。8レーンまとめて計算するので飛ばさない
+        for i in 1..ROWS - 1 {
+            let row = table.row(i);
+            for (g, (a, d)) in acc.iter_mut().zip(digits[i].as_chunks::<8>().0).enumerate() {
+                prefetch_next(table, &digits, i, g);
+                add_niels::<F, true>(a, &gather(row, d));
+            }
+        }
+        let row = table.row(ROWS - 1);
+        let last = digits[ROWS - 1].as_chunks::<8>().0;
+        for ((p, d), o) in acc.iter_mut().zip(last).zip(out.as_chunks_mut::<8>().0) {
+            add_niels::<F, false>(p, &gather(row, d));
+            let (x, y, z) = (p.x.lanes(), p.y.lanes(), p.z.lanes());
+            for k in 0..8 {
+                o[k] = Extended {
+                    x: x[k],
+                    y: y[k],
+                    z: z[k],
+                    t: Fe::ZERO,
+                };
+            }
         }
     }
 }

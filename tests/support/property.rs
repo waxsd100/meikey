@@ -8,7 +8,9 @@
 //! 例: `MEIKEY_PROPTEST_SCALE=100`（`cargo make proptest-deep` はこれを使う）、
 //! `MEIKEY_PROPTEST_SCALE=0.1`（ミューテーションテスト用に減らす）
 
-#![allow(dead_code)] // 読み込む側によって使う関数が違う
+// 読み込む側（ユニットテスト・IT）によって使う関数が違い、未使用が出るかどうかも読み込む側で変わるので
+// expect ではなく allow
+#![allow(dead_code, reason = "読み込む側によって使う関数が違う")]
 
 use proptest::strategy::Strategy;
 use proptest::test_runner::{Config, TestCaseResult, TestRunner};

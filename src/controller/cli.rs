@@ -17,8 +17,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 /// 公開鍵に好きな文字列を刻む ed25519 SSH 鍵ジェネレーター
-// ヘルプの文面（`<OUTPUT>` など）は clap がそのまま表示するので、rustdoc の HTML の検査は外す
-#[allow(rustdoc::invalid_html_tags)]
+#[expect(
+    rustdoc::invalid_html_tags,
+    reason = "ヘルプの文面（`<OUTPUT>` など）は clap がそのまま表示するので、HTML として書かない"
+)]
 #[derive(Parser)]
 #[command(name = "meikey", version)]
 struct Cli {
