@@ -143,27 +143,33 @@ Model・Controller・Service・Repository の4つに分けています。
 ```
 src/
 ├── main.rs            起動するだけ（controller::cli を呼ぶ）
+├── lib.rs             4つの区画の宣言
+├── model.rs           model のモジュール宣言（以下、各ディレクトリと同名の .rs が親モジュール）
 ├── model/
 │   ├── pattern.rs     探す文字列（検証・一致した位置・期待試行回数）
 │   ├── key.rs         シード → ed25519 鍵、公開鍵の base64・authorized_keys の1行
 │   ├── backend.rs     公開鍵の計算方法（倍算・圧縮・SIMD）
 │   └── search.rs      探索の設定と結果
+├── controller.rs
 ├── controller/
 │   ├── cli.rs         引数を読んで探索・保存を呼び、進捗と結果を表示する
 │   └── format.rs      件数・時間の表示
+├── service.rs
 ├── service/
 │   ├── search.rs      全コアで鍵を作って当たりを探す（Searcher trait と本番の Parallel）
 │   ├── matcher.rs     探索ループでの文字列の判定（memmem・総当たり）
-│   └── derive/        シード → 公開鍵を256個ずつ計算
-│       ├── mod.rs       計算方法の切り替え（CPU の検出・表の準備）
+│   ├── derive.rs      シード → 公開鍵を256個ずつ計算（計算方法の切り替え・CPU の検出・表の準備）
+│   └── derive/
 │       ├── field.rs     GF(2^255-19) の体演算
 │       ├── comb.rs      櫛形テーブルによる固定基点倍算
 │       ├── avx2.rs      AVX2 で4鍵同時の倍算
-│       ├── avx512/      AVX-512 で8鍵同時の倍算（mod.rs が表・表引き・点の演算）
+│       ├── avx512.rs    AVX-512 で8鍵同時の倍算（表・表引き・点の演算）
+│       ├── avx512/
 │       │   ├── ifma.rs    IFMA の体演算（51ビット×5リム）
 │       │   └── f.rs       IFMA の無い CPU の体演算（25.5ビット×10リム）
 │       ├── sha512x4.rs  AVX2 で4シード同時の SHA-512
 │       └── sha512x8.rs  AVX-512 で8シード同時の SHA-512
+├── repository.rs
 └── repository/
     └── key_file.rs    秘密鍵（openssh-key-v1、0600）と .pub の保存（KeyRepository trait と本番の KeyFiles）
 tests/

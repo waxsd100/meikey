@@ -28,6 +28,10 @@ rstest = "0.27.0"
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
 tempfile = "3.27.0"
 
+# モジュールは Rust 2018 以降の書き方（`foo.rs` と `foo/`）にそろえ、`foo/mod.rs` は使わない
+[lints.clippy]
+mod_module_files = "warn"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
