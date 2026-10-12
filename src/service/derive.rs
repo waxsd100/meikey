@@ -149,25 +149,30 @@ impl Backend {
     }
 }
 
-/// 実際に使う SIMD を表示する（上限より下がったときは理由も添える）
-impl std::fmt::Display for Backend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mul = match self.mul {
-            Mul::Table => "テーブル",
-            Mul::ConstantTime => "定数時間",
+impl Compress {
+    /// 逆元を何鍵ごとに1回計算するか（表示用。例: 「256 鍵ごとに 1 回」）
+    pub fn name(self) -> String {
+        let keys = match self {
+            Compress::Batch => BATCH,
+            Compress::Each => 1,
         };
-        let compress = match self.compress {
-            Compress::Batch => "まとめて",
-            Compress::Each => "1鍵ずつ",
-        };
-        let used = self.simd.effective();
-        write!(f, "倍算={mul}・圧縮={compress}・SIMD={}", used.name())?;
-        if used != self.simd {
-            write!(f, "（{} は CPU が対応していません）", self.simd.name())?;
-        }
-        Ok(())
+        format!("{keys} 鍵ごとに 1 回")
     }
 }
+
+/// 計算方法（SIMD は実際に使うもの）
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "倍算={}・逆元={}・SIMD={}",
+            self.mul.name(),
+            self.compress.name(),
+            self.simd.effective().name()
+        )
+    }
+}
+
 /// スレッドごとに1つ持つ作業領域
 pub struct Deriver {
     backend: Backend,
@@ -352,29 +357,23 @@ mod tests {
         }
     }
 
-    /// --bench の表示。SIMD は実際に使うものを表示し、上限より下がったときは理由も添える。
-    /// ALL は16通りを1回ずつ、先頭が既定（全部の高速化あり）、最後が BASELINE（全部なし）
+    /// 計算方法の表示。SIMD は実際に使うもの（上限より下がったら下がったもの）。
+    /// ALL は全部の組み合わせを1回ずつ、最後が BASELINE（全部なし）
     #[rstest]
-    #[case::fast(Backend::FAST, "倍算=テーブル・圧縮=まとめて・SIMD=AVX-512 IFMA")]
-    #[case::no_batch(Backend { compress: Compress::Each, ..Backend::FAST }, "倍算=テーブル・圧縮=1鍵ずつ・SIMD=AVX-512 IFMA")]
-    #[case::constant_time(Backend { mul: Mul::ConstantTime, ..Backend::FAST }, "倍算=定数時間・圧縮=まとめて・SIMD=AVX-512 IFMA")]
-    #[case::avx512(Backend { simd: Simd::Avx512, ..Backend::FAST }, "倍算=テーブル・圧縮=まとめて・SIMD=AVX-512")]
-    #[case::avx2(Backend { simd: Simd::Avx2, ..Backend::FAST }, "倍算=テーブル・圧縮=まとめて・SIMD=AVX2")]
-    #[case::no_simd(Backend { simd: Simd::Off, ..Backend::FAST }, "倍算=テーブル・圧縮=まとめて・SIMD=なし")]
-    #[case::baseline(Backend::BASELINE, "倍算=定数時間・圧縮=1鍵ずつ・SIMD=なし")]
+    #[case::fast(
+        Backend::FAST,
+        "倍算=テーブル・逆元=256 鍵ごとに 1 回・SIMD=AVX-512 IFMA"
+    )]
+    #[case::no_batch(Backend { compress: Compress::Each, ..Backend::FAST }, "倍算=テーブル・逆元=1 鍵ごとに 1 回・SIMD=AVX-512 IFMA")]
+    #[case::constant_time(Backend { mul: Mul::ConstantTime, ..Backend::FAST }, "倍算=定数時間・逆元=256 鍵ごとに 1 回・SIMD=AVX-512 IFMA")]
+    #[case::avx512(Backend { simd: Simd::Avx512, ..Backend::FAST }, "倍算=テーブル・逆元=256 鍵ごとに 1 回・SIMD=AVX-512")]
+    #[case::avx2(Backend { simd: Simd::Avx2, ..Backend::FAST }, "倍算=テーブル・逆元=256 鍵ごとに 1 回・SIMD=AVX2")]
+    #[case::no_simd(Backend { simd: Simd::Off, ..Backend::FAST }, "倍算=テーブル・逆元=256 鍵ごとに 1 回・SIMD=なし")]
+    #[case::baseline(Backend::BASELINE, "倍算=定数時間・逆元=1 鍵ごとに 1 回・SIMD=なし")]
     fn backend_display(#[case] backend: Backend, #[case] full: &str) {
-        let got = backend.to_string();
-        if backend.simd.supported() {
-            assert_eq!(got, full);
-        } else {
-            let (head, _) = full.split_once("SIMD=").unwrap();
-            let want = format!(
-                "{head}SIMD={}（{} は CPU が対応していません）",
-                backend.simd.effective().name(),
-                backend.simd.name()
-            );
-            assert_eq!(got, want);
-        }
+        let (head, _) = full.split_once("SIMD=").unwrap();
+        let want = format!("{head}SIMD={}", backend.simd.effective().name());
+        assert_eq!(backend.to_string(), want);
         assert_eq!(Backend::ALL.iter().filter(|&&b| b == backend).count(), 1);
         assert_eq!(Backend::default(), Backend::FAST);
         assert_eq!(Backend::ALL.last(), Some(&Backend::BASELINE));

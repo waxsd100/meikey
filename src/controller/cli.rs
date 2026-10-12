@@ -62,7 +62,7 @@ struct Cli {
     #[arg(long)]
     constant_time: bool,
 
-    /// 圧縮の逆元を256鍵でまとめず、1鍵ずつ計算する（高速化前の圧縮。比較用）。
+    /// 逆元を 256 鍵ごとに 1 回ではなく、1 鍵ごとに計算する（高速化前の圧縮。比較用）。
     /// --constant-time・--simd off・--no-memmem と全部付けると、ed25519-dalek で1鍵ずつ計算する高速化前と同じになる
     #[arg(long)]
     no_batch: bool,
@@ -127,7 +127,6 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "cuda")]
     if cli.gpu {
         let gpu = crate::service::gpu::Gpu::new(0)?;
-        eprintln!("GPU: {}", gpu.info());
         return run(cli, &gpu, &KeyFiles);
     }
     run(cli, &Parallel, &KeyFiles)
@@ -154,7 +153,7 @@ fn run(
     }
 
     if cli.check {
-        check_features(&config);
+        print_rows(&searcher.status(&config));
         return Ok(());
     }
 
@@ -163,7 +162,26 @@ fn run(
     check_comment(&cli.comment)?;
     config.pattern = Some(pattern.clone());
 
-    check_features(&config);
+    let mut rows = searcher.status(&config);
+    rows.extend([
+        (
+            "文字列",
+            format!(
+                "{}（大小文字の区別{}）",
+                pattern.as_str(),
+                if pattern.case_sensitive() {
+                    "あり"
+                } else {
+                    "なし"
+                }
+            ),
+        ),
+        (
+            "期待試行",
+            format!("約 {}", format::count(pattern.expected_tries())),
+        ),
+    ]);
+    print_rows(&rows);
 
     match cli.bench {
         Some(limit) => bench(searcher, config, &pattern, limit),
@@ -173,13 +191,11 @@ fn run(
 
 /// 0 より大きい秒数（小数可）
 fn parse_secs(s: &str) -> Result<Duration, String> {
-    let secs: f64 = s
-        .parse()
-        .map_err(|_| format!("{s:?} は秒数ではありません"))?;
+    let secs: f64 = s.parse().map_err(|_| format!("秒数ではない: {s:?}"))?;
     Duration::try_from_secs_f64(secs)
         .ok()
         .filter(|d| !d.is_zero())
-        .ok_or_else(|| format!("{s:?} は 0 より大きい秒数にしてください"))
+        .ok_or_else(|| format!("0 より大きい秒数が必要: {s:?}"))
 }
 
 fn bench(
@@ -193,11 +209,7 @@ fn bench(
     config.time_limit = Some(limit);
     config.progress_interval = Duration::from_secs(1);
 
-    eprintln!(
-        "{} で{}秒間計測します",
-        searcher.detail(&config),
-        limit.as_secs_f64()
-    );
+    print_rows(&[("計測", format!("{} 秒", limit.as_secs_f64()))]);
     let mut last = Stats {
         tries: 0,
         elapsed: Duration::ZERO,
@@ -214,14 +226,18 @@ fn bench(
 
     let rate = out.stats.rate();
     println!(
-        "速度: {} 鍵/秒（{}）",
-        format::count(rate),
-        searcher.label(&config)
+        "{}",
+        format::row("速度", &format!("{} 鍵/秒", format::count(rate)))
     );
     println!(
-        "「{}」の期待時間: 約 {}",
-        pattern.as_str(),
-        format::duration_secs(pattern.expected_tries() / rate)
+        "{}",
+        format::row(
+            "期待時間",
+            &format!(
+                "約 {}",
+                format::duration_secs(pattern.expected_tries() / rate)
+            )
+        )
     );
     Ok(())
 }
@@ -238,26 +254,17 @@ fn generate(
     {
         // 何時間も回したあとで書き込めない、を防ぐため先に確認する
         // （書き込み時も確かめ、間に作られたファイルは上書きしない）
-        return Err(format!("{} は既に存在します（上書きするなら --force）", p.display()).into());
+        return Err(format!("既に存在: {}（--force で上書き）", p.display()).into());
     }
 
     let expected = pattern.expected_tries();
-    eprintln!(
-        "「{}」（大小文字{}）を{}で探します。期待試行回数: 約{}",
-        pattern.as_str(),
-        if pattern.case_sensitive() {
-            "区別あり"
-        } else {
-            "区別なし"
-        },
-        searcher.label(&config),
-        format::count(expected),
-    );
 
+    let mut shown = false;
     let out = searcher.run(&config, &mut |s: Stats| {
+        shown = true;
         let remaining = remaining_secs(expected, s);
         eprint!(
-            "\r{}  試行 {}  {} 鍵/秒  期待値まで残り約 {}    ",
+            "\r経過 {}  試行 {}  {} 鍵/秒  残り約 {}    ",
             format::duration(s.elapsed),
             format::count(s.tries as f64),
             format::count(s.rate()),
@@ -265,16 +272,21 @@ fn generate(
         );
         let _ = io::stderr().flush();
     });
-    eprintln!();
+    if shown {
+        // 進捗の行を改行で終える
+        eprintln!();
+    }
 
-    let key = out.key.ok_or("鍵が見つかりませんでした")?;
+    let key = out.key.ok_or("鍵が見つからなかった")?;
     repo.save(&key, &cli.comment, &cli.output, cli.force)?;
 
-    eprintln!(
-        "見つかりました！（{} 鍵、{}）",
-        format::count(out.stats.tries as f64),
-        format::duration(out.stats.elapsed)
-    );
+    print_rows(&[
+        (
+            "試行",
+            format!("{} 鍵", format::count(out.stats.tries as f64)),
+        ),
+        ("経過", format::duration(out.stats.elapsed)),
+    ]);
     let line = key.public_openssh(&cli.comment);
     println!("{line}");
     if let Some(r) = pattern.find(&key.public_b64()) {
@@ -282,12 +294,17 @@ fn generate(
         let offset = "ssh-ed25519 ".len();
         eprintln!("{}{}", " ".repeat(offset + r.start), "^".repeat(r.len()));
     }
-    eprintln!("秘密鍵: {}", cli.output.display());
-    eprintln!("公開鍵: {}", key_file::pub_path(&cli.output).display());
-    eprintln!(
-        "※ パスフレーズなしです。使う前に ssh-keygen -p -f {} で設定してください",
-        cli.output.display()
-    );
+    print_rows(&[
+        ("秘密鍵", cli.output.display().to_string()),
+        (
+            "公開鍵",
+            key_file::pub_path(&cli.output).display().to_string(),
+        ),
+        (
+            "パスフレーズ",
+            format!("なし（設定: ssh-keygen -p -f {}）", cli.output.display()),
+        ),
+    ]);
     Ok(())
 }
 
@@ -304,27 +321,11 @@ fn remaining_secs(expected: f64, s: Stats) -> f64 {
     (expected - s.tries as f64).max(0.0) / s.rate()
 }
 
-fn check_features(config: &SearchConfig) {
-    eprintln!("高速化機能の対応状況:");
-    let used = config.backend.simd.effective();
-    for simd in Simd::ALL {
-        let what = match simd {
-            Simd::Amx => "実験的、体の乗算をタイル演算で。IFMA より遅い",
-            Simd::Avx512Ifma => "8鍵同時、52 ビットの積和で倍算",
-            Simd::Avx512 => "8鍵同時",
-            Simd::Avx2 => "4鍵同時",
-            Simd::Off => continue,
-        };
-        let state = match (simd == used, simd.supported()) {
-            (true, _) => "対応 ✓",
-            (false, true) => "対応",
-            (false, false) => "非対応",
-        };
-        eprintln!("- {}（{what}）: {state}", simd.name());
+/// 状態の行を標準エラーに（`ラベル  値`）
+fn print_rows(rows: &[(&str, String)]) {
+    for (label, value) in rows {
+        eprintln!("{}", format::row(label, value));
     }
-    eprintln!("- 計算バックエンド: {}", config.backend);
-    eprintln!("- 検索アルゴリズム: {}", config.find);
-    eprintln!();
 }
 
 #[cfg(test)]
@@ -345,8 +346,8 @@ mod tests {
     /// 表示用の名前だけ答える探索のモック（run の期待は各テストで書く）
     fn mock_searcher() -> MockSearcher {
         let mut s = MockSearcher::new();
-        s.expect_label().return_const("テスト用".to_string());
-        s.expect_detail().return_const("テスト用の探索".to_string());
+        s.expect_status()
+            .return_const(vec![("テスト", "探索".to_string())]);
         s
     }
 
@@ -489,7 +490,7 @@ mod tests {
         });
 
         let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
-        assert_eq!(e, "鍵が見つかりませんでした");
+        assert_eq!(e, "鍵が見つからなかった");
     }
 
     /// 保存に失敗したら（探索中に作られたファイル・書き込み権限など）、そのエラーを返す
@@ -555,8 +556,8 @@ mod tests {
 
     /// 文字列・コメントがおかしければ、ファイルを確かめる前・探索する前に止まる
     #[rstest]
-    #[case::invalid_char(&["ab-c"], "'-' は使えません")]
-    #[case::too_long(&["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "長すぎます")]
+    #[case::invalid_char(&["ab-c"], "使えない文字: '-'")]
+    #[case::too_long(&["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "長すぎる")]
     #[case::newline_in_comment(&["abc", "-C", "a\nb"], "")]
     #[case::nul_in_comment(&["abc", "-C", "a\0b", "--bench", "1"], "")]
     fn invalid_input_stops_early(#[case] args: &[&str], #[case] message: &str) {

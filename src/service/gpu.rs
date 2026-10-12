@@ -56,7 +56,7 @@ impl std::error::Error for GpuError {}
 
 impl From<DriverError> for GpuError {
     fn from(e: DriverError) -> Self {
-        GpuError(format!("CUDA のエラー: {e}"))
+        GpuError(format!("CUDA: {e}"))
     }
 }
 
@@ -76,7 +76,7 @@ impl fmt::Display for GpuInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}（compute capability {}.{}、SM {} 個、メモリ {:.0}GB）",
+            "{}（sm_{}{}・SM {}・{:.0} GB）",
             self.name,
             self.compute.0,
             self.compute.1,
@@ -111,14 +111,13 @@ impl Gpu {
         };
         if !cuda {
             return Err(GpuError(
-                "CUDA のドライバ（libcuda）が見つかりません。NVIDIA の GPU とドライバが必要です"
-                    .into(),
+                "libcuda が見つからない（NVIDIA の GPU とドライバが必要）".into(),
             ));
         }
         if !nvrtc {
             return Err(GpuError(
-                "NVRTC（libnvrtc）が見つかりません。CUDA Toolkit を入れるか、LD_LIBRARY_PATH に \
-                 libnvrtc.so のあるディレクトリ（例: /usr/local/cuda/lib64）を足してください"
+                "libnvrtc が見つからない（LD_LIBRARY_PATH に libnvrtc.so のディレクトリを追加。\
+                 例: /usr/local/cuda/lib64）"
                     .into(),
             ));
         }
@@ -255,7 +254,7 @@ impl Gpu {
             // 一致しなければ GPU の計算か判定が間違っている（バグ）ので止める
             assert!(
                 p.is_match(&found.public_b64()),
-                "内部エラー: GPU（{}）の結果が ed25519-dalek・総当たりと一致しません",
+                "内部エラー: GPU（{}）の結果が ed25519-dalek・総当たりと不一致",
                 self.info.name
             );
         }
@@ -266,18 +265,21 @@ impl Gpu {
 impl Searcher for Gpu {
     fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome {
         self.search(config, on_progress)
-            .unwrap_or_else(|e| panic!("GPU での探索に失敗しました: {e}"))
+            .unwrap_or_else(|e| panic!("GPU での探索に失敗: {e}"))
     }
 
-    fn label(&self, _config: &SearchConfig) -> String {
-        format!("GPU {}", self.info.name)
-    }
-
-    fn detail(&self, _config: &SearchConfig) -> String {
-        format!(
-            "GPU {}・{} ブロック × {} スレッド・1スレッド {} 鍵ずつ",
-            self.info, self.grid, BLOCK, BATCH
-        )
+    fn status(&self, _config: &SearchConfig) -> Vec<(&'static str, String)> {
+        let i = &self.info;
+        vec![
+            ("GPU", i.name.clone()),
+            ("世代", format!("sm_{}{}", i.compute.0, i.compute.1)),
+            ("SM", i.sms.to_string()),
+            ("メモリ", format!("{:.0} GB", i.memory as f64 / 1e9)),
+            (
+                "並列",
+                format!("{} ブロック × {} スレッド × {} 鍵", self.grid, BLOCK, BATCH),
+            ),
+        ]
     }
 }
 
@@ -310,7 +312,7 @@ fn compile(compute: (i32, i32)) -> Result<cudarc::nvrtc::Ptx, GpuError> {
         }
     }
     Err(GpuError(format!(
-        "カーネルをコンパイルできません:\n{}",
+        "カーネルのコンパイルに失敗:\n{}",
         errors.join("\n")
     )))
 }

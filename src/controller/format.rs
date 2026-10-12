@@ -22,6 +22,18 @@ pub fn duration(d: Duration) -> String {
     }
 }
 
+/// 状態表示の1行（`ラベル  値`）。ラベルを表示幅 14 桁にそろえる（全角は2桁と数える）
+pub fn row(label: &str, value: &str) -> String {
+    let width: usize = label
+        .chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum();
+    format!(
+        "{label}{}{value}",
+        " ".repeat(14usize.saturating_sub(width).max(1))
+    )
+}
+
 /// 秒数（f64）版。期待値など無限大になりうる値用
 pub fn duration_secs(secs: f64) -> String {
     if secs.is_finite() && secs < Duration::MAX.as_secs_f64() {
@@ -38,6 +50,15 @@ mod tests {
     use proptest::prelude::*;
     use rstest::rstest;
     use std::ops::Range;
+
+    /// ラベルは表示幅 14 桁にそろう（全角は2桁）。長すぎても値との間に空白を1つ入れる
+    #[rstest]
+    #[case::ascii("CPU", "CPU           x")]
+    #[case::wide("パスフレーズ", "パスフレーズ  x")]
+    #[case::too_long("とても長いラベルの例", "とても長いラベルの例 x")]
+    fn row_aligns_labels(#[case] label: &str, #[case] want: &str) {
+        assert_eq!(row(label, "x"), want);
+    }
 
     #[rstest]
     #[case::zero(0.0, "0")]

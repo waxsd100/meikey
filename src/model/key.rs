@@ -58,7 +58,7 @@ impl std::fmt::Display for InvalidComment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "コメントに使えない文字 {:?} が入っています（改行と NUL は使えません）",
+            "コメントに使えない文字: {:?}（改行・NUL は不可）",
             self.0
         )
     }
@@ -183,9 +183,9 @@ mod tests {
     #[case::plain("wakokara@example", None)]
     #[case::spaces_and_tabs("my key\tfor work", None)]
     #[case::japanese("和光から", None)]
-    #[case::lf("wako\nkara", Some(('\n', "コメントに使えない文字 '\\n' が入っています（改行と NUL は使えません）")))]
-    #[case::crlf("wako\r\nkara", Some(('\r', "コメントに使えない文字 '\\r' が入っています（改行と NUL は使えません）")))]
-    #[case::nul("wako\0kara", Some(('\0', "コメントに使えない文字 '\\0' が入っています（改行と NUL は使えません）")))]
+    #[case::lf("wako\nkara", Some(('\n', "コメントに使えない文字: '\\n'（改行・NUL は不可）")))]
+    #[case::crlf("wako\r\nkara", Some(('\r', "コメントに使えない文字: '\\r'（改行・NUL は不可）")))]
+    #[case::nul("wako\0kara", Some(('\0', "コメントに使えない文字: '\\0'（改行・NUL は不可）")))]
     fn check_comment_cases(#[case] comment: &str, #[case] bad: Option<(char, &str)>) {
         match bad {
             None => assert_eq!(check_comment(comment), Ok(())),

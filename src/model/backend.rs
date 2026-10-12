@@ -55,6 +55,15 @@ pub enum Simd {
     Amx,
 }
 
+impl Mul {
+    pub fn name(self) -> &'static str {
+        match self {
+            Mul::Table => "テーブル",
+            Mul::ConstantTime => "定数時間",
+        }
+    }
+}
+
 impl Simd {
     /// 上から順に（Amx は feature `amx` が有効なときだけ）
     #[cfg(feature = "amx")]

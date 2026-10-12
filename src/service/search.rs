@@ -1,5 +1,6 @@
 //! 全コアで鍵を生成して、当たりを探す（設定と結果の型は [`crate::model::search`]）
 
+use crate::model::backend::Simd;
 use crate::model::key::{self, PUBLIC_B64_LEN, VanityKey};
 use crate::model::search::{Outcome, SearchConfig, Stats};
 use crate::service::derive::{BATCH, Deriver, PublicKeys, Seeds};
@@ -33,11 +34,8 @@ pub trait Searcher {
     /// 探索を実行する。`on_progress` は呼び出し元スレッドで定期的に呼ばれる。
     fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome;
 
-    /// 何で探すか（表示用の短い名前。例: 「8スレッド」「GPU NVIDIA H100 80GB HBM3」）
-    fn label(&self, config: &SearchConfig) -> String;
-
-    /// 何で探すか（表示用の詳しい説明。例: 「8スレッド・倍算=テーブル・圧縮=まとめて・SIMD=AVX2・検索=memmem」）
-    fn detail(&self, config: &SearchConfig) -> String;
+    /// 探索の状態（表示用の「ラベル・値」の行。例: `("SIMD", "AVX2")`、`("GPU", "NVIDIA H100 80GB HBM3")`）
+    fn status(&self, config: &SearchConfig) -> Vec<(&'static str, String)>;
 }
 
 /// 全コアで総当たりする [`Searcher`]（本番で使うもの。中身は [`run`]）
@@ -49,17 +47,21 @@ impl Searcher for Parallel {
         run(config, |s| on_progress.report(s))
     }
 
-    fn label(&self, config: &SearchConfig) -> String {
-        format!("{}スレッド", config.threads)
-    }
-
-    fn detail(&self, config: &SearchConfig) -> String {
-        format!(
-            "{}・{}・{}",
-            self.label(config),
-            config.backend,
-            config.find
-        )
+    fn status(&self, config: &SearchConfig) -> Vec<(&'static str, String)> {
+        let marks: Vec<String> = Simd::ALL
+            .into_iter()
+            .filter(|&s| s != Simd::Off)
+            .map(|s| format!("{} {}", s.name(), if s.supported() { "✓" } else { "✗" }))
+            .collect();
+        let b = config.backend;
+        vec![
+            ("CPU", marks.join("  ")),
+            ("SIMD", b.simd.effective().name().into()),
+            ("倍算", b.mul.name().into()),
+            ("逆元", b.compress.name()),
+            ("検索", config.find.name().into()),
+            ("並列", format!("{} スレッド", config.threads)),
+        ]
     }
 }
 
@@ -148,7 +150,7 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
                 // 間違っている（バグ）ので止める
                 assert!(
                     pattern.is_match(&VanityKey::from_seed(*seed).public_b64()),
-                    "内部エラー: {}・{} の結果が ed25519-dalek・総当たりと一致しません",
+                    "内部エラー: {}・{} の結果が ed25519-dalek・総当たりと不一致",
                     config.backend,
                     config.find
                 );

@@ -20,15 +20,12 @@ pub enum PatternError {
 impl fmt::Display for PatternError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty => write!(f, "文字列が空です"),
+            Self::Empty => write!(f, "文字列が空"),
             Self::InvalidChar(c) => {
-                write!(
-                    f,
-                    "'{c}' は使えません（使えるのは A-Z a-z 0-9 + / だけです）"
-                )
+                write!(f, "使えない文字: '{c}'（使える文字: A-Z a-z 0-9 + /）")
             }
             Self::TooLong { len, max } => {
-                write!(f, "文字列が長すぎます（{len}文字、最大{max}文字）")
+                write!(f, "文字列が長すぎる: {len} 文字（最大 {max} 文字）")
             }
         }
     }
@@ -127,12 +124,18 @@ pub enum Find {
     Naive,
 }
 
+impl Find {
+    pub fn name(self) -> &'static str {
+        match self {
+            Find::Memmem => "memmem",
+            Find::Naive => "総当たり",
+        }
+    }
+}
+
 impl fmt::Display for Find {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Find::Memmem => "検索=memmem",
-            Find::Naive => "検索=総当たり",
-        })
+        write!(f, "検索={}", self.name())
     }
 }
 
@@ -153,7 +156,7 @@ pub(crate) mod tests {
         Pattern::new(s, cs).unwrap()
     }
 
-    const MSG_EMPTY: &str = "文字列が空です";
+    const MSG_EMPTY: &str = "文字列が空";
 
     /// 受け付けるか（受け付けるなら大小文字の設定もそのまま保つ）、拒否するならそのエラーとメッセージ
     #[rstest]
@@ -165,11 +168,11 @@ pub(crate) mod tests {
     #[case::max_minus_1(&"a".repeat(41), None)]
     #[case::max_42(&"a".repeat(42), None)]
     #[case::empty("", Some((PatternError::Empty, MSG_EMPTY)))]
-    #[case::hyphen("wako-kara", Some((PatternError::InvalidChar('-'), "'-' は使えません（使えるのは A-Z a-z 0-9 + / だけです）")))]
-    #[case::space("wako kara", Some((PatternError::InvalidChar(' '), "' ' は使えません（使えるのは A-Z a-z 0-9 + / だけです）")))]
-    #[case::padding("wako=", Some((PatternError::InvalidChar('='), "'=' は使えません（使えるのは A-Z a-z 0-9 + / だけです）")))]
-    #[case::japanese("わこから", Some((PatternError::InvalidChar('わ'), "'わ' は使えません（使えるのは A-Z a-z 0-9 + / だけです）")))]
-    #[case::too_long(&"x".repeat(43), Some((PatternError::TooLong { len: 43, max: 42 }, "文字列が長すぎます（43文字、最大42文字）")))]
+    #[case::hyphen("wako-kara", Some((PatternError::InvalidChar('-'), "使えない文字: '-'（使える文字: A-Z a-z 0-9 + /）")))]
+    #[case::space("wako kara", Some((PatternError::InvalidChar(' '), "使えない文字: ' '（使える文字: A-Z a-z 0-9 + /）")))]
+    #[case::padding("wako=", Some((PatternError::InvalidChar('='), "使えない文字: '='（使える文字: A-Z a-z 0-9 + /）")))]
+    #[case::japanese("わこから", Some((PatternError::InvalidChar('わ'), "使えない文字: 'わ'（使える文字: A-Z a-z 0-9 + /）")))]
+    #[case::too_long(&"x".repeat(43), Some((PatternError::TooLong { len: 43, max: 42 }, "文字列が長すぎる: 43 文字（最大 42 文字）")))]
     fn new_validates(
         #[case] s: &str,
         #[case] error: Option<(PatternError, &str)>,

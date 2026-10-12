@@ -67,7 +67,7 @@ pub fn save(key: &VanityKey, comment: &str, private: &Path, overwrite: bool) -> 
     // 片方だけ書いて止まらないよう、先に両方を確かめる（書くときも create_new なので、
     // 確かめた後に作られたファイルも上書きしない）
     if !overwrite && let Some(p) = existing(private)? {
-        let message = format!("{} は既に存在します", p.display());
+        let message = format!("既に存在: {}", p.display());
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, message));
     }
     write_file(
