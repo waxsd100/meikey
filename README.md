@@ -98,7 +98,7 @@ Windows でも同じ（PowerShell なら `-o $HOME\.ssh\id_ed25519_wakokara`）�
 
 ## Google Colab
 
-上の **Open in Colab** から開き、セルを上から順に実行する（GPU の確認 → Rust の導入 → ビルド → 計測 → 探索 → ダウンロード → 後片付け）。
+上の **Open in Colab** から開き、セルを上から順に実行する（GPU・CPU・メモリなどの確認 → Rust の導入 → ビルド → 計測 → 探索 → ダウンロード → 後片付け）。
 
 - ランタイムのタイプで GPU を選ぶ。整数演算の多い GPU ほど速いはずで、目安は RTX PRO 6000（G4）> H100 > A100 > L4 > T4。どれが使えるかはプランと空き状況しだい
 - 計測と探索のフォームで、GPU・CPU・GPU + CPU のどれを使うか選べる（既定は計測が全部、探索が GPU + CPU）。CPU は AVX-512 IFMA があれば自動で使う
