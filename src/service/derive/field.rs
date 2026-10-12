@@ -22,8 +22,8 @@ impl Fe {
     pub const ZERO: Fe = Fe([0; 5]);
     pub const ONE: Fe = Fe([1, 0, 0, 0, 0]);
 
-    /// リトルエンディアン32バイトから（最上位ビットは無視）。テストでの検算用
-    #[cfg(test)]
+    /// リトルエンディアン32バイトから（最上位ビットは無視）。AMX の経路とテストで使う
+    #[cfg(any(test, all(target_arch = "x86_64", feature = "amx")))]
     pub fn from_bytes(b: &[u8; 32]) -> Fe {
         let load = |i: usize| u64::from_le_bytes(*b[i..].first_chunk().unwrap());
         Fe([

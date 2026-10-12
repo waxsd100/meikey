@@ -9,6 +9,10 @@ repository = "https://github.com/waxsd100/meikey"
 keywords = ["ssh", "ed25519", "vanity", "keygen"]
 categories = ["command-line-utilities", "cryptography"]
 
+[features]
+# 体の乗算を AMX のタイル演算でする実験的な経路（--simd amx）。IFMA より遅いので既定では無効
+amx = []
+
 [dependencies]
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }

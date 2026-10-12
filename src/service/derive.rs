@@ -3,7 +3,8 @@
 //! ed25519 の公開鍵は `clamp(SHA-512(seed)[..32]) * B` を圧縮したもの。
 //! 探索ではこれを [`BATCH`] 個ずつまとめて計算し、圧縮に必要な逆元を1回にまとめる。
 //! x86_64 では CPU に合わせて、SHA-512 とテーブルの倍算を AVX-512 で8鍵ずつ（IFMA があれば
-//! 52 ビットの積和で）、AVX2 で4鍵ずつ同時に計算する。
+//! 52 ビットの積和で）、AVX2 で4鍵ずつ同時に計算する。体の乗算を AMX のタイル演算でする実験的な経路は、
+//! feature `amx` を有効にしてビルドし、`--simd amx` を指定したときだけ使う（IFMA より遅いので既定では無効）。
 //!
 //! 計算方法の型（[`Backend`] など）は [`crate::model::backend`] にあり、ここでは CPU が対応して
 //! いるかで決まる部分（[`Simd::effective`]・[`Backend::prepare`]・表示）を足している。
@@ -12,6 +13,7 @@
 //! - `field` — GF(2^255 - 19) の体演算（51 ビット × 5 リム）
 //! - `comb` — 櫛形テーブルによる固定基点倍算
 //! - `avx2`・`avx512` — 倍算を4鍵・8鍵ずつ同時に
+//! - `amx` — 体の乗算を AMX のタイル演算で（実験的。feature `amx`）
 //! - `sha512x4`・`sha512x8` — SHA-512 を4シード・8シードずつ同時に
 
 pub(crate) mod comb;
@@ -20,11 +22,15 @@ pub(crate) mod field;
 // SIMD の部品は x86_64 だけ
 cfg_select! {
     target_arch = "x86_64" => {
+        #[cfg(feature = "amx")]
+        pub(crate) mod amx;
         pub(crate) mod avx2;
         pub(crate) mod avx512;
         pub(crate) mod sha512x4;
         pub(crate) mod sha512x8;
 
+        #[cfg(feature = "amx")]
+        use amx::Amx;
         use avx2::{Avx2, Table4};
         use avx512::{Avx512, Ifma};
     }
@@ -59,6 +65,8 @@ impl Simd {
 /// 実際に使う SIMD と、CPU が対応していることの証明
 #[derive(Debug, Clone, Copy)]
 enum Lanes {
+    #[cfg(all(target_arch = "x86_64", feature = "amx"))]
+    Amx(Amx),
     #[cfg(target_arch = "x86_64")]
     Ifma(Ifma),
     #[cfg(target_arch = "x86_64")]
@@ -73,6 +81,12 @@ impl Lanes {
     fn detect(limit: Simd) -> Lanes {
         cfg_select! {
             target_arch = "x86_64" => {
+                #[cfg(feature = "amx")]
+                if limit >= Simd::Amx
+                    && let Some(a) = Amx::detect()
+                {
+                    return Lanes::Amx(a);
+                }
                 if limit >= Simd::Avx512Ifma
                     && let Some(i) = Ifma::detect()
                 {
@@ -98,6 +112,8 @@ impl Lanes {
 
     fn simd(self) -> Simd {
         match self {
+            #[cfg(all(target_arch = "x86_64", feature = "amx"))]
+            Lanes::Amx(_) => Simd::Amx,
             #[cfg(target_arch = "x86_64")]
             Lanes::Ifma(_) => Simd::Avx512Ifma,
             #[cfg(target_arch = "x86_64")]
@@ -116,6 +132,8 @@ impl Backend {
             return;
         }
         match Lanes::detect(self.simd) {
+            #[cfg(all(target_arch = "x86_64", feature = "amx"))]
+            Lanes::Amx(a) => amx::prepare(a),
             #[cfg(target_arch = "x86_64")]
             Lanes::Ifma(i) => avx512::ifma::prepare(i),
             #[cfg(target_arch = "x86_64")]
@@ -183,6 +201,8 @@ impl Deriver {
     fn scalars(&self, seeds: &Seeds) -> Seeds {
         let mut out: Seeds = [[0u8; 32]; BATCH];
         match self.lanes {
+            #[cfg(all(target_arch = "x86_64", feature = "amx"))]
+            Lanes::Amx(a) => scalars_avx512(a.avx512(), seeds, &mut out),
             #[cfg(target_arch = "x86_64")]
             Lanes::Ifma(i) => scalars_avx512(i.avx512(), seeds, &mut out),
             #[cfg(target_arch = "x86_64")]
@@ -209,6 +229,8 @@ impl Deriver {
 
     fn table(&mut self, scalars: &Seeds, out: &mut PublicKeys) {
         match self.lanes {
+            #[cfg(all(target_arch = "x86_64", feature = "amx"))]
+            Lanes::Amx(a) => amx::mul_base_batch(a, scalars, &mut self.points),
             #[cfg(target_arch = "x86_64")]
             Lanes::Ifma(i) => avx512::ifma::mul_base_batch(i, scalars, &mut self.points),
             #[cfg(target_arch = "x86_64")]
@@ -309,7 +331,7 @@ mod tests {
         #[case] batches: &[Batch],
         #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
         #[values(Compress::Batch, Compress::Each)] compress: Compress,
-        #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
+        #[values(Simd::Amx, Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
     ) {
         let mut d = Deriver::new(Backend {
             mul,
@@ -355,8 +377,7 @@ mod tests {
         }
         assert_eq!(Backend::ALL.iter().filter(|&&b| b == backend).count(), 1);
         assert_eq!(Backend::default(), Backend::FAST);
-        assert_eq!(Backend::ALL[0], Backend::FAST);
-        assert_eq!(Backend::ALL[15], Backend::BASELINE);
+        assert_eq!(Backend::ALL.last(), Some(&Backend::BASELINE));
     }
 
     /// 各 SIMD を「使える」と判定するのは、CPU がその命令セットに対応しているときだけ
@@ -364,6 +385,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[rstest]
     fn simd_support_matches_cpu() {
+        #[cfg(feature = "amx")]
+        assert_eq!(Simd::Amx.supported(), Amx::detect().is_some());
+        #[cfg(not(feature = "amx"))]
+        assert!(!Simd::Amx.supported(), "feature amx が無効なら使わない");
         assert_eq!(Simd::Avx512Ifma.supported(), Ifma::detect().is_some());
         assert_eq!(Simd::Avx512.supported(), Avx512::detect().is_some());
         assert_eq!(Simd::Avx2.supported(), Avx2::detect().is_some());
@@ -372,7 +397,7 @@ mod tests {
     /// SIMD の上限は、CPU が対応していなければ、対応している中で一番上のものに下がる
     #[rstest]
     fn simd_falls_back_to_best_supported(
-        #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] limit: Simd,
+        #[values(Simd::Amx, Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] limit: Simd,
     ) {
         let used = limit.effective();
         assert!(used <= limit && used.supported());
@@ -468,7 +493,7 @@ mod tests {
             #[case] mul: Mul,
             #[case] compress: Compress,
             #[case] position: usize,
-            #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
+            #[values(Simd::Amx, Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
             #[values("1", "2", "3", "1024", "SHA(abc)")] name: &str,
         ) {
             let v = rfc8032::vector(name);
@@ -499,7 +524,7 @@ mod tests {
         fn section_7_1_all_vectors_in_one_batch(
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
-            #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
+            #[values(Simd::Amx, Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
         ) {
             let vectors = rfc8032::vectors();
             let mut seeds = filler_seeds();
@@ -529,7 +554,7 @@ mod tests {
         fn implementations_agree(
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
-            #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
+            #[values(Simd::Amx, Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
         ) {
             check(16, (seeds_strategy(), 0..BATCH), |(seeds, pick)| {
                 let got = derive(
@@ -563,7 +588,7 @@ mod tests {
         fn outputs_are_canonical_points_of_order_l(
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
-            #[values(Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
+            #[values(Simd::Amx, Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
         ) {
             check(16, (any::<[u8; 32]>(), 0..BATCH), |(seed, position)| {
                 let mut seeds = filler_seeds();

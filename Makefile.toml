@@ -21,7 +21,7 @@ skip_core_tasks = true
 alias = "ci"
 
 [tasks.ci]
-description = "整形の確認・clippy・全テスト（nextest は doctest を回さないので cargo test --doc も）"
+description = "整形の確認・clippy・全テスト（nextest は doctest を回さないので cargo test --doc も）。feature amx を有効にした clippy と AMX のテストも"
 dependencies = ["install-nextest"]
 # 警告が1つでもあれば失敗させる（Cargo の build.warnings。-D warnings と違って rustc のフラグが
 # 変わらないので、普段のビルドのキャッシュをそのまま使える。テストのビルドの警告も対象）
@@ -30,7 +30,9 @@ script_runner = "@duckscript"
 script = '''
 exec --fail-on-error cargo fmt --all --check
 exec --fail-on-error cargo clippy --all-targets
+exec --fail-on-error cargo clippy --all-targets --features amx
 exec --fail-on-error cargo nextest run
+exec --fail-on-error cargo nextest run --features amx --lib -E "test(/^service::derive::amx::/)"
 exec --fail-on-error cargo test --doc
 '''
 
@@ -57,21 +59,24 @@ dependencies = ["install-nextest"]
 command = "cargo"
 args = ["mutants", "--test-tool", "nextest", "--jobs", "2", "--exclude", "src/main.rs", "--exclude-re", "^src/controller/cli\\.rs:.*\\b(main|check_features)\\b", "${@}", "--", "--lib"]
 
-# Intel SDE（Intel の命令エミュレーター）で CPU を3種類真似て、SIMD の経路のテストを回す。
+# Intel SDE（Intel の命令エミュレーター）で CPU を4種類真似て、SIMD の経路のテストを回す。
 # AVX-512 に対応していない PC でも、AVX-512 IFMA・AVX-512F の経路を実際に実行して確かめられる。
-# 3種類それぞれで、その CPU にある命令セットを MEIKEY_REQUIRE_SIMD で必須にするので、黙って飛ばされない。
+# それぞれで、その CPU にある命令セットを MEIKEY_REQUIRE_SIMD で必須にするので、黙って飛ばされない。
+# ただし AMX は、OS（Linux）にタイルを使う許可をもらう必要があり、本物の CPU が AMX に対応していないと
+# 許可が下りないので必須にしない（spr で、AMX のある CPU の Linux なら AMX のテストも回る）。
+# AMX の経路（feature amx）も入れてビルドする。
 # エミュレーションは遅いので、最適化したテスト用ビルド（proptest プロファイル）で回す。
 # SDE は https://www.intel.com/content/www/us/en/download/684897/ から入れ、環境変数 SDE に
 # sde64（Windows では sde.exe）のパスを入れておく
 [tasks.sde]
-description = "Intel SDE で Ice Lake サーバー（IFMA）・Skylake サーバー（AVX-512F）・Alder Lake（AVX2 まで）を真似て SIMD のテスト"
+description = "Intel SDE で Sapphire Rapids（AMX）・Ice Lake サーバー（IFMA）・Skylake サーバー（AVX-512F）・Alder Lake（AVX2 まで）を真似て SIMD のテスト"
 dependencies = ["install-nextest"]
 script_runner = "@duckscript"
 script = '''
 sde = get_env SDE
 assert ${sde} "環境変数 SDE に Intel SDE（sde64 / sde.exe）のパスを入れてください"
 # CPU:その CPU で必須にする命令セット
-cases = array "icx:avx2,avx512,avx512-ifma" "skx:avx2,avx512" "adl:avx2"
+cases = array "spr:avx2,avx512,avx512-ifma" "icx:avx2,avx512,avx512-ifma" "skx:avx2,avx512" "adl:avx2"
 for case in ${cases}
     parts = split ${case} :
     cpu = array_get ${parts} 0
@@ -80,7 +85,7 @@ for case in ${cases}
     set_env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER "${sde} -${cpu} --"
     set_env CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER "${sde} -${cpu} --"
     set_env MEIKEY_REQUIRE_SIMD ${need}
-    exec --fail-on-error cargo nextest run --cargo-profile proptest --lib -E "test(/^service::derive::(avx2|avx512|sha512x4|sha512x8|tests)::/)"
+    exec --fail-on-error cargo nextest run --cargo-profile proptest --features amx --lib -E "test(/^service::derive::(amx|avx2|avx512|sha512x4|sha512x8|tests)::/)"
 end
 '''
 

@@ -36,7 +36,9 @@ pub enum Compress {
 }
 
 /// 使ってよい SIMD の上限。CPU が対応していなければ、対応している中で一番上のものに下がる
-/// （上から Avx512Ifma → Avx512 → Avx2 → Off。x86_64 以外では常に Off）
+/// （上から Amx → Avx512Ifma → Avx512 → Avx2 → Off。x86_64 以外では常に Off）。
+/// 既定は Avx512Ifma。実験的な Amx は、feature `amx` を有効にしてビルドしたときだけ使える
+/// （無効なら Amx を上限にしても Avx512Ifma から下がる）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Simd {
     /// 1鍵ずつ（高速化前）
@@ -48,14 +50,28 @@ pub enum Simd {
     /// AVX-512 IFMA で8鍵ずつ（体演算は 51 ビット × 5 リムで、52 ビットの積和命令を使う）
     #[default]
     Avx512Ifma,
+    /// 体の乗算を AMX のタイル演算（8 ビットの行列積）で（実験的。IFMA より遅い）。
+    /// SHA-512 は AVX-512 で8つずつ
+    Amx,
 }
 
 impl Simd {
-    /// 上から順に
+    /// 上から順に（Amx は feature `amx` が有効なときだけ）
+    #[cfg(feature = "amx")]
+    pub const ALL: [Simd; 5] = [
+        Simd::Amx,
+        Simd::Avx512Ifma,
+        Simd::Avx512,
+        Simd::Avx2,
+        Simd::Off,
+    ];
+    /// 上から順に（Amx は feature `amx` が有効なときだけ）
+    #[cfg(not(feature = "amx"))]
     pub const ALL: [Simd; 4] = [Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off];
 
     pub fn name(self) -> &'static str {
         match self {
+            Simd::Amx => "AMX",
             Simd::Avx512Ifma => "AVX-512 IFMA",
             Simd::Avx512 => "AVX-512",
             Simd::Avx2 => "AVX2",
@@ -77,17 +93,18 @@ impl Backend {
         compress: Compress::Each,
         simd: Simd::Off,
     };
-    /// すべての組み合わせ（先頭が FAST、最後が BASELINE）
-    pub const ALL: [Backend; 16] = {
+    /// すべての組み合わせ（最後が BASELINE）
+    pub const ALL: [Backend; 4 * Simd::ALL.len()] = {
+        const S: usize = Simd::ALL.len();
         let muls = [Mul::Table, Mul::ConstantTime];
         let compresses = [Compress::Batch, Compress::Each];
-        let mut all = [Backend::FAST; 16];
+        let mut all = [Backend::FAST; 4 * S];
         let mut i = 0;
-        while i < 16 {
+        while i < all.len() {
             all[i] = Backend {
-                mul: muls[i / 8],
-                compress: compresses[(i / 4) % 2],
-                simd: Simd::ALL[i % 4],
+                mul: muls[i / (2 * S)],
+                compress: compresses[(i / S) % 2],
+                simd: Simd::ALL[i % S],
             };
             i += 1;
         }

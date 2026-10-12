@@ -67,7 +67,9 @@ struct Cli {
     no_batch: bool,
 
     /// 使う SIMD の上限（比較用）。CPU が対応していなければ、対応している中で一番上のものに下がる。
-    /// avx512-ifma・avx512 は8鍵ずつ、avx2 は4鍵ずつ同時に計算し、off は1鍵ずつ（高速化前の SHA-512 と倍算）
+    /// avx512-ifma・avx512 は8鍵ずつ、avx2 は4鍵ずつ同時に計算し、off は1鍵ずつ（高速化前の SHA-512 と倍算）。
+    /// amx は体の乗算を AMX のタイル演算でする実験的な経路（IFMA より遅い。Linux のみ。feature amx を
+    /// 有効にしてビルドしたときだけ指定できる）
     #[arg(long, value_enum, value_name = "LEVEL", default_value_t = SimdArg::Avx512Ifma)]
     simd: SimdArg,
 
@@ -80,6 +82,8 @@ struct Cli {
 /// `--simd` の値
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum SimdArg {
+    #[cfg(feature = "amx")]
+    Amx,
     #[value(name = "avx512-ifma")]
     Avx512Ifma,
     Avx512,
@@ -90,6 +94,8 @@ enum SimdArg {
 impl From<SimdArg> for Simd {
     fn from(s: SimdArg) -> Simd {
         match s {
+            #[cfg(feature = "amx")]
+            SimdArg::Amx => Simd::Amx,
             SimdArg::Avx512Ifma => Simd::Avx512Ifma,
             SimdArg::Avx512 => Simd::Avx512,
             SimdArg::Avx2 => Simd::Avx2,
@@ -288,6 +294,7 @@ fn check_features(config: &SearchConfig) {
     let used = config.backend.simd.effective();
     for simd in Simd::ALL {
         let what = match simd {
+            Simd::Amx => "実験的、体の乗算をタイル演算で。IFMA より遅い",
             Simd::Avx512Ifma => "8鍵同時、52 ビットの積和で倍算",
             Simd::Avx512 => "8鍵同時",
             Simd::Avx2 => "4鍵同時",
@@ -543,6 +550,16 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains(message), "{e}");
+    }
+
+    /// --simd amx は feature amx が有効なときだけ受け付け、探索の設定に届く
+    #[rstest]
+    fn simd_amx_needs_feature() {
+        let parsed = Cli::try_parse_from(["meikey", "abc", "--simd", "amx"]);
+        #[cfg(feature = "amx")]
+        assert_eq!(Simd::from(parsed.unwrap().simd), Simd::Amx);
+        #[cfg(not(feature = "amx"))]
+        assert!(parsed.is_err());
     }
 
     /// 各オプションが探索の設定（[`SearchConfig`]）にそのまま届く
