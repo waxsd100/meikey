@@ -1,6 +1,7 @@
 # meikey
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/waxsd100/meikey/blob/master/colab/meikey.ipynb)
+[![Benchmark: 5.4億 鍵/秒](https://img.shields.io/badge/benchmark-5.4%E5%84%84%20%E9%8D%B5%2F%E7%A7%92-brightgreen.svg)](docs/benchmark.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#ライセンス)
 [![Rust 1.99+](https://img.shields.io/badge/rust-1.99%2B-orange.svg?logo=rust)](https://www.rust-lang.org)
 [![CUDA sm_75+](https://img.shields.io/badge/CUDA-sm__75%2B-76B900.svg?logo=nvidia)](#gpucuda)
@@ -8,6 +9,8 @@
 [![技術者倫理|遵守済み](https://gijutsusharin.li/badge.svg)](https://gijutsusharin.li)
 
 公開鍵に好きな文字列が入った ed25519 の SSH 鍵（vanity key）を探す CLI。名前は 銘（めい）＋ key。
+
+GPU にも対応していて、Google Colab の RTX PRO 6000 の環境なら **毎秒 5.4億 鍵** を探索できる（[ベンチマーク](docs/benchmark.md)）。
 
 ```
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAiytFbrDh3MEGkK6xS5oe22CBkwAkOiHqOUBG+RECKz wakokara
@@ -100,14 +103,14 @@ Windows でも同じ（PowerShell なら `-o $HOME\.ssh\id_ed25519_wakokara`）�
 
 上の **Open in Colab** から開き、セルを上から順に実行する（GPU・CPU・メモリなどの確認 → Rust の導入 → ビルド → 計測 → 探索 → ダウンロード → 後片付け）。
 
-- ランタイムのタイプで GPU を選ぶ。整数演算の多い GPU ほど速いはずで、目安は RTX PRO 6000（G4）> H100 > A100 > L4 > T4。どれが使えるかはプランと空き状況しだい
+- ランタイムのタイプで GPU を選ぶ。実測で RTX PRO 6000（G4）4.8億 > A100 1.1億 > L4 8185万 > T4 2186万 鍵/秒（GPU のみ。[ベンチマーク](docs/benchmark.md)）。H100 は未計測。どれが使えるかはプランと空き状況しだい
 - 計測と探索のフォームで、GPU・CPU・GPU + CPU のどれを使うか選べる（既定は計測が全部、探索が GPU + CPU）。CPU は AVX-512 IFMA があれば自動で使う
 - Google AI Ultra ならバックグラウンド実行が使えるので、ブラウザを閉じても探索は続く
 - 秘密鍵は Colab の VM 上で作られる。ダウンロードしたら VM から消し、手元でパスフレーズを付ける
 
 ## 速度
 
-i7-12700K（20 スレッド）で約 600 万 鍵/秒、1 スレッドで約 70 万 鍵/秒。GPU は RTX 3080 Ti で約 1.1億 鍵/秒（[GPU](#gpucuda)）。1 鍵あたりの内訳（1 スレッド）:
+i7-12700K（20 スレッド）で約 600 万 鍵/秒、1 スレッドで約 70 万 鍵/秒。GPU は RTX 3080 Ti で約 1.1億 鍵/秒（[GPU](#gpucuda)）。Colab の各 GPU・CPU の結果は [docs/benchmark.md](docs/benchmark.md)。1 鍵あたりの内訳（1 スレッド）:
 
 | 工程 | ed25519-dalek | meikey |
 |---|---|---|
@@ -236,6 +239,8 @@ tests/
 └── support/     テスト用の独立実装（RFC 8032 の参照実装、SSH 形式）と補助
 colab/
 └── meikey.ipynb Google Colab の GPU で動かすノートブック
+docs/
+└── benchmark.md Google Colab の各 GPU・CPU で測った速度
 ```
 
 ### テスト
@@ -250,3 +255,7 @@ colab/
 ## ライセンス
 
 [MIT](LICENSE-MIT) または [Apache-2.0](LICENSE-APACHE) のどちらかを選んで使える。
+
+## 免責事項
+
+meikey は ed25519 の鍵生成をどこまで速くできるかを試すための研究用プロジェクト。本番環境で使う鍵の生成には使わないこと。

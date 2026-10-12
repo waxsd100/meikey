@@ -1,0 +1,61 @@
+# ベンチマーク（Google Colab）
+
+Google Colab の各ランタイムで測った meikey の速度。
+
+- 文字列: `TARGET`（大小文字の区別なし、期待試行 約 2902.0万）
+- 時間: 各 10 秒（`--bench 10`）
+
+## 速度
+
+単位は 鍵/秒。
+
+| ランタイム | GPU | CPU | GPU + CPU |
+|---|---|---|---|
+| RTX PRO 6000（G4） | 4.8億 | 6230.0万 | 5.4億 |
+| A100 | 1.1億 | 292.8万 | 1.2億 |
+| L4 | 8185.1万 | 298.3万 | 8416.0万 |
+| T4 | 2185.8万 | 178.0万 | 2322.8万 |
+| CPU のみ | — | 107.3万 | — |
+
+| ランタイム | グリッド | CPU の SIMD | CPU のスレッド（CPU / GPU + CPU） |
+|---|---|---|---|
+| RTX PRO 6000（G4） | 752 ブロック × 128 スレッド × 8 鍵 | AVX-512 IFMA | 48 / 47 |
+| A100 | 324 ブロック × 128 スレッド × 8 鍵 | AVX-512 | 12 / 11 |
+| L4 | 174 ブロック × 128 スレッド × 8 鍵 | AVX-512 | 12 / 11 |
+| T4 | 120 ブロック × 128 スレッド × 8 鍵 | AVX-512 | 8 / 7 |
+| CPU のみ | — | AVX2 | 8 / — |
+
+## 環境
+
+### GPU
+
+| ランタイム | GPU | 世代 | SM | メモリ | 電力上限 | 最大クロック（SM・メモリ） | PCIe |
+|---|---|---|---|---|---|---|---|
+| RTX PRO 6000（G4） | NVIDIA RTX PRO 6000 Blackwell Server Edition | sm_120 | 188 | 95.6 GiB | 600 W | 2430 MHz・12481 MHz | Gen5 x16 |
+| A100 | NVIDIA A100-SXM4-80GB | sm_80 | 108 | 80.0 GiB | 400 W | 1410 MHz・1593 MHz | Gen4 x16 |
+| L4 | NVIDIA L4 | sm_89 | 58 | 22.5 GiB | 72 W | 2040 MHz・6251 MHz | Gen3 x16 |
+| T4 | Tesla T4 | sm_75 | 40 | 15.0 GiB | 70 W | 1590 MHz・5001 MHz | Gen3 x16 |
+
+ドライバはどれも 580.82.07（CUDA 13.0）。
+
+### CPU
+
+| ランタイム | CPU | コア・スレッド | クロック | キャッシュ（L2・L3） | AVX2 | AVX-512 | AVX-512 IFMA |
+|---|---|---|---|---|---|---|---|
+| RTX PRO 6000（G4） | AMD EPYC 9B45 | 24・48 | 2700 MHz | 24 MiB・96 MiB | ✓ | ✓ | ✓ |
+| A100 | Intel Xeon CPU @ 2.20GHz | 6・12 | 2200 MHz | 6 MiB・38.5 MiB | ✓ | ✓ | ✗ |
+| L4 | Intel Xeon CPU @ 2.20GHz | 6・12 | 2200 MHz | 6 MiB・38.5 MiB | ✓ | ✓ | ✗ |
+| T4 | Intel Xeon CPU @ 2.00GHz | 4・8 | 2000 MHz | 4 MiB・38.5 MiB | ✓ | ✓ | ✗ |
+| CPU のみ | Intel Xeon CPU @ 2.20GHz | 4・8 | 2200 MHz | 1 MiB・55 MiB | ✓ | ✗ | ✗ |
+
+### その他
+
+| ランタイム | メモリ | ディスク | OS |
+|---|---|---|---|
+| RTX PRO 6000（G4） | 176.9 GiB | 236 GiB | Ubuntu 24.04.4 LTS |
+| A100 | 167.1 GiB | 236 GiB | Ubuntu 24.04.4 LTS |
+| L4 | 53.0 GiB | 236 GiB | Ubuntu 24.04.4 LTS |
+| T4 | 51.0 GiB | 236 GiB | Ubuntu 24.04.4 LTS |
+| CPU のみ | 51.0 GiB | 226 GiB | Ubuntu 24.04.5 LTS |
+
+カーネルはどれも 6.6.122+。
