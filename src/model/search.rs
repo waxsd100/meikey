@@ -4,6 +4,8 @@ use crate::model::backend::Backend;
 use crate::model::key::VanityKey;
 use crate::model::pattern::{Find, Pattern};
 use std::num::NonZero;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::thread;
 use std::time::Duration;
 
@@ -22,6 +24,23 @@ pub struct SearchConfig {
     pub time_limit: Option<Duration>,
     /// 進捗コールバックを呼ぶ間隔
     pub progress_interval: Duration,
+    /// 外から探索を止める合図（CPU と GPU で同時に探すとき、片方が見つけたらもう片方を止める）
+    pub cancel: Cancel,
+}
+
+/// 探索を止める合図。clone したものどうしで共有する
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    /// 止める（何度呼んでもよい）
+    pub fn cancel(&self) {
+        self.0.store(true, Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Relaxed)
+    }
 }
 
 impl SearchConfig {
@@ -34,6 +53,7 @@ impl SearchConfig {
             bench: false,
             time_limit: None,
             progress_interval: Duration::from_secs(5),
+            cancel: Cancel::default(),
         }
     }
 }
@@ -80,5 +100,19 @@ mod tests {
         if let Some(want) = want {
             assert!((r - want).abs() < 1e-9, "{r}");
         }
+    }
+
+    /// 止める合図は clone したものどうしで共有し、新しく作ったものには届かない
+    #[rstest]
+    fn cancel_is_shared_by_clones(#[values(1, 2)] times: usize) {
+        let a = Cancel::default();
+        let b = a.clone();
+        let other = Cancel::default();
+        assert!(!a.is_cancelled() && !b.is_cancelled());
+        for _ in 0..times {
+            b.cancel();
+        }
+        assert!(a.is_cancelled() && b.is_cancelled());
+        assert!(!other.is_cancelled());
     }
 }

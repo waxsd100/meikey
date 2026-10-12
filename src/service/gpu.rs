@@ -254,9 +254,10 @@ impl Gpu {
                     stats,
                 });
             }
-            if config
-                .time_limit
-                .is_some_and(|limit| stats.elapsed >= limit)
+            if config.cancel.is_cancelled()
+                || config
+                    .time_limit
+                    .is_some_and(|limit| stats.elapsed >= limit)
             {
                 return Ok(Outcome { key: None, stats });
             }
@@ -298,8 +299,9 @@ impl Searcher for Gpu {
             ("世代", format!("sm_{}{}", i.compute.0, i.compute.1)),
             ("SM", i.sms.to_string()),
             ("メモリ", format!("{:.0} GB", i.memory as f64 / 1e9)),
+            // CPU と同時に探すとき、CPU の「並列」と並ぶので別の名前にする
             (
-                "並列",
+                "グリッド",
                 format!("{} ブロック × {} スレッド × {} 鍵", self.grid, BLOCK, BATCH),
             ),
         ]
@@ -407,6 +409,7 @@ mod tests {
     use crate::property::check;
     #[cfg(meikey_gpu_host)]
     use crate::service::derive::field::Fe;
+    use crate::service::search::{Both, Parallel};
     #[cfg(meikey_gpu_host)]
     use proptest::prelude::*;
     use rstest::rstest;
@@ -693,6 +696,40 @@ mod tests {
         };
         let out = gpu.run(&bench, &mut |_| {});
         assert!(out.key.is_none() && out.stats.tries > 0);
+    }
+
+    /// GPU の探索は外からの合図で止まる（時間制限が無くても）。CPU と同時に探すと、どちらかが見つける
+    #[rstest]
+    fn gpu_with_cpu(#[values(false, true)] cancel_only: bool) {
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        if cancel_only {
+            let config = SearchConfig::new(Some(
+                Pattern::new(&"z".repeat(Pattern::MAX_LEN), false).unwrap(),
+            ));
+            let cancel = config.cancel.clone();
+            let started = Instant::now();
+            let out = std::thread::scope(|s| {
+                s.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    cancel.cancel();
+                });
+                gpu.run(&config, &mut |_| {})
+            });
+            assert!(out.key.is_none() && out.stats.tries > 0);
+            assert!(started.elapsed() < Duration::from_secs(5), "止まるのが遅い");
+        } else {
+            let p = Pattern::new("Ab1c", false).unwrap();
+            let config = SearchConfig {
+                threads: 1,
+                time_limit: Some(Duration::from_secs(60)),
+                ..SearchConfig::new(Some(p.clone()))
+            };
+            let out = Both(gpu, Parallel).run(&config, &mut |_| {});
+            let key = out.key.expect("4文字ならすぐ見つかる");
+            assert!(p.is_match(&key.public_b64()));
+        }
     }
 
     /// カーネル全体（CPU で真似たもの）: 見つけた通し番号のシードの鍵は文字列を含み、

@@ -60,8 +60,9 @@ SIMD          AVX2
 | `-C TEXT` | 鍵のコメント |
 | `-f`, `--force` | 既存のファイルを置き換える |
 | `--bench SECS` | 探さずに速度だけ測る |
-| `--check` | CPU（`--gpu` なら GPU）と計算方法を表示して終わる |
-| `--gpu` | GPU で探す（feature `cuda` でビルドしたときだけ。[GPU](#gpucuda)） |
+| `--check` | 使う CPU・GPU と計算方法を表示して終わる |
+| `--gpu` | CPU ではなく GPU で探す（[GPU](#gpucuda)） |
+| `--both` | GPU と CPU の両方で探す（CPU のスレッド数の既定は 全コア − 1） |
 | `--constant-time` | 倍算に定数時間の実装を使う（約 5 倍遅い。[安全性](#安全性)） |
 | `--no-batch` | 逆元を 1 鍵ごとに計算する（比較用） |
 | `--simd LEVEL` | SIMD の上限。`avx512-ifma`（既定）・`avx512`・`avx2`・`off`。CPU が対応していなければ下がる。`amx` は feature `amx` でビルドしたときだけ（[AMX](#amx実験的)） |
@@ -79,9 +80,9 @@ SIMD          AVX2
 Turing（RTX 20 シリーズ・T4）以降の NVIDIA の GPU で動く。
 
 ```sh
-cargo make run-gpu wakokara --bench 10
-cargo make run-gpu wakokara -C wakokara -o ~/.ssh/id_ed25519_wakokara
-cargo make build-gpu      # target/release/meikey に --gpu を付けて使う
+cargo make run wakokara --gpu --bench 10
+cargo make run wakokara --gpu -C wakokara -o ~/.ssh/id_ed25519_wakokara
+cargo make run wakokara --both --bench 10   # GPU と CPU の両方
 ```
 
 Windows でも同じ（PowerShell なら `-o $HOME\.ssh\id_ed25519_wakokara`）。
@@ -90,20 +91,23 @@ Windows でも同じ（PowerShell なら `-o $HOME\.ssh\id_ed25519_wakokara`）�
 - 1 スレッドで鍵 8 本ずつ、シードの生成（ChaCha20）・SHA-512・倍算・逆元・base64 の判定まで GPU で行う。体演算は AVX2 版と同じ 25.5 ビット × 10 リム
 - 当たりは通し番号だけを受け取り、CPU 側で同じシードから ed25519-dalek で作り直して確かめてから書き出す
 - 画面をつないだ GPU では 1 回の起動を 0.05 秒ほどに抑える。Windows の TDR（約 2 秒でドライバをリセット）に引っかからず、画面も固まらない
+- `--both` は GPU と CPU で同時に探し、どちらかが見つけたら両方止める。CPU の 1 本は GPU の操作に空ける。RTX 3080 Ti（1.1億 鍵/秒）と i7-12700K（約 600 万 鍵/秒）なら約 5% 速くなる
 - ドライバが古くて PTX を読めないときは、NVRTC があればその GPU 向けにコンパイルし直す
 - `kernel.cu` を変えたら `cargo make ptx` で PTX を作り直す
+- GPU 対応（feature `cuda`）は既定で入っている。外すなら `--no-default-features` でビルドする（cudarc と約 1MB の PTX が入らない）
 
 ## Google Colab
 
 上の **Open in Colab** から開き、セルを上から順に実行する（GPU の確認 → Rust の導入 → ビルド → 計測 → 探索 → ダウンロード → 後片付け）。
 
 - ランタイムのタイプで GPU を選ぶ。整数演算の多い GPU ほど速いはずで、目安は RTX PRO 6000（G4）> H100 > A100 > L4 > T4。どれが使えるかはプランと空き状況しだい
+- 計測と探索のフォームで、GPU・CPU・GPU + CPU のどれを使うか選べる（既定は計測が全部、探索が GPU + CPU）。CPU は AVX-512 IFMA があれば自動で使う
 - Google AI Ultra ならバックグラウンド実行が使えるので、ブラウザを閉じても探索は続く
 - 秘密鍵は Colab の VM 上で作られる。ダウンロードしたら VM から消し、手元でパスフレーズを付ける
 
 ## 速度
 
-i7-12700K（20 スレッド）で約 600 万 鍵/秒、1 スレッドで約 70 万 鍵/秒。1 鍵あたりの内訳（1 スレッド）:
+i7-12700K（20 スレッド）で約 600 万 鍵/秒、1 スレッドで約 70 万 鍵/秒。GPU は RTX 3080 Ti で約 1.1億 鍵/秒（[GPU](#gpucuda)）。1 鍵あたりの内訳（1 スレッド）:
 
 | 工程 | ed25519-dalek | meikey |
 |---|---|---|
@@ -171,8 +175,8 @@ AMX（Sapphire Rapids 以降の Xeon）の `tdpbuud`（u8 × u8 の行列積を 
 | `cargo make proptest-deep` | proptest の試行回数を 100 倍にして全テスト |
 | `cargo make mutants` | [cargo-mutants](https://mutants.rs/) でミューテーションテスト |
 | `cargo make sde` | [Intel SDE](https://www.intel.com/content/www/us/en/download/684897/) で Sapphire Rapids・Ice Lake サーバー・Skylake サーバー・Alder Lake を真似て SIMD の経路をテスト（環境変数 `SDE` に sde64 / sde.exe のパス） |
-| `cargo make run …` / `run-gpu …` | 最適化ビルドで実行（`run-gpu` は GPU 版） |
-| `cargo make build` / `build-gpu` | 最適化ビルド（`target/release/meikey`） |
+| `cargo make run …` | 最適化ビルドで実行（引数はそのまま meikey に渡る） |
+| `cargo make build` | 最適化ビルド（`target/release/meikey`） |
 | `cargo make breakdown` | 1 鍵あたりの計算時間・検索時間を高速化の組み合わせごとに比べる |
 | `cargo make ptx` | `kernel.cu` から埋め込む PTX を作る（NVRTC が要る。`Makefile.toml` を参照） |
 
@@ -239,7 +243,7 @@ colab/
 - ユニットテスト: 体演算・倍算・SHA-512・鍵の書き出しを、多倍長整数・RFC 8032 の参照実装・curve25519-dalek・ed25519-dalek と proptest で突き合わせる。RFC 8032 Section 7.1 のテストベクタも全部通す
 - モックテスト: controller を、探索と保存を mockall のモックに差し替えて確かめる。呼ぶ順番（既存ファイルの確認 → 探索 → 保存）、オプションが探索の設定に届くか、エラーのときに探索や保存をしないか
 - IT: meikey を実際に起動して鍵を作り、ssh-key・`ssh-keygen`・一時的に立てた sshd で読み込み・署名・検証・ログインができるか確かめる。ツールが無い環境ではその部分だけ飛ばす
-- GPU: `kernel.cu` を C++ として CPU 向けにもコンパイルし、ChaCha20・SHA-512・体演算・倍算・base64 の判定・探索全体を rand・sha2・curve25519-dalek・ed25519-dalek・`Pattern` と突き合わせる（GPU が無くても回る）。埋め込んだ PTX が今の `kernel.cu` から作ったものかも確かめる。GPU があれば、実機で計算した約 8,000 鍵が ed25519-dalek と一致し、探索で鍵が見つかるかも見る（`cargo test --features cuda`）
+- GPU: `kernel.cu` を C++ として CPU 向けにもコンパイルし、ChaCha20・SHA-512・体演算・倍算・base64 の判定・探索全体を rand・sha2・curve25519-dalek・ed25519-dalek・`Pattern` と突き合わせる（GPU が無くても回る）。埋め込んだ PTX が今の `kernel.cu` から作ったものかも確かめる。GPU があれば、実機で計算した約 8,000 鍵が ed25519-dalek と一致し、探索で鍵が見つかるかも見る（`cargo test`）
 - SIMD の経路: CPU が対応していない命令セットのテストは飛ばす。環境変数 `MEIKEY_REQUIRE_SIMD`（例: `avx2,avx512,avx512-ifma`）に書いたものは飛ばさずに失敗させる。手元に無い命令セットは `cargo make sde` で確かめる
 - 正解には、本体とは別に仕様書（RFC 8032 / 8709 / 4251 / 4648、PROTOCOL.key / sshsig）から書いた独立実装（`tests/support/`）を使う
 

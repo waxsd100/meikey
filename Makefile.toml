@@ -7,11 +7,9 @@
 #   cargo make proptest-deep            # proptest の試行回数を100倍にして全テスト
 #   cargo make mutants                  # ミューテーションテスト
 #   cargo make sde                      # Intel SDE で、この PC に無い命令セット（AVX-512 など）の経路もテスト
-#   cargo make run wakokara --bench 10  # 速度と期待時間を測る
+#   cargo make run wakokara --bench 10  # 速度と期待時間を測る（--gpu で GPU、--both で GPU と CPU の両方）
 #   cargo make run wakokara -C wakokara -o ~/.ssh/id_ed25519_wakokara  # 鍵を探して書き出す
 #   cargo make build                    # 最適化ビルド（target/release/meikey）
-#   cargo make run-gpu wakokara --bench 10  # NVIDIA の GPU（CUDA）で測る・探す（引数は run と同じ）
-#   cargo make build-gpu                # GPU 対応の最適化ビルド
 #   cargo make ptx                      # GPU のカーネル（kernel.cu）を変えたら、埋め込む PTX を作り直す（NVRTC が要る）
 #   cargo make breakdown                # 1鍵あたりの計算時間を実装ごとに比べる
 #
@@ -24,7 +22,7 @@ skip_core_tasks = true
 alias = "ci"
 
 [tasks.ci]
-description = "整形の確認・clippy・全テスト（nextest は doctest を回さないので cargo test --doc も）。feature amx・cuda を有効にした clippy と、AMX・GPU・CLI のテストも"
+description = "整形の確認・clippy・全テスト（nextest は doctest を回さないので cargo test --doc も）。feature amx を有効にしたとき・cuda を外したときの clippy と、AMX・GPU・CLI のテストも"
 dependencies = ["install-nextest"]
 # 警告が1つでもあれば失敗させる（Cargo の build.warnings。-D warnings と違って rustc のフラグが
 # 変わらないので、普段のビルドのキャッシュをそのまま使える。テストのビルドの警告も対象）
@@ -34,8 +32,10 @@ script = '''
 exec --fail-on-error cargo fmt --all --check
 exec --fail-on-error cargo clippy --all-targets
 exec --fail-on-error cargo clippy --all-targets --all-features
+exec --fail-on-error cargo clippy --all-targets --no-default-features
 exec --fail-on-error cargo nextest run
 exec --fail-on-error cargo nextest run --all-features -E "test(/^service::(derive::amx|gpu)::/) | test(/^controller::/)"
+exec --fail-on-error cargo nextest run --no-default-features -E "test(/^controller::/)"
 exec --fail-on-error cargo test --doc
 '''
 
@@ -104,25 +104,13 @@ env = { RUSTFLAGS = "-C target-cpu=native" }
 command = "cargo"
 args = ["build", "--release"]
 
-[tasks.run-gpu]
-description = "GPU（CUDA）対応の最適化ビルドで、GPU で meikey を実行する（引数はそのまま meikey に渡る）"
-env = { RUSTFLAGS = "-C target-cpu=native" }
-command = "cargo"
-args = ["run", "--release", "--quiet", "--features", "cuda", "--", "--gpu", "${@}"]
-
-[tasks.build-gpu]
-description = "GPU（CUDA）対応の最適化ビルド（target/release/meikey）"
-env = { RUSTFLAGS = "-C target-cpu=native" }
-command = "cargo"
-args = ["build", "--release", "--features", "cuda"]
-
 # 埋め込む PTX の版は NVRTC の版で決まり、それより古いドライバでは読めないので、古い NVRTC（CUDA 12.0）で作る:
 #   pip install --target /tmp/nvrtc "nvidia-cuda-nvrtc-cu12==12.0.*"
 #   LD_LIBRARY_PATH=/tmp/nvrtc/nvidia/cuda_nvrtc/lib cargo make ptx
 [tasks.ptx]
 description = "GPU のカーネル（src/service/gpu/kernel.cu）から、埋め込む PTX（kernel.ptx）を作る"
 command = "cargo"
-args = ["run", "--quiet", "--features", "cuda", "--example", "gen_ptx"]
+args = ["run", "--quiet", "--example", "gen_ptx"]
 
 [tasks.breakdown]
 description = "1鍵あたりの計算時間を実装ごとに比べる"

@@ -2,7 +2,7 @@
 
 use crate::model::backend::Simd;
 use crate::model::key::{self, PUBLIC_B64_LEN, VanityKey};
-use crate::model::search::{Outcome, SearchConfig, Stats};
+use crate::model::search::{Cancel, Outcome, SearchConfig, Stats};
 use crate::service::derive::{BATCH, Deriver, PublicKeys, Seeds};
 use crate::service::matcher::Matcher;
 use rand::Rng;
@@ -65,6 +65,80 @@ impl Searcher for Parallel {
     }
 }
 
+/// 2つの [`Searcher`] で同時に探す（例: GPU と CPU）。どちらかが見つけたら（時間切れでも）もう片方も止め、
+/// 試行回数は合計する。表示する状態は1つ目、2つ目の順に並べる
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Both<A, B>(pub A, pub B);
+
+/// 内側の探索から試行回数を受け取る間隔（外への進捗はこれを合計して、外の設定の間隔で渡す）
+const INNER_PROGRESS: Duration = Duration::from_millis(100);
+
+impl<A: Searcher + Sync, B: Searcher + Sync> Searcher for Both<A, B> {
+    fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome {
+        // 内側の2つだけで共有する合図（外の合図は下のループで中継する）
+        let cancel = Cancel::default();
+        let inner = SearchConfig {
+            cancel: cancel.clone(),
+            progress_interval: INNER_PROGRESS,
+            ..config.clone()
+        };
+        let tries = [AtomicU64::new(0), AtomicU64::new(0)];
+        let start = Instant::now();
+        let stats = || Stats {
+            tries: tries.iter().map(|t| t.load(Relaxed)).sum(),
+            elapsed: start.elapsed(),
+        };
+
+        let (a, b) = thread::scope(|s| {
+            let a = s.spawn(|| side(&self.0, &inner, &tries[0]));
+            let b = s.spawn(|| side(&self.1, &inner, &tries[1]));
+            let mut next_report = start + config.progress_interval;
+            while !(a.is_finished() && b.is_finished()) {
+                thread::sleep(TICK);
+                if config.cancel.is_cancelled() {
+                    cancel.cancel();
+                }
+                if Instant::now() >= next_report {
+                    on_progress.report(stats());
+                    next_report += config.progress_interval;
+                }
+            }
+            // 片方がパニックしていたら、ここで呼び出し元に伝える
+            let join = |h: thread::ScopedJoinHandle<'_, Outcome>| {
+                h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
+            };
+            (join(a), join(b))
+        });
+
+        Outcome {
+            // 同時に当たったら1つ目を採用
+            key: a.key.or(b.key),
+            stats: Stats {
+                tries: a.stats.tries + b.stats.tries,
+                elapsed: start.elapsed(),
+            },
+        }
+    }
+
+    fn status(&self, config: &SearchConfig) -> Vec<(&'static str, String)> {
+        let mut rows = self.0.status(config);
+        rows.extend(self.1.status(config));
+        rows
+    }
+}
+
+/// [`Both`] の片方を走らせる。終わったら（見つけた・時間切れ・パニック）もう片方を止める
+fn side(searcher: &impl Searcher, config: &SearchConfig, tries: &AtomicU64) -> Outcome {
+    struct CancelOnDrop<'a>(&'a Cancel);
+    impl Drop for CancelOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let _guard = CancelOnDrop(&config.cancel);
+    searcher.run(config, &mut |s: Stats| tries.store(s.tries, Relaxed))
+}
+
 /// 探索を実行する。`on_progress` は呼び出し元スレッドで定期的に呼ばれる。
 pub fn run(config: &SearchConfig, mut on_progress: impl FnMut(Stats)) -> Outcome {
     // 表（最適化ビルドで数十ミリ秒、テスト用のビルドでは数百ミリ秒）は計測の前に作っておく。
@@ -87,9 +161,10 @@ pub fn run(config: &SearchConfig, mut on_progress: impl FnMut(Stats)) -> Outcome
         let mut next_report = start + config.progress_interval;
         while !stop.load(Relaxed) {
             thread::sleep(TICK);
-            if config
-                .time_limit
-                .is_some_and(|limit| start.elapsed() >= limit)
+            if config.cancel.is_cancelled()
+                || config
+                    .time_limit
+                    .is_some_and(|limit| start.elapsed() >= limit)
             {
                 stop.store(true, Relaxed);
             } else if Instant::now() >= next_report {
@@ -166,6 +241,7 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
 
 #[cfg(test)]
 mod tests {
+    use super::MockSearcher;
     use super::*;
     use crate::model::backend::Backend;
     use crate::model::pattern::{Find, Pattern};
@@ -346,5 +422,157 @@ mod tests {
             prop_assert!(cfg.pattern.unwrap().is_match(&recomputed));
             Ok(())
         });
+    }
+
+    /// 外から止める合図が来たら、時間制限が無くてもすぐ止まる（探索中でも、始まる前からでも）
+    #[rstest]
+    fn stops_when_cancelled(
+        #[values(Endless::NoPattern, Endless::Impossible, Endless::BenchWithHits)] endless: Endless,
+        #[values(0, 50)] after_ms: u64,
+    ) {
+        let cfg = SearchConfig {
+            threads: 2,
+            ..endless.config()
+        };
+        let cancel = cfg.cancel.clone();
+        let started = Instant::now();
+        let out = thread::scope(|s| {
+            s.spawn(|| {
+                thread::sleep(Duration::from_millis(after_ms));
+                cancel.cancel();
+            });
+            run(&cfg, |_| {})
+        });
+
+        assert!(out.key.is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(after_ms) + Duration::from_secs(2),
+            "止まるのが遅い: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 決まった結果をすぐ返す [`Searcher`]（[`Both`] の片方用）。止める合図を受け取ったかも記録する
+    fn instant(key: bool, tries: u64) -> MockSearcher {
+        let mut m = MockSearcher::new();
+        m.expect_run().returning(move |_, _| Outcome {
+            key: key.then(|| VanityKey::from_seed([7; 32])),
+            stats: Stats {
+                tries,
+                elapsed: Duration::ZERO,
+            },
+        });
+        m.expect_status()
+            .returning(|_| vec![("GPU", "テスト".into())]);
+        m
+    }
+
+    /// 片方が見つけたら、もう片方（時間制限の無い CPU の探索）もすぐ止まり、見つけた鍵と合計の試行回数を返す。
+    /// どちらが見つけても同じ
+    #[rstest]
+    fn both_stops_other_when_one_finds(#[values(false, true)] finder_first: bool) {
+        let cfg = SearchConfig {
+            threads: 1,
+            ..Endless::Impossible.config()
+        };
+        let started = Instant::now();
+        let out = if finder_first {
+            Both(instant(true, 5), Parallel).run(&cfg, &mut |_: Stats| {})
+        } else {
+            Both(Parallel, instant(true, 5)).run(&cfg, &mut |_: Stats| {})
+        };
+
+        assert_eq!(out.key.map(|k| *k.seed()), Some([7; 32]));
+        assert!(out.stats.tries >= 5, "{:?}", out.stats);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "止まるのが遅い: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 両方とも本物の CPU の探索でも見つかり、見つかった鍵は一致している
+    #[rstest]
+    fn both_finds_matching_key(#[values("a", "Wa")] pattern: &str) {
+        let cfg = SearchConfig {
+            threads: 1,
+            time_limit: Some(Duration::from_secs(10)),
+            ..SearchConfig::new(Some(Pattern::new(pattern, false).unwrap()))
+        };
+        let out = Both(Parallel, Parallel).run(&cfg, &mut |_: Stats| {});
+
+        let key = out.key.expect("短い文字列ならすぐ見つかる");
+        assert!(cfg.pattern.unwrap().is_match(&key.public_b64()));
+    }
+
+    /// 時間切れまで回すときは両方の試行回数を合計して進捗を渡し、外の合図でも止まる
+    #[rstest]
+    #[case::time_limit(Some(300), None)]
+    #[case::cancelled(None, Some(300))]
+    fn both_reports_total_progress(#[case] limit_ms: Option<u64>, #[case] cancel_ms: Option<u64>) {
+        let cfg = SearchConfig {
+            threads: 1,
+            time_limit: limit_ms.map(Duration::from_millis),
+            progress_interval: Duration::from_millis(100),
+            ..SearchConfig::new(None)
+        };
+        let cancel = cfg.cancel.clone();
+        let started = Instant::now();
+        let mut reported = Vec::new();
+        let out = thread::scope(|s| {
+            if let Some(ms) = cancel_ms {
+                s.spawn(move || {
+                    thread::sleep(Duration::from_millis(ms));
+                    cancel.cancel();
+                });
+            }
+            Both(Parallel, Parallel).run(&cfg, &mut |st: Stats| reported.push(st))
+        });
+
+        assert!(out.key.is_none());
+        assert!(started.elapsed() < Duration::from_secs(3), "止まるのが遅い");
+        assert!(!reported.is_empty(), "進捗が届いていない");
+        assert!(
+            reported.windows(2).all(|w| w[0].tries <= w[1].tries),
+            "試行回数が減った: {reported:?}"
+        );
+        assert!(reported.iter().all(|s| s.tries <= out.stats.tries));
+    }
+
+    /// 片方がパニックしたら、もう片方（時間制限の無い探索）も止まり、パニックが呼び出し元に伝わる
+    #[rstest]
+    fn both_propagates_panic() {
+        let mut broken = MockSearcher::new();
+        broken
+            .expect_run()
+            .returning(|_, _| panic!("わざとパニック"));
+        let cfg = SearchConfig {
+            threads: 1,
+            ..Endless::Impossible.config()
+        };
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Both(Parallel, broken).run(&cfg, &mut |_: Stats| {})
+        }));
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2), "止まるのが遅い");
+    }
+
+    /// 状態の行は1つ目、2つ目の順に並ぶ
+    #[rstest]
+    fn both_status_lists_first_then_second() {
+        let cfg = SearchConfig::new(None);
+        let rows = Both(instant(false, 0), Parallel).status(&cfg);
+        let labels: Vec<_> = rows.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels[0], "GPU");
+        assert_eq!(
+            &labels[1..],
+            Parallel
+                .status(&cfg)
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<_>>()
+        );
     }
 }

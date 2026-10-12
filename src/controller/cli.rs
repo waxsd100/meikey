@@ -79,10 +79,26 @@ struct Cli {
     #[arg(long)]
     no_memmem: bool,
 
-    /// GPU（CUDA）で探す。--threads・--constant-time・--no-batch・--simd・--no-memmem は使わない
+    /// CPU ではなく GPU（CUDA）で探す。--threads・--constant-time・--no-batch・--simd・--no-memmem は
+    /// CPU 用なので使わない
+    #[cfg(feature = "cuda")]
+    #[arg(long, conflicts_with = "both")]
+    gpu: bool,
+
+    /// GPU と CPU の両方で同時に探す（CPU のスレッド数の既定は 全コア − 1。1 本は GPU の操作に使う）
     #[cfg(feature = "cuda")]
     #[arg(long)]
-    gpu: bool,
+    both: bool,
+}
+
+/// 探すのに使うもの（既定は CPU、--gpu で GPU、--both で両方）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Device {
+    Cpu,
+    #[cfg(feature = "cuda")]
+    Gpu,
+    #[cfg(feature = "cuda")]
+    Both,
 }
 
 /// `--simd` の値
@@ -122,14 +138,29 @@ pub fn main() -> ExitCode {
     }
 }
 
-/// 探す手段（CPU か GPU）を決めて実行する
+/// 探すのに使うもの（CPU・GPU・両方）を決めて実行する
 fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(feature = "cuda")]
-    if cli.gpu {
-        let gpu = crate::service::gpu::Gpu::new(0)?;
-        return run(cli, &gpu, &KeyFiles);
+    match device(cli) {
+        Device::Cpu => run(cli, &Parallel, &KeyFiles),
+        #[cfg(feature = "cuda")]
+        Device::Gpu => run(cli, &crate::service::gpu::Gpu::new(0)?, &KeyFiles),
+        #[cfg(feature = "cuda")]
+        Device::Both => {
+            let gpu = crate::service::gpu::Gpu::new(0)?;
+            run(cli, &crate::service::search::Both(gpu, Parallel), &KeyFiles)
+        }
     }
-    run(cli, &Parallel, &KeyFiles)
+}
+
+fn device(cli: &Cli) -> Device {
+    #[cfg(feature = "cuda")]
+    if cli.both {
+        return Device::Both;
+    } else if cli.gpu {
+        return Device::Gpu;
+    }
+    let _ = cli;
+    Device::Cpu
 }
 
 fn run(
@@ -140,6 +171,10 @@ fn run(
     let mut config = SearchConfig::new(None);
     if let Some(n) = cli.threads {
         config.threads = n.into();
+    } else if device(cli) != Device::Cpu {
+        // GPU と両方で探すときは、GPU を操作するスレッドの分を空ける
+        // （GPU だけのときは CPU で探さないので、この値は使わない）
+        config.threads = config.threads.saturating_sub(1).max(1);
     }
     if cli.constant_time {
         config.backend.mul = Mul::ConstantTime;
@@ -577,14 +612,47 @@ mod tests {
         assert!(parsed.is_err());
     }
 
-    /// --gpu は feature cuda が有効なときだけ受け付ける
+    /// 既定は CPU、--gpu で GPU、--both で両方。--gpu と --both は一緒に付けられない
+    #[cfg(feature = "cuda")]
     #[rstest]
-    fn gpu_flag_needs_feature() {
-        let parsed = Cli::try_parse_from(["meikey", "abc", "--gpu"]);
-        #[cfg(feature = "cuda")]
-        assert!(parsed.unwrap().gpu);
-        #[cfg(not(feature = "cuda"))]
-        assert!(parsed.is_err());
+    #[case::default(&[], Some(Device::Cpu))]
+    #[case::gpu(&["--gpu"], Some(Device::Gpu))]
+    #[case::both(&["--both"], Some(Device::Both))]
+    #[case::conflict(&["--gpu", "--both"], None)]
+    fn device_from_flags(#[case] options: &[&str], #[case] want: Option<Device>) {
+        let parsed = Cli::try_parse_from(["meikey", "abc"].iter().chain(options));
+        assert_eq!(parsed.ok().map(|c| device(&c)), want);
+    }
+
+    /// --gpu・--both は feature cuda が無ければ受け付けない
+    #[cfg(not(feature = "cuda"))]
+    #[rstest]
+    fn gpu_flags_need_feature(#[values("--gpu", "--both")] flag: &str) {
+        assert!(Cli::try_parse_from(["meikey", "abc", flag]).is_err());
+    }
+
+    /// CPU のスレッド数: -j が無ければ、CPU だけなら全コア、GPU と両方なら 全コア − 1（最低 1）。-j があればそのまま
+    #[rstest]
+    #[case::cpu(&[], |all| all)]
+    #[case::cpu_explicit(&["-j", "3"], |_| 3)]
+    #[cfg_attr(feature = "cuda", case::both(&["--both"], |all: usize| all.saturating_sub(1).max(1)))]
+    #[cfg_attr(feature = "cuda", case::both_explicit(&["--both", "-j", "3"], |_| 3))]
+    fn cpu_threads(#[case] options: &[&str], #[case] want: fn(usize) -> usize) {
+        let want = want(SearchConfig::new(None).threads);
+        let mut args = vec!["abc", "--bench", "1"];
+        args.extend(options);
+        let repo = MockKeyRepository::new();
+        let mut searcher = mock_searcher();
+        searcher
+            .expect_run()
+            .withf(move |c, _| c.threads == want)
+            .times(1)
+            .returning(|_, _| Outcome {
+                key: None,
+                stats: stats(10, 5),
+            });
+
+        run(&parse(&args), &searcher, &repo).unwrap();
     }
 
     /// 各オプションが探索の設定（[`SearchConfig`]）にそのまま届く

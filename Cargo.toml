@@ -10,10 +10,11 @@ keywords = ["ssh", "ed25519", "vanity", "keygen"]
 categories = ["command-line-utilities", "cryptography"]
 
 [features]
+default = ["cuda"]
 # 体の乗算を AMX のタイル演算でする実験的な経路（--simd amx）。IFMA より遅いので既定では無効
 amx = []
-# GPU（CUDA）で探す（--gpu）。CUDA のライブラリは実行時に読み込むので、ビルドに CUDA は要らない
-# （テスト用にカーネルを C++ としてコンパイルするので、C++ コンパイラは要る）
+# GPU（CUDA）で探す（--gpu・--both）。既定で有効。CUDA のライブラリは実行時に読み込むので、ビルドに CUDA は要らない
+# （テスト用にカーネルを C++ としてもコンパイルする。C++ コンパイラが無ければそのテストだけ外れる）
 cuda = ["dep:cudarc", "dep:cc"]
 
 [dependencies]
