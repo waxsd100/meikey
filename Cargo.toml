@@ -43,6 +43,10 @@ tempfile = "3.27.0"
 [lints.clippy]
 mod_module_files = "warn"
 
+[[example]]
+name = "gen_ptx"
+required-features = ["cuda"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

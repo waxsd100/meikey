@@ -2,13 +2,17 @@
 //!
 //! シードの生成から文字列の判定までを GPU のカーネル（`gpu/kernel.cu`）で行い、CPU は起動と結果の確認だけをする。
 //!
-//! - カーネルは実行時に NVRTC で、その GPU の世代（compute capability）向けにコンパイルする。
-//!   CUDA のライブラリ（libcuda・libnvrtc）も実行時に読み込むので、ビルドに CUDA は要らない
+//! - カーネルは compute_75（Turing）向けの PTX（`gpu/kernel.ptx`）を埋め込んでおき、起動時にドライバが
+//!   その GPU 向けに変換する（変換結果はドライバがキャッシュするので2回目からは速い）。要るのは NVIDIA の
+//!   ドライバ（libcuda / nvcuda.dll）だけで、CUDA Toolkit は要らない。ドライバが古くて PTX を読めないときだけ、
+//!   NVRTC（libnvrtc）があればその GPU 向けにコンパイルし直す。PTX は `cargo make ptx` で kernel.cu から作る
+//! - CUDA のライブラリは実行時に読み込むので、ビルドに CUDA は要らない
 //! - シードは `ChaCha20(鍵 = 起動ごとの乱数, ブロック番号 = 鍵の通し番号)` の先頭 32 バイト。
 //!   当たりは通し番号だけを受け取り、CPU で同じシードを作り直して ed25519-dalek で計算し、
 //!   文字列が本当に含まれるかを確かめてから返す（CPU 版と同じく、GPU の計算にバグがあっても誤った鍵は返さない）
 //! - 櫛形テーブル（`comb::Table`、W = 12）は CPU で作って 25.5 ビット × 10 リムにして GPU に送る
-//! - 1回の起動（カーネル）が `TARGET_LAUNCH`（0.2 秒）前後で終わるように、1スレッドの繰り返し回数を測りながら調整する
+//! - 1回の起動（カーネル）が `TARGET_LAUNCH`（0.2 秒）前後で終わるように、1スレッドの繰り返し回数を測りながら調整する。
+//!   画面をつないだ GPU（Windows のタイムアウト検出の対象）では、画面が固まらないよう `DISPLAY_LAUNCH`（0.05 秒）にする
 
 use crate::model::key::VanityKey;
 use crate::model::search::{Outcome, SearchConfig, Stats};
@@ -30,6 +34,13 @@ use std::time::{Duration, Instant};
 /// カーネルのソース
 const KERNEL: &str = include_str!("gpu/kernel.cu");
 
+/// kernel.cu を compute_75 向けにコンパイルした PTX（`cargo make ptx` で作る）。1行目に kernel.cu の
+/// ハッシュ（[`kernel_hash`]）を書いておき、ソースと食い違っていないかをテストで確かめる
+const PTX: &str = include_str!("gpu/kernel.ptx");
+
+/// 埋め込む PTX の世代。これより新しい GPU でもドライバが変換して動かせる（Turing 〜 Blackwell）
+pub const PTX_ARCH: &str = "compute_75";
+
 /// 1スレッドが1回にまとめて計算する鍵の数（逆元をまとめる数）
 const BATCH: u64 = 8;
 
@@ -38,6 +49,10 @@ const BLOCK: u32 = 128;
 
 /// 1回の起動にかける時間の目安（長いほど起動の手間は減るが、当たりや時間切れに気づくのが遅れる）
 const TARGET_LAUNCH: Duration = Duration::from_millis(200);
+
+/// 画面をつないだ GPU での目安。Windows は GPU が約 2 秒応答しないとドライバをリセットし、
+/// 起動が長いと画面もその間固まるので短くする
+const DISPLAY_LAUNCH: Duration = Duration::from_millis(50);
 
 /// 表の1エントリの語数（y+x, y-x, 2dxy の 10 リムずつと未使用の 2 語。kernel.cu の ENTRY_WORDS）
 const ENTRY_WORDS: usize = 32;
@@ -97,27 +112,17 @@ pub struct Gpu {
     info: GpuInfo,
     /// 起動するブロック数
     grid: u32,
+    /// 1回の起動にかける時間の目安
+    target: Duration,
 }
 
 impl Gpu {
     /// `ordinal` 番目の GPU を使えるようにする（カーネルのコンパイルと表の転送をする）
     pub fn new(ordinal: usize) -> Result<Gpu, GpuError> {
         // SAFETY: ライブラリを読み込めるか試すだけ
-        let (cuda, nvrtc) = unsafe {
-            (
-                cudarc::driver::sys::is_culib_present(),
-                cudarc::nvrtc::sys::is_culib_present(),
-            )
-        };
-        if !cuda {
+        if !unsafe { cudarc::driver::sys::is_culib_present() } {
             return Err(GpuError(
-                "libcuda が見つからない（NVIDIA の GPU とドライバが必要）".into(),
-            ));
-        }
-        if !nvrtc {
-            return Err(GpuError(
-                "libnvrtc が見つからない（LD_LIBRARY_PATH に libnvrtc.so のディレクトリを追加。\
-                 例: /usr/local/cuda/lib64）"
+                "CUDA のドライバが見つからない（NVIDIA の GPU とドライバが必要。libcuda / nvcuda.dll）"
                     .into(),
             ));
         }
@@ -129,9 +134,26 @@ impl Gpu {
                 as u32,
             memory: ctx.total_mem()?,
         };
-        let ptx = compile(info.compute)?;
-        let module = ctx.load_module(ptx)?;
+        let module = match ctx.load_module(cudarc::nvrtc::Ptx::from_src(PTX)) {
+            Ok(m) => m,
+            // ドライバが古くて埋め込んだ PTX を読めない: NVRTC があればこの GPU 向けにコンパイルし直す
+            Err(embedded) => {
+                // SAFETY: ライブラリを読み込めるか試すだけ
+                if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+                    return Err(GpuError(format!(
+                        "PTX を読めない（{embedded}。ドライバを更新するか、NVRTC を入れて LD_LIBRARY_PATH / PATH に追加）"
+                    )));
+                }
+                ctx.load_module(compile(info.compute)?)?
+            }
+        };
         let func = module.load_function("meikey_search")?;
+        // 画面をつないだ GPU（カーネルの実行時間に制限がある）なら起動を短くする
+        let target =
+            match ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT) {
+                Ok(1) => DISPLAY_LAUNCH,
+                _ => TARGET_LAUNCH,
+            };
         // SM あたりに同時に載るブロック数（レジスタの使用量で決まる）の分だけ起動する
         let per_sm = func
             .occupancy_max_active_blocks_per_multiprocessor(BLOCK, 0, None)
@@ -148,6 +170,7 @@ impl Gpu {
             table,
             info,
             grid,
+            target,
         })
     }
 
@@ -241,8 +264,8 @@ impl Gpu {
                 on_progress.report(stats);
                 next_report += config.progress_interval;
             }
-            // 1回の起動が TARGET_LAUNCH 前後になるよう、繰り返し回数を調整する（急に増やしすぎない）
-            let scale = TARGET_LAUNCH.as_secs_f64() / took.as_secs_f64().max(1e-6);
+            // 1回の起動が self.target 前後になるよう、繰り返し回数を調整する（急に増やしすぎない）
+            let scale = self.target.as_secs_f64() / took.as_secs_f64().max(1e-6);
             iters = ((f64::from(iters) * scale.clamp(0.5, 4.0)) as u32).clamp(1, 1 << 16);
         }
     }
@@ -297,16 +320,8 @@ fn seed(key: &[u8; 32], index: u64) -> [u8; 32] {
 fn compile(compute: (i32, i32)) -> Result<cudarc::nvrtc::Ptx, GpuError> {
     let exact = format!("sm_{}{}", compute.0, compute.1);
     let mut errors = Vec::new();
-    for arch in [exact.as_str(), "compute_90", "compute_80", "compute_75"] {
-        let opts = CompileOptions {
-            options: vec![
-                format!("--gpu-architecture={arch}"),
-                format!("-DMEIKEY_W={W}"),
-                format!("-DMEIKEY_BATCH={BATCH}"),
-            ],
-            ..Default::default()
-        };
-        match compile_ptx_with_opts(KERNEL, opts) {
+    for arch in [exact.as_str(), "compute_90", "compute_80", PTX_ARCH] {
+        match compile_for(arch) {
             Ok(ptx) => return Ok(ptx),
             Err(e) => errors.push(format!("{arch}: {}", compile_error(&e))),
         }
@@ -315,6 +330,45 @@ fn compile(compute: (i32, i32)) -> Result<cudarc::nvrtc::Ptx, GpuError> {
         "カーネルのコンパイルに失敗:\n{}",
         errors.join("\n")
     )))
+}
+
+/// NVRTC でカーネルを `arch`（sm_86・compute_75 など）向けの PTX にする
+fn compile_for(arch: &str) -> Result<cudarc::nvrtc::Ptx, CompileError> {
+    compile_ptx_with_opts(
+        KERNEL,
+        CompileOptions {
+            options: vec![
+                format!("--gpu-architecture={arch}"),
+                format!("-DMEIKEY_W={W}"),
+                format!("-DMEIKEY_BATCH={BATCH}"),
+            ],
+            ..Default::default()
+        },
+    )
+}
+
+/// kernel.cu（改行は LF にそろえる）とコンパイルの設定のハッシュ（埋め込む PTX の1行目に書く）
+pub fn kernel_hash() -> String {
+    use sha2::{Digest, Sha256};
+    let source = KERNEL.replace('\r', "");
+    let digest = Sha256::digest(format!("{source}\n// {PTX_ARCH} W={W} BATCH={BATCH}"));
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 埋め込む PTX（kernel.ptx の中身）を NVRTC で作る（`cargo make ptx`）。互換性のため、なるべく古い NVRTC で作る
+/// （PTX の版はコンパイルした NVRTC の版で決まり、それより古いドライバでは読めない）
+pub fn portable_ptx() -> Result<String, GpuError> {
+    // SAFETY: ライブラリを読み込めるか試すだけ
+    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+        return Err(GpuError("libnvrtc が見つからない".into()));
+    }
+    let ptx = compile_for(PTX_ARCH).map_err(|e| GpuError(compile_error(&e)))?;
+    Ok(format!(
+        // PTX は ASCII だけ（ptxas は ASCII 以外の文字を受け付けない）
+        "// meikey: sha256(kernel.cu) = {} (regenerate: cargo make ptx)\n{}",
+        kernel_hash(),
+        ptx.to_src()
+    ))
 }
 
 fn compile_error(e: &CompileError) -> String {
@@ -349,13 +403,19 @@ mod tests {
     //! kernel.cu を CPU 向けにコンパイルしたもの（build.rs）を呼んで、Rust の実装と突き合わせる
     use super::*;
     use crate::model::pattern::Pattern;
+    #[cfg(meikey_gpu_host)]
     use crate::property::check;
+    #[cfg(meikey_gpu_host)]
     use crate::service::derive::field::Fe;
+    #[cfg(meikey_gpu_host)]
     use proptest::prelude::*;
     use rstest::rstest;
+    #[cfg(meikey_gpu_host)]
     use sha2::{Digest, Sha512};
+    #[cfg(meikey_gpu_host)]
     use std::sync::LazyLock;
 
+    #[cfg(meikey_gpu_host)]
     unsafe extern "C" {
         fn meikey_test_seed(key: *const u32, counter: u64, out: *mut u8);
         fn meikey_test_secret(seed: *const u8, out: *mut u8);
@@ -380,12 +440,14 @@ mod tests {
         fn meikey_test_batch() -> u32;
     }
 
+    #[cfg(meikey_gpu_host)]
     static TABLE: LazyLock<Vec<u32>> = LazyLock::new(table_words);
 
     fn key_words(key: &[u8; 32]) -> [u32; 8] {
         std::array::from_fn(|i| u32::from_le_bytes(*key[4 * i..].first_chunk().unwrap()))
     }
 
+    #[cfg(meikey_gpu_host)]
     fn to_limbs(fe: Fe) -> [u32; 10] {
         let mut out = [0u32; 10];
         for (i, l) in fe.reduce().into_iter().enumerate() {
@@ -395,12 +457,14 @@ mod tests {
         out
     }
 
+    #[cfg(meikey_gpu_host)]
     fn fe(bytes: [u8; 32]) -> Fe {
         let mut b = bytes;
         b[31] &= 0x7f;
         Fe::from_bytes(&b)
     }
 
+    #[cfg(meikey_gpu_host)]
     #[rstest]
     fn batch_matches_kernel() {
         // SAFETY: 引数なしの関数
@@ -408,6 +472,7 @@ mod tests {
     }
 
     /// シードは rand の ChaCha20Rng（ストリーム 0）のブロック `index` の先頭 32 バイト
+    #[cfg(meikey_gpu_host)]
     #[rstest]
     fn seed_matches_chacha20_rng() {
         check(256, (any::<[u8; 32]>(), any::<u64>()), |(key, index)| {
@@ -420,6 +485,7 @@ mod tests {
     }
 
     /// 秘密スカラーは clamp(SHA-512(seed)[..32])（sha2 と curve25519-dalek）
+    #[cfg(meikey_gpu_host)]
     #[rstest]
     fn secret_scalar_matches_sha2() {
         check(256, any::<[u8; 32]>(), |s| {
@@ -434,6 +500,7 @@ mod tests {
     }
 
     /// 桁の分解は comb.rs と同じ
+    #[cfg(meikey_gpu_host)]
     #[rstest]
     fn digits_match_comb() {
         check(256, any::<[u8; 32]>(), |mut s| {
@@ -447,6 +514,7 @@ mod tests {
     }
 
     /// 体の乗算・逆元は field.rs と同じ値
+    #[cfg(meikey_gpu_host)]
     #[rstest]
     fn field_matches_fe() {
         check(256, (any::<[u8; 32]>(), any::<[u8; 32]>()), |(a, b)| {
@@ -475,6 +543,7 @@ mod tests {
     }
 
     /// まとめて計算した公開鍵は、同じシードから ed25519-dalek で作った鍵と一致する
+    #[cfg(meikey_gpu_host)]
     #[rstest]
     fn derive_batch_matches_dalek() {
         check(16, (any::<[u8; 32]>(), any::<u64>()), |(key, first)| {
@@ -498,6 +567,7 @@ mod tests {
     }
 
     /// base64 は model::key と同じで、判定は Pattern と同じ（大小文字の区別あり・なし）
+    #[cfg(meikey_gpu_host)]
     #[rstest]
     fn b64_and_match_agree_with_pattern(#[values(false, true)] case_sensitive: bool) {
         let needle = "[A-Za-z0-9+/]{1,3}";
@@ -527,6 +597,17 @@ mod tests {
             prop_assert_eq!(got, p.is_match(&key.public_b64()));
             Ok(())
         });
+    }
+
+    /// 埋め込んだ PTX は今の kernel.cu から作ったもの（違えば `cargo make ptx` で作り直す）
+    #[rstest]
+    fn embedded_ptx_matches_kernel_source() {
+        let first = PTX.lines().next().unwrap_or_default();
+        assert!(
+            first.contains(&kernel_hash()),
+            "kernel.ptx が kernel.cu と食い違っている（cargo make ptx で作り直す）: {first}"
+        );
+        assert!(PTX.contains(".target sm_75") && PTX.contains(".entry meikey_search"));
     }
 
     // ---- NVRTC・GPU があるときだけ（無ければ飛ばす。MEIKEY_REQUIRE_SIMD に nvrtc・cuda があれば失敗させる） ----
@@ -616,6 +697,7 @@ mod tests {
 
     /// カーネル全体（CPU で真似たもの）: 見つけた通し番号のシードの鍵は文字列を含み、
     /// それより前の番号の鍵は含まない（1スレッドなら最初の当たりを返す）。stop_on_hit なら途中で止まる
+    #[cfg(meikey_gpu_host)]
     #[rstest]
     fn search_finds_first_hit() {
         let key: [u8; 32] = std::array::from_fn(|i| i as u8 * 7);
