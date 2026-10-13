@@ -8,7 +8,7 @@ use crate::lang::{Lang, current, t, tf};
 use crate::model::backend::{Compress, Mul, Simd};
 use crate::model::key::check_comment;
 use crate::model::pattern::{Find, Pattern};
-use crate::model::search::{SearchConfig, Stats};
+use crate::model::search::{SearchConfig, SeedSource, Stats};
 use crate::repository::key_file::{KeyFiles, KeyRepository, pub_path};
 use crate::service::search::{Parallel, Searcher};
 use clap::Parser;
@@ -56,7 +56,7 @@ struct Cli {
     bench: Option<Duration>,
 
     #[arg(long)]
-    constant_time: bool,
+    low_security: bool,
 
     #[arg(long)]
     no_batch: bool,
@@ -67,12 +67,13 @@ struct Cli {
     #[arg(long)]
     no_memmem: bool,
 
+    // GPU の計算は定数時間でないので、低セキュリティモードのときだけ使える
     #[cfg(feature = "cuda")]
-    #[arg(long, conflicts_with_all = ["both", "constant_time"])]
+    #[arg(long, conflicts_with = "both", requires = "low_security")]
     gpu: bool,
 
     #[cfg(feature = "cuda")]
-    #[arg(long, conflicts_with = "constant_time")]
+    #[arg(long, requires = "low_security")]
     both: bool,
 
     #[cfg(feature = "cuda")]
@@ -150,22 +151,27 @@ const HELP: &[(&str, &str, &str)] = &[
         "Measure the speed for this many seconds instead of searching (fractions such as 0.5 are allowed)",
     ),
     (
-        "constant_time",
-        "基点倍算に定数時間の実装（curve25519-dalek）を使う（高速化前の倍算）。数倍遅いが、\
-         同じマシン上の他プロセスからキャッシュのタイミングで秘密鍵を推測される余地をなくす。\
-         CPU だけで使える（GPU の計算は定数時間ではないので、--gpu・--both とは一緒に付けられない）",
-        "Use a constant-time implementation (curve25519-dalek) for base-point multiplication \
-         (the multiplication before the speedups). Several times slower, but leaves no room for other \
-         processes on the same machine to infer the private key from cache timing. CPU only \
-         (the GPU computation is not constant-time, so it cannot be combined with --gpu or --both)",
+        "low_security",
+        "低セキュリティモード: 速さを優先する。基点倍算を定数時間でない表の倍算にし（数倍速いが、同じマシン上の\
+         他プロセスからキャッシュのタイミングで秘密鍵を推測される余地がある）、シードは鍵ごとの ChaCha20 ではなく、\
+         OS の乱数（スレッドごとに1回）に通し番号を足したものにする。--gpu・--both はこのモードでだけ使える\
+         （GPU の計算は定数時間でない）。付けなければ、倍算は定数時間の実装（curve25519-dalek）",
+        "Low-security mode: prioritize speed. Use the table-based base-point multiplication, which is \
+         not constant-time (several times faster, but leaves room for other processes on the same \
+         machine to infer the private key from cache timing), and make seeds by adding a counter to \
+         OS randomness (once per thread) instead of ChaCha20 for each key. --gpu and --both work only \
+         in this mode (the GPU computation is not constant-time). Without it, the multiplication \
+         uses the constant-time implementation (curve25519-dalek)",
     ),
     (
         "no_batch",
         "逆元を 256 鍵ごとに 1 回ではなく、1 鍵ごとに計算する（高速化前の圧縮。比較用）。\
-         --constant-time・--simd off・--no-memmem と全部付けると、ed25519-dalek で1鍵ずつ計算する高速化前と同じになる",
+         --simd off・--no-memmem と全部付けると（--low-security なし）、ed25519-dalek で1鍵ずつ計算する高速化前と\
+         同じになる",
         "Compute the inverse for every key instead of once per 256 keys (the compression before \
-         the speedups; for comparison). With --constant-time, --simd off and --no-memmem as well, \
-         keys are computed one at a time with ed25519-dalek, the same as before the speedups",
+         the speedups; for comparison). With --simd off and --no-memmem as well (without \
+         --low-security), keys are computed one at a time with ed25519-dalek, the same as before \
+         the speedups",
     ),
     (
         "simd",
@@ -187,16 +193,17 @@ const HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "gpu",
-        "CPU ではなく GPU（CUDA）で探す。--threads・--constant-time・--no-batch・--simd・--no-memmem は \
-         CPU 用なので使わない",
-        "Search on the GPU (CUDA) instead of the CPU. --threads, --constant-time, --no-batch, \
-         --simd and --no-memmem are for the CPU and are not used",
+        "CPU ではなく GPU（CUDA）で探す（--low-security と一緒に付ける）。--threads・--no-batch・--simd・\
+         --no-memmem は CPU 用なので使わない",
+        "Search on the GPU (CUDA) instead of the CPU (use with --low-security). --threads, \
+         --no-batch, --simd and --no-memmem are for the CPU and are not used",
     ),
     (
         "both",
-        "GPU と CPU の両方で同時に探す（CPU のスレッド数の既定は 全コア − 1。1 本は GPU の操作に使う）",
-        "Search on the GPU and the CPU at the same time (the default number of CPU threads is \
-         all cores − 1; one drives the GPU)",
+        "GPU と CPU の両方で同時に探す（--low-security と一緒に付ける。CPU のスレッド数の既定は 全コア − 1。\
+         1 本は GPU の操作に使う）",
+        "Search on the GPU and the CPU at the same time (use with --low-security; the default \
+         number of CPU threads is all cores − 1; one drives the GPU)",
     ),
     (
         "gpu_width",
@@ -507,8 +514,10 @@ fn run(cli: &Cli, searcher: &impl Searcher, repo: &impl KeyRepository) -> Result
         // （GPU だけのときは CPU で探さないので、この値は使わない）
         config.threads = config.threads.saturating_sub(1).max(1);
     }
-    if cli.constant_time {
-        config.backend.mul = Mul::ConstantTime;
+    // 既定は定数時間の倍算と ChaCha20 のシード。低セキュリティモードでは表の倍算と通し番号のシード
+    match cli.low_security {
+        true => config.seeds = SeedSource::Counter,
+        false => config.backend.mul = Mul::ConstantTime,
     }
     if cli.no_batch {
         config.backend.compress = Compress::Each;
@@ -519,7 +528,9 @@ fn run(cli: &Cli, searcher: &impl Searcher, repo: &impl KeyRepository) -> Result
     }
 
     if cli.check {
-        print_rows(&searcher.status(&config));
+        let mut rows = searcher.status(&config);
+        rows.push(seed_row(&config));
+        print_rows(&rows);
         return Ok(());
     }
 
@@ -529,6 +540,7 @@ fn run(cli: &Cli, searcher: &impl Searcher, repo: &impl KeyRepository) -> Result
     config.pattern = Some(pattern.clone());
 
     let mut rows = searcher.status(&config);
+    rows.push(seed_row(&config));
     rows.extend([
         (
             t!("文字列", "Text"),
@@ -565,6 +577,18 @@ fn parse_secs(s: &str) -> Result<Duration, ValueError> {
         .ok()
         .filter(|d| !d.is_zero())
         .ok_or(ValueError::NotPositive)
+}
+
+/// 状態の表示の「シード」の行（低セキュリティモードかどうかも分かるように）
+fn seed_row(config: &SearchConfig) -> (&'static str, String) {
+    let how = match config.seeds {
+        SeedSource::ChaCha20 => t!("鍵ごとに ChaCha20", "ChaCha20 for each key"),
+        SeedSource::Counter => t!(
+            "乱数 + 通し番号（低セキュリティモード）",
+            "random + counter (low-security mode)"
+        ),
+    };
+    (t!("シード", "Seeds"), how.to_string())
 }
 
 /// 「約 …」（期待試行・期待時間・残り時間）
@@ -1131,7 +1155,7 @@ mod tests {
     #[case::both(&["--both"], Some(Device::Both))]
     #[case::conflict(&["--gpu", "--both"], None)]
     fn device_from_flags(#[case] options: &[&str], #[case] want: Option<Device>) {
-        let parsed = Cli::try_parse_from(["meikey", "abc"].iter().chain(options));
+        let parsed = Cli::try_parse_from(["meikey", "abc", "--low-security"].iter().chain(options));
         assert_eq!(parsed.ok().map(|c| device(&c)), want);
     }
 
@@ -1153,24 +1177,31 @@ mod tests {
     #[case::batch_zero(&["--gpu-batch", "0"], None)]
     #[case::batch_too_large(&["--gpu-batch", "65"], None)]
     fn gpu_options_from_flags(#[case] options: &[&str], #[case] want: Option<GpuSetting>) {
-        let parsed = Cli::try_parse_from(["meikey", "abc", "--gpu"].iter().chain(options));
+        let parsed = Cli::try_parse_from(
+            ["meikey", "abc", "--gpu", "--low-security"]
+                .iter()
+                .chain(options),
+        );
         assert_eq!(parsed.ok().map(|c| gpu_options(&c)), want);
     }
 
-    /// --constant-time は GPU では使えない（GPU の計算は定数時間でない）。--gpu-width・--gpu-batch は
-    /// GPU で探すときだけ付けられる
+    /// --gpu・--both は低セキュリティモードでだけ使える（GPU の計算は定数時間でない）。
+    /// --gpu-width・--gpu-batch・--gpu-limbs は GPU で探すときだけ付けられる
     #[cfg(feature = "cuda")]
     #[rstest]
-    #[case::constant_time_gpu(&["--constant-time", "--gpu"], false)]
-    #[case::constant_time_both(&["--constant-time", "--both"], false)]
-    #[case::constant_time_cpu(&["--constant-time"], true)]
-    #[case::width_without_gpu(&["--gpu-width", "16"], false)]
-    #[case::batch_without_gpu(&["--gpu-batch", "32"], false)]
-    #[case::width_with_gpu(&["--gpu", "--gpu-width", "16"], true)]
-    #[case::batch_with_both(&["--both", "--gpu-batch", "32"], true)]
-    #[case::limbs_without_gpu(&["--gpu-limbs", "8"], false)]
-    #[case::limbs_with_gpu(&["--gpu", "--gpu-limbs", "8"], true)]
-    #[case::check_width_without_gpu(&["--check", "--gpu-width", "16"], false)]
+    #[case::gpu_without_low_security(&["--gpu"], false)]
+    #[case::both_without_low_security(&["--both"], false)]
+    #[case::gpu(&["--gpu", "--low-security"], true)]
+    #[case::both(&["--both", "--low-security"], true)]
+    #[case::low_security_cpu(&["--low-security"], true)]
+    #[case::gpu_and_both(&["--gpu", "--both", "--low-security"], false)]
+    #[case::width_without_gpu(&["--gpu-width", "16", "--low-security"], false)]
+    #[case::batch_without_gpu(&["--gpu-batch", "32", "--low-security"], false)]
+    #[case::width_with_gpu(&["--gpu", "--gpu-width", "16", "--low-security"], true)]
+    #[case::batch_with_both(&["--both", "--gpu-batch", "32", "--low-security"], true)]
+    #[case::limbs_without_gpu(&["--gpu-limbs", "8", "--low-security"], false)]
+    #[case::limbs_with_gpu(&["--gpu", "--gpu-limbs", "8", "--low-security"], true)]
+    #[case::check_width_without_gpu(&["--check", "--gpu-width", "16", "--low-security"], false)]
     fn gpu_flag_combinations(#[case] options: &[&str], #[case] accepted: bool) {
         let parsed = Cli::try_parse_from(["meikey", "abc"].iter().chain(options));
         assert_eq!(parsed.is_ok(), accepted, "{:?}", parsed.err());
@@ -1191,8 +1222,8 @@ mod tests {
     #[rstest]
     #[case::cpu(&[], |all| all)]
     #[case::cpu_explicit(&["-j", "3"], |_| 3)]
-    #[cfg_attr(feature = "cuda", case::both(&["--both"], |all: usize| all.saturating_sub(1).max(1)))]
-    #[cfg_attr(feature = "cuda", case::both_explicit(&["--both", "-j", "3"], |_| 3))]
+    #[cfg_attr(feature = "cuda", case::both(&["--both", "--low-security"], |all: usize| all.saturating_sub(1).max(1)))]
+    #[cfg_attr(feature = "cuda", case::both_explicit(&["--both", "--low-security", "-j", "3"], |_| 3))]
     fn cpu_threads(
         #[case] options: &[&str],
         #[case] want: fn(usize) -> usize,
@@ -1217,21 +1248,26 @@ mod tests {
 
     /// 各オプションが探索の設定（[`SearchConfig`]）にそのまま届く
     #[rstest]
+    // 既定は定数時間の倍算（ほかの高速化はあり）と ChaCha20 のシード
     #[case::defaults(&[], |c: &SearchConfig| {
-        c.backend == Backend::FAST
+        c.backend == Backend { mul: Mul::ConstantTime, ..Backend::FAST }
             && c.find == Find::Memmem
+            && c.seeds == SeedSource::ChaCha20
             && !c.pattern.as_ref().unwrap().case_sensitive()
+    })]
+    // 低セキュリティモードは表の倍算と通し番号のシード
+    #[case::low_security(&["--low-security"], |c: &SearchConfig| {
+        c.backend == Backend::FAST && c.seeds == SeedSource::Counter
     })]
     #[case::threads(&["-j", "3"], |c: &SearchConfig| c.threads == 3)]
     #[case::case_sensitive(&["-s"], |c: &SearchConfig| c.pattern.as_ref().unwrap().case_sensitive())]
-    #[case::constant_time(&["--constant-time"], |c: &SearchConfig| c.backend.mul == Mul::ConstantTime)]
     #[case::no_batch(&["--no-batch"], |c: &SearchConfig| c.backend.compress == Compress::Each)]
     #[case::simd_avx512(&["--simd", "avx512"], |c: &SearchConfig| c.backend.simd == Simd::Avx512)]
     #[case::simd_avx2(&["--simd", "avx2"], |c: &SearchConfig| c.backend.simd == Simd::Avx2)]
     #[case::simd_off(&["--simd", "off"], |c: &SearchConfig| c.backend.simd == Simd::Off)]
     #[case::no_memmem(&["--no-memmem"], |c: &SearchConfig| c.find == Find::Naive)]
     #[case::baseline(
-        &["--constant-time", "--no-batch", "--simd", "off", "--no-memmem"],
+        &["--no-batch", "--simd", "off", "--no-memmem"],
         |c: &SearchConfig| c.backend == Backend::BASELINE && c.find == Find::Naive
     )]
     fn options_reach_search_config(
@@ -1330,9 +1366,10 @@ mod tests {
     #[case::threads_not_number(&["abc", "-j", "x"], "'--threads <THREADS>' の値 'x' が正しくない: 1〜65535 の整数が必要")]
     #[case::bench_zero(&["abc", "--bench", "0"], "'--bench <SECS>' の値 '0' が正しくない: 0 より大きい秒数が必要")]
     #[case::bench_not_number(&["abc", "--bench", "x"], "'--bench <SECS>' の値 'x' が正しくない: 秒数ではない")]
-    #[cfg_attr(feature = "cuda", case::conflict(&["abc", "--constant-time", "--gpu"], "'--constant-time' と '--gpu' は一緒に付けられない"))]
+    #[cfg_attr(feature = "cuda", case::conflict(&["abc", "--low-security", "--gpu", "--both"], "'--gpu' と '--both' は一緒に付けられない"))]
+    #[cfg_attr(feature = "cuda", case::gpu_without_low_security(&["abc", "--gpu"], "必要な引数が無い: --low-security"))]
     #[cfg_attr(feature = "cuda", case::gpu_width_alone(&["abc", "--gpu-width", "16"], "必要な引数が無い: <--gpu|--both>"))]
-    #[cfg_attr(feature = "cuda", case::gpu_width_range(&["abc", "--gpu", "--gpu-width", "17"], "'--gpu-width <W>' の値 '17' が正しくない: 2〜16 の整数が必要"))]
+    #[cfg_attr(feature = "cuda", case::gpu_width_range(&["abc", "--low-security", "--gpu", "--gpu-width", "17"], "'--gpu-width <W>' の値 '17' が正しくない: 2〜16 の整数が必要"))]
     fn clap_errors_in_japanese(#[case] args: &[&str], #[case] want: &str) {
         let parse = || {
             parse_from(once("meikey").chain(args.iter().copied()))

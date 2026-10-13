@@ -23,7 +23,7 @@
 
 use crate::lang::{t, tf};
 use crate::model::key::VanityKey;
-use crate::model::search::{Outcome, SearchConfig, Stats};
+use crate::model::search::{Outcome, SearchConfig, SeedSource, Stats, counter_seed};
 use crate::service::derive::comb::{entries_with_width, rows_cols};
 use crate::service::derive::field::Fe;
 use crate::service::search::{Progress, Searcher};
@@ -298,6 +298,8 @@ struct Kernel {
 /// 探索の1回の起動に渡すもの（カーネルの引数のうち、起動ごとに変わらないもの）
 struct Launch {
     key: CudaSlice<u32>,
+    /// シードを通し番号で作るか（低セキュリティモード）
+    counter: u32,
     needle: CudaSlice<u8>,
     needle_len: u32,
     fold: u32,
@@ -354,20 +356,22 @@ impl Kernel {
     }
 
     /// 1 ブロック分（[`SELF_CHECK_THREADS`] スレッド）の公開鍵を GPU で計算し、そのうち先頭と最後のスレッドの全部と、
-    /// ほかのスレッドの1本目を CPU（ed25519-dalek）で計算し直して比べる。合わなければ使えない設定
-    /// （通し番号は奇数から始めて、シードを ChaCha20 のブロックの後半から取る場合も通す）
+    /// ほかのスレッドの1本目を CPU（ed25519-dalek）で計算し直して比べる。シードの作り方の両方で確かめ、
+    /// 合わなければ使えない設定（通し番号は奇数から始めて、シードを ChaCha20 のブロックの後半から取る場合も通す）
     fn self_check(&self, stream: &Arc<CudaStream>) -> Result<(), GpuError> {
-        let key: [u8; 32] = rand::random();
-        let first = (rand::random::<u64>() >> 8) | 1;
         let batch = self.options.batch as usize;
         let keys = SELF_CHECK_THREADS as usize * batch;
-        let got = self.derive_on_gpu(stream, &key, first, 1, SELF_CHECK_THREADS)?;
-        let checked =
-            (0..keys).filter(|i| i % batch == 0 || i / batch == 0 || i / batch == keys / batch - 1);
-        for i in checked {
-            let want = VanityKey::from_seed(seed(&key, first + i as u64));
-            if &got.as_chunks::<32>().0[i] != want.public_bytes() {
-                return Err(GpuError::SelfCheck(self.options));
+        for source in [SeedSource::ChaCha20, SeedSource::Counter] {
+            let key: [u8; 32] = rand::random();
+            let first = (rand::random::<u64>() >> 8) | 1;
+            let got = self.derive_on_gpu(stream, &key, source, first, 1, SELF_CHECK_THREADS)?;
+            let checked = (0..keys)
+                .filter(|i| i % batch == 0 || i / batch == 0 || i / batch == keys / batch - 1);
+            for i in checked {
+                let want = VanityKey::from_seed(seed(&key, source, first + i as u64));
+                if &got.as_chunks::<32>().0[i] != want.public_bytes() {
+                    return Err(GpuError::SelfCheck(self.options));
+                }
             }
         }
         Ok(())
@@ -378,15 +382,21 @@ impl Kernel {
         &self,
         stream: &Arc<CudaStream>,
         key: &[u8; 32],
+        source: SeedSource,
         first: u64,
         blocks: u32,
         threads: u32,
     ) -> Result<Vec<u8>, GpuError> {
         let n = (blocks * threads) as usize * self.options.batch as usize;
         let key_dev = stream.clone_htod(&key_words(key))?;
+        let counter = u32::from(source == SeedSource::Counter);
         let mut out = stream.alloc_zeros::<u8>(n * 32)?;
         let mut b = stream.launch_builder(&self.derive);
-        b.arg(&self.table).arg(&key_dev).arg(&first).arg(&mut out);
+        b.arg(&self.table)
+            .arg(&key_dev)
+            .arg(&counter)
+            .arg(&first)
+            .arg(&mut out);
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -402,18 +412,20 @@ impl Kernel {
         u64::from(self.grid) * u64::from(BLOCK) * u64::from(self.options.batch)
     }
 
-    /// 起動に渡すものを GPU に置く。`key` はシードを作る ChaCha20 の鍵、`needle` は探す文字列
-    /// （fold なら小文字にしたもの）
+    /// 起動に渡すものを GPU に置く。`key` はシードを作る乱数（ChaCha20 の鍵か、通し番号を足す 32 バイト）、
+    /// `needle` は探す文字列（fold なら小文字にしたもの）
     fn prepare(
         &self,
         stream: &Arc<CudaStream>,
         key: &[u8; 32],
+        source: SeedSource,
         needle: &[u8],
         fold: bool,
         stop_on_hit: bool,
     ) -> Result<Launch, GpuError> {
         Ok(Launch {
             key: stream.clone_htod(&key_words(key))?,
+            counter: u32::from(source == SeedSource::Counter),
             needle: stream.clone_htod(&[needle, &[0; 64]].concat())?,
             needle_len: needle.len() as u32,
             fold: u32::from(fold),
@@ -435,6 +447,7 @@ impl Kernel {
         let mut b = stream.launch_builder(&self.func);
         b.arg(&self.table)
             .arg(&l.key)
+            .arg(&l.counter)
             .arg(&l.needle)
             .arg(&l.needle_len)
             .arg(&l.fold)
@@ -458,7 +471,15 @@ impl Kernel {
     /// この GPU での速度（鍵/秒）。1回 [`MEASURE_LAUNCH`] ほどの起動を [`MEASURE_LAUNCHES`] 回して測る
     /// （最初の1回は、繰り返し回数を決めるための短い起動）
     fn measure(&self, stream: &Arc<CudaStream>) -> Result<f64, GpuError> {
-        let mut l = self.prepare(stream, &[0x5a; 32], MEASURE_NEEDLE, true, false)?;
+        // GPU で探すのは低セキュリティモード（通し番号のシード）だけなので、それで測る
+        let mut l = self.prepare(
+            stream,
+            &[0x5a; 32],
+            SeedSource::Counter,
+            MEASURE_NEEDLE,
+            true,
+            false,
+        )?;
         let start = Instant::now();
         self.launch(stream, &mut l, 0, 1)?;
         let once = start.elapsed().as_secs_f64().max(1e-6);
@@ -638,7 +659,7 @@ impl Gpu {
             None => (Vec::new(), false),
         };
         // ベンチマークでは当たっても止まらない
-        let mut l = kernel.prepare(stream, &key, &needle, fold, !config.bench)?;
+        let mut l = kernel.prepare(stream, &key, config.seeds, &needle, fold, !config.bench)?;
 
         let start = Instant::now();
         let mut tries = 0u64;
@@ -682,7 +703,7 @@ impl Gpu {
 
     /// 通し番号 `index` の鍵を CPU で作り直し、文字列が含まれることを確かめる
     fn confirm(&self, key: &[u8; 32], index: u64, config: &SearchConfig) -> VanityKey {
-        let found = VanityKey::from_seed(seed(key, index));
+        let found = VanityKey::from_seed(seed(key, config.seeds, index));
         if let Some(p) = &config.pattern {
             // 一致しなければ GPU の計算か判定が間違っている（バグ）ので止める
             assert!(
@@ -778,6 +799,14 @@ impl Searcher for Gpu {
     }
 }
 
+/// 通し番号 `index` のシード（kernel.cu と同じ。ChaCha20 か、`key` の先頭 8 バイトに通し番号を足したもの）
+fn seed(key: &[u8; 32], source: SeedSource, index: u64) -> [u8; 32] {
+    match source {
+        SeedSource::ChaCha20 => chacha20_seed(key, index),
+        SeedSource::Counter => counter_seed(key, index),
+    }
+}
+
 /// ChaCha20 の鍵を 32 ビットの語に（kernel.cu に渡す形）
 fn key_words(key: &[u8; 32]) -> [u32; 8] {
     std::array::from_fn(|i| u32::from_le_bytes(*key[4 * i..].first_chunk().expect("32 バイト")))
@@ -785,7 +814,7 @@ fn key_words(key: &[u8; 32]) -> [u32; 8] {
 
 /// 通し番号 `index` のシード（kernel.cu の chacha20_seed と同じ: ChaCha20 のブロック `index / 2` の 64 バイトの、
 /// `index` が偶数なら前半・奇数なら後半の 32 バイト）
-fn seed(key: &[u8; 32], index: u64) -> [u8; 32] {
+fn chacha20_seed(key: &[u8; 32], index: u64) -> [u8; 32] {
     let mut rng = ChaCha20Rng::from_seed(*key);
     rng.set_block_pos(index >> 1);
     let mut block = [0u8; 64];
@@ -920,7 +949,8 @@ mod tests {
 
     #[cfg(meikey_gpu_host)]
     unsafe extern "C" {
-        fn meikey_test_seed(key: *const u32, counter: u64, out: *mut u8);
+        fn meikey_test_seed(key: *const u32, index: u64, out: *mut u8);
+        fn meikey_test_counter_seed(key: *const u32, index: u64, out: *mut u8);
         fn meikey_test_secret(seed: *const u8, out: *mut u8);
         fn meikey_test_digits(s: *const u8, out: *mut i32);
         fn meikey_test_fe_mul(a: *const u32, b: *const u32, out: *mut u32);
@@ -938,12 +968,13 @@ mod tests {
     }
 
     #[cfg(meikey_gpu_host)]
-    type DeriveFn = unsafe extern "C" fn(*const u32, *const u32, u64, *mut u8);
+    type DeriveFn = unsafe extern "C" fn(*const u32, *const u32, u32, u64, *mut u8);
     #[cfg(meikey_gpu_host)]
     type SearchFn = unsafe extern "C" fn(
         u64,
         *const u32,
         *const u32,
+        u32,
         *const u8,
         u32,
         u32,
@@ -1032,7 +1063,7 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed(key);
         let mut stream = [0u8; 64 * 3];
         rand::Rng::fill_bytes(&mut rng, &mut stream);
-        let seeds: Vec<u8> = (0..6).flat_map(|i| seed(&key, i)).collect();
+        let seeds: Vec<u8> = (0..6).flat_map(|i| chacha20_seed(&key, i)).collect();
         assert_eq!(seeds, stream.to_vec());
     }
 
@@ -1044,7 +1075,10 @@ mod tests {
             let mut got = [0u8; 32];
             // SAFETY: key は 8 語、out は 32 バイト
             unsafe { meikey_test_seed(key_words(&key).as_ptr(), index, got.as_mut_ptr()) };
-            prop_assert_eq!(got, seed(&key, index));
+            prop_assert_eq!(got, chacha20_seed(&key, index));
+            // SAFETY: 同上
+            unsafe { meikey_test_counter_seed(key_words(&key).as_ptr(), index, got.as_mut_ptr()) };
+            prop_assert_eq!(got, counter_seed(&key, index));
             Ok(())
         });
     }
@@ -1215,7 +1249,10 @@ mod tests {
     /// まとめて計算した公開鍵は、同じシードから ed25519-dalek で作った鍵と一致する（埋め込む設定すべて）
     #[cfg(meikey_gpu_host)]
     #[rstest]
-    fn derive_batch_matches_dalek(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] variant: usize) {
+    fn derive_batch_matches_dalek(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] variant: usize,
+        #[values(SeedSource::ChaCha20, SeedSource::Counter)] source: SeedSource,
+    ) {
         let h = &HOSTS[variant];
         let (table, batch, derive) = (table(h.options.width), h.options.batch, h.derive);
         check(16, (any::<[u8; 32]>(), any::<u64>()), |(key, first)| {
@@ -1226,12 +1263,13 @@ mod tests {
                 derive(
                     table.as_ptr(),
                     key_words(&key).as_ptr(),
+                    u32::from(source == SeedSource::Counter),
                     first,
                     got.as_mut_ptr(),
                 )
             };
             for (j, pk) in got.as_chunks::<32>().0.iter().enumerate() {
-                let want = VanityKey::from_seed(seed(&key, first + j as u64));
+                let want = VanityKey::from_seed(seed(&key, source, first + j as u64));
                 prop_assert_eq!(pk, want.public_bytes(), "#{}", j);
             }
             Ok(())
@@ -1608,10 +1646,10 @@ mod tests {
         let first = (1 << 40) + 1;
         let got = gpu
             .kernel
-            .derive_on_gpu(&gpu.stream, &key, first, 8, BLOCK)
+            .derive_on_gpu(&gpu.stream, &key, SeedSource::ChaCha20, first, 8, BLOCK)
             .unwrap();
         for (i, pk) in got.as_chunks::<32>().0.iter().enumerate() {
-            let want = VanityKey::from_seed(seed(&key, first + i as u64));
+            let want = VanityKey::from_seed(seed(&key, SeedSource::ChaCha20, first + i as u64));
             assert_eq!(pk, want.public_bytes(), "#{i}");
         }
     }
@@ -1715,7 +1753,10 @@ mod tests {
     /// （埋め込む設定すべて）
     #[cfg(meikey_gpu_host)]
     #[rstest]
-    fn search_finds_first_hit(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] variant: usize) {
+    fn search_finds_first_hit(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] variant: usize,
+        #[values(SeedSource::ChaCha20, SeedSource::Counter)] source: SeedSource,
+    ) {
         let h = &HOSTS[variant];
         let (table, search) = (table(h.options.width), h.search);
         let key: [u8; 32] = from_fn(|i| i as u8 * 7);
@@ -1728,6 +1769,7 @@ mod tests {
                 1,
                 table.as_ptr(),
                 key_words(&key).as_ptr(),
+                u32::from(source == SeedSource::Counter),
                 needle.as_ptr(),
                 2,
                 1,
@@ -1740,12 +1782,12 @@ mod tests {
         assert_eq!(result[0], 1, "512 鍵以上のうちに「ab」はほぼ確実に出る");
         let hit = result[1];
         assert_eq!(
-            p.is_match(&VanityKey::from_seed(seed(&key, hit)).public_b64()),
+            p.is_match(&VanityKey::from_seed(seed(&key, source, hit)).public_b64()),
             true
         );
         for i in 0..hit {
             assert_eq!(
-                p.is_match(&VanityKey::from_seed(seed(&key, i)).public_b64()),
+                p.is_match(&VanityKey::from_seed(seed(&key, source, i)).public_b64()),
                 false,
                 "{i} が先に当たる"
             );

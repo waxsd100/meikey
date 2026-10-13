@@ -97,28 +97,28 @@ mod tests {
     #[rstest]
     #[case::version(&["--version"], &["meikey 0."], &[])]
     #[case::short_version(&["-V"], &["meikey 0."], &[])]
-    #[case::help(&["--help"], &["使い方: meikey", "引数:", "オプション:", "ヘルプを表示する", "[既定: id_ed25519_meikey]", "--constant-time", "--no-batch", "--simd <LEVEL>", "--no-memmem", "--bench <SECS>"], &[])]
+    #[case::help(&["--help"], &["使い方: meikey", "引数:", "オプション:", "ヘルプを表示する", "[既定: id_ed25519_meikey]", "--low-security", "--no-batch", "--simd <LEVEL>", "--no-memmem", "--bench <SECS>"], &[])]
     #[case::short_help(&["-h"], &["使い方: meikey"], &[])]
-    // --bench は、どの組み合わせで測ったかを表示する
-    #[case::bench_fast(
+    // --bench は、どの組み合わせで測ったかを表示する。既定は定数時間の倍算と ChaCha20 のシード
+    #[case::bench_default(
         &["wakokara", "--bench", "0.1", "-j", "1"],
         &["鍵/秒", "期待時間"],
-        &[("並列", "1 スレッド"), ("倍算", "テーブル"), ("逆元", "256 鍵ごとに 1 回"), ("検索", "memmem"), ("計測", "0.1 秒")]
+        &[("並列", "1 スレッド"), ("倍算", "定数時間"), ("逆元", "256 鍵ごとに 1 回"), ("検索", "memmem"), ("シード", "鍵ごとに ChaCha20"), ("計測", "0.1 秒")]
+    )]
+    #[case::bench_low_security(
+        &["wakokara", "--bench", "0.1", "-j", "1", "--low-security"],
+        &["鍵/秒", "期待時間"],
+        &[("倍算", "テーブル"), ("逆元", "256 鍵ごとに 1 回"), ("シード", "乱数 + 通し番号（低セキュリティモード）")]
     )]
     #[case::bench_fast_2_threads(
-        &["wakokara", "--bench", "0.1", "-j", "2"],
+        &["wakokara", "--bench", "0.1", "-j", "2", "--low-security"],
         &["鍵/秒", "期待時間"],
         &[("並列", "2 スレッド"), ("文字列", "wakokara（大小文字の区別なし）")]
     )]
     #[case::bench_no_batch(
-        &["wakokara", "--bench", "0.1", "-j", "1", "--no-batch"],
+        &["wakokara", "--bench", "0.1", "-j", "1", "--no-batch", "--low-security"],
         &["鍵/秒"],
         &[("倍算", "テーブル"), ("逆元", "1 鍵ごとに 1 回")]
-    )]
-    #[case::bench_constant_time(
-        &["wakokara", "--bench", "0.1", "-j", "1", "--constant-time"],
-        &["鍵/秒"],
-        &[("倍算", "定数時間"), ("逆元", "256 鍵ごとに 1 回")]
     )]
     #[case::bench_no_simd(
         &["wakokara", "--bench", "0.1", "-j", "1", "--simd", "off"],
@@ -137,7 +137,7 @@ mod tests {
         &[("文字列", "a（大小文字の区別あり）"), ("計測", "0.1 秒")]
     )]
     #[case::bench_baseline(
-        &["wakokara", "--bench", "0.1", "-j", "1", "--constant-time", "--no-batch", "--simd", "off", "--no-memmem"],
+        &["wakokara", "--bench", "0.1", "-j", "1", "--no-batch", "--simd", "off", "--no-memmem"],
         &["鍵/秒"],
         &[("SIMD", "なし"), ("倍算", "定数時間"), ("逆元", "1 鍵ごとに 1 回"), ("検索", "総当たり")]
     )]

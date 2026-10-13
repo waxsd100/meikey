@@ -9,7 +9,7 @@
 //! パスフレーズを付けた鍵は [`crate::encrypted`]、ssh-agent は [`crate::agent`]、
 //! 実際のログインは [`crate::sshd`]、authorized_keys は [`crate::authorized_keys`] で確かめる。
 //!
-//! 鍵は meikey 本体で高速版と定数時間版（`--constant-time`）の両方で作り、
+//! 鍵は meikey 本体で低セキュリティモード（`--low-security`）と既定（定数時間）の両方で作り、
 //! テストバイナリの中で使い回す（[`KeyFiles::shared`]）。
 //! OpenSSH を使うケースは、OpenSSH が無い環境ではスキップする。
 

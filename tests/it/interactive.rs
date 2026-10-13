@@ -41,20 +41,6 @@ fn answer(p: &mut PtySession, prompt: &str, keys: &str) {
     p.flush().unwrap();
 }
 
-/// GPU を使える版では「使うもの」を聞かれるので、CPU のまま進める
-fn answer_device(p: &mut PtySession) {
-    if cfg!(feature = "cuda") {
-        answer(p, "使うもの", ENTER);
-    }
-}
-
-/// 英語版の [`answer_device`]
-fn answer_device_en(p: &mut PtySession) {
-    if cfg!(feature = "cuda") {
-        answer(p, "Use", ENTER);
-    }
-}
-
 /// 終わるのを待って、終了コード
 fn exit_code(mut p: PtySession) -> i32 {
     p.exp_eof().unwrap();
@@ -78,7 +64,8 @@ mod tests {
         let mut p = spawn_in(dir.path());
         answer(&mut p, "何をする", ENTER);
         answer(&mut p, "公開鍵に入れたい文字列", &format!("12{ENTER}"));
-        answer_device(&mut p);
+        // 低セキュリティモードにしない（使うものは聞かれず CPU）
+        answer(&mut p, "低セキュリティモードにする", ENTER);
         answer(&mut p, "秘密鍵の保存先", ENTER);
         answer(&mut p, "鍵のコメント", &format!("wako{ENTER}"));
         answer(&mut p, "引数で起動するなら: meikey 12 --comment=wako", "");
@@ -118,7 +105,8 @@ mod tests {
             "公開鍵に入れたい文字列",
             &format!("0123456789{ENTER}"),
         );
-        answer_device(&mut p);
+        // 低セキュリティモードにしない（使うものは聞かれず CPU）
+        answer(&mut p, "低セキュリティモードにする", ENTER);
         answer(&mut p, "秘密鍵の保存先", ENTER);
         answer(&mut p, "鍵のコメント", ENTER);
         answer(&mut p, "始める？", "y");
@@ -138,7 +126,7 @@ mod tests {
             "Text to put in the public key",
             &format!("1{ENTER}"),
         );
-        answer_device_en(&mut p);
+        answer(&mut p, "Use low-security mode", ENTER);
         answer(&mut p, "Where to save the private key", ENTER);
         answer(&mut p, "Comment for the key", ENTER);
         answer(&mut p, "The same with arguments: meikey 1", "");

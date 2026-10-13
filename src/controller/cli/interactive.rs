@@ -196,7 +196,7 @@ pub(super) fn ask(p: &mut impl Prompt, repo: &impl KeyRepository) -> Result<Vec<
 
     if action == 2 {
         args.push("--check".to_string());
-        ask_device(p, &mut args)?;
+        ask_mode(p, &mut args)?;
         return start(p, args);
     }
 
@@ -221,7 +221,7 @@ pub(super) fn ask(p: &mut impl Prompt, repo: &impl KeyRepository) -> Result<Vec<
     {
         args.push("-s".to_string());
     }
-    ask_device(p, &mut args)?;
+    ask_mode(p, &mut args)?;
 
     if action == 1 {
         let secs = p.input(
@@ -252,6 +252,22 @@ pub(super) fn ask(p: &mut impl Prompt, repo: &impl KeyRepository) -> Result<Vec<
         args.push(format!("--comment={comment}"));
     }
     start(p, args)
+}
+
+/// 低セキュリティモードにするか。するなら、探すのに使うもの（GPU は低セキュリティモードでだけ使える）も聞く
+fn ask_mode(p: &mut impl Prompt, args: &mut Vec<String>) -> Result<(), AskError> {
+    let low = p.confirm(
+        t!(
+            "低セキュリティモードにする？（数倍速いが、倍算が定数時間でなく、シードは乱数に通し番号を足したもの。GPU はこのモードだけ）",
+            "Use low-security mode? (several times faster, but the multiplication is not constant-time and seeds are a counter added to random bytes; the GPU works only in this mode)"
+        ),
+        false,
+    )?;
+    if low {
+        args.push("--low-security".to_string());
+        ask_device(p, args)?;
+    }
+    Ok(())
 }
 
 /// 探すのに使うもの（GPU を使える版だけ聞く。CPU なら引数は付けない）
@@ -368,9 +384,9 @@ mod tests {
     }
     use Answer::*;
 
-    /// 「使うもの」への答え（GPU を使えない版では聞かれないので、台本から外れる）
-    fn device(i: usize) -> Option<Answer> {
-        cfg!(feature = "cuda").then_some(Select(i))
+    /// 「低セキュリティモードにする？」にいいえ（使うものは聞かれず CPU）
+    fn safe() -> Option<Answer> {
+        Some(Confirm(false))
     }
 
     /// 答えを順に返す [`Prompt`]。検査に通らなかった入力と、知らせた行も覚えておく
@@ -472,19 +488,19 @@ mod tests {
     /// 鍵を作る: 既定のまま答えれば文字列だけ、変えたものだけ引数になる。数字や記号だけなら大文字小文字は聞かない
     #[rstest]
     #[case::defaults(
-        vec![Some(Select(0)), Some(Input("abc")), Some(Confirm(false)), device(0), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
         &["abc"]
     )]
     #[case::everything(
-        vec![Some(Select(0)), Some(Input("Wako")), Some(Confirm(true)), device(0), Some(Input("keys/k")), Some(Input("me@host")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Input("Wako")), Some(Confirm(true)), safe(), Some(Input("keys/k")), Some(Input("me@host")), Some(Confirm(true))],
         &["Wako", "-s", "--output=keys/k", "--comment=me@host"]
     )]
     #[case::no_letters(
-        vec![Some(Select(0)), Some(Input("12+/")), device(0), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Input("12+/")), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
         &["12+/"]
     )]
     #[case::comment_with_space(
-        vec![Some(Select(0)), Some(Input("abc")), Some(Confirm(false)), device(0), Some(Input("-k")), Some(Input("wako kara")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("-k")), Some(Input("wako kara")), Some(Confirm(true))],
         &["abc", "--output=-k", "--comment=wako kara"]
     )]
     fn generate(
@@ -497,15 +513,42 @@ mod tests {
         assert_eq!(script.rejected, Vec::<String>::new());
     }
 
-    /// 使うもの: CPU なら何も付けず、GPU は --gpu、両方は --both（鍵を作る・測る・見る のどれでも聞く）
+    /// 低セキュリティモードにすると --low-security を付け、使うものも聞く（CPU なら何も付けず、GPU は --gpu、
+    /// 両方は --both）。鍵を作る・測る・見る のどれでも聞く
     #[cfg(feature = "cuda")]
     #[rstest]
-    #[case::generate_gpu(vec![Select(0), Input("123"), Select(1), Input(""), Input(""), Confirm(true)], &["123", "--gpu"])]
-    #[case::bench_both(vec![Select(1), Input("123"), Select(2), Input(""), Confirm(true)], &["123", "--both", "--bench=10"])]
-    #[case::check_gpu(vec![Select(2), Select(1), Confirm(true)], &["--check", "--gpu"])]
+    #[case::generate_gpu(vec![Select(0), Input("123"), Confirm(true), Select(1), Input(""), Input(""), Confirm(true)], &["123", "--low-security", "--gpu"])]
+    #[case::generate_cpu(vec![Select(0), Input("123"), Confirm(true), Select(0), Input(""), Input(""), Confirm(true)], &["123", "--low-security"])]
+    #[case::bench_both(vec![Select(1), Input("123"), Confirm(true), Select(2), Input(""), Confirm(true)], &["123", "--low-security", "--both", "--bench=10"])]
+    #[case::check_gpu(vec![Select(2), Confirm(true), Select(1), Confirm(true)], &["--check", "--low-security", "--gpu"])]
     fn device_choice(#[case] answers: Vec<Answer>, #[case] want: &[&str], repo: MockKeyRepository) {
         let mut script = Script::new(answers.into_iter().map(Some));
         assert_eq!(answer(&mut script, &repo), strings(want));
+    }
+
+    /// 低セキュリティモードにしなければ、使うものは聞かずに CPU（GPU は低セキュリティモードでだけ使える）
+    #[rstest]
+    fn safe_mode_uses_cpu(repo: MockKeyRepository) {
+        let mut script = Script::new([
+            Some(Select(0)),
+            Some(Input("123")),
+            safe(),
+            Some(Input("")),
+            Some(Input("")),
+            Some(Confirm(true)),
+        ]);
+        assert_eq!(answer(&mut script, &repo), strings(&["123"]));
+    }
+
+    /// GPU を使えない版でも、低セキュリティモードは選べる（使うものは聞かない）
+    #[cfg(not(feature = "cuda"))]
+    #[rstest]
+    fn low_security_without_gpu(repo: MockKeyRepository) {
+        let mut script = Script::new([Some(Select(2)), Some(Confirm(true)), Some(Confirm(true))]);
+        assert_eq!(
+            answer(&mut script, &repo),
+            strings(&["--check", "--low-security"])
+        );
     }
 
     /// 速さを測る: 秒数を聞き（既定 10 秒）、保存先やコメントは聞かない
@@ -519,7 +562,7 @@ mod tests {
             Some(Select(1)),
             Some(Input("abc")),
             Some(Confirm(false)),
-            device(0),
+            safe(),
             Some(Input(secs)),
             Some(Confirm(true)),
         ]);
@@ -529,7 +572,7 @@ mod tests {
     /// 見る: 文字列も聞かずに --check
     #[rstest]
     fn check() {
-        let mut script = Script::new([Some(Select(2)), device(0), Some(Confirm(true))]);
+        let mut script = Script::new([Some(Select(2)), safe(), Some(Confirm(true))]);
         assert_eq!(
             answer(&mut script, &MockKeyRepository::new()),
             strings(&["--check"])
@@ -539,23 +582,23 @@ mod tests {
     /// 検査に通らない答えは理由を見せて入れ直してもらう（文字列・秒数・保存先）
     #[rstest]
     #[case::invalid_char(
-        vec![Some(Select(0)), Some(Input("ab-c")), Some(Input("abc")), Some(Confirm(false)), device(0), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Input("ab-c")), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
         &["abc"], &["ab-c: 使えない文字: '-'（使える文字: A-Z a-z 0-9 + /）"]
     )]
     #[case::empty_target(
-        vec![Some(Select(0)), Some(Input("")), Some(Input("abc")), Some(Confirm(false)), device(0), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Input("")), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
         &["abc"], &[": 文字列が空"]
     )]
     #[case::too_long(
-        vec![Some(Select(1)), Some(Input("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), Some(Input("123")), device(0), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(1)), Some(Input("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), Some(Input("123")), safe(), Some(Input("")), Some(Confirm(true))],
         &["123", "--bench=10"], &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: 文字列が長すぎる: 43 文字（最大 42 文字）"]
     )]
     #[case::bad_secs(
-        vec![Some(Select(1)), Some(Input("123")), device(0), Some(Input("0")), Some(Input("x")), Some(Input("2")), Some(Confirm(true))],
+        vec![Some(Select(1)), Some(Input("123")), safe(), Some(Input("0")), Some(Input("x")), Some(Input("2")), Some(Confirm(true))],
         &["123", "--bench=2"], &["0: 0 より大きい秒数が必要", "x: 秒数ではない"]
     )]
     #[case::blank_output(
-        vec![Some(Select(0)), Some(Input("123")), device(0), Some(Input("  ")), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Input("123")), safe(), Some(Input("  ")), Some(Input("")), Some(Input("")), Some(Confirm(true))],
         &["123"], &["  : 空"]
     )]
     fn rejected_answers_are_asked_again(
@@ -582,12 +625,7 @@ mod tests {
             .with(eq(Path::new("other")))
             .returning(|_| Ok(None));
         repo.expect_check_writable().times(1).returning(|_| Ok(()));
-        let mut answers = vec![
-            Some(Select(0)),
-            Some(Input("123")),
-            device(0),
-            Some(Input("")),
-        ];
+        let mut answers = vec![Some(Select(0)), Some(Input("123")), safe(), Some(Input(""))];
         answers.extend(middle.iter().copied().map(Some));
         answers.extend([Some(Input("")), Some(Confirm(true))]);
 
@@ -614,7 +652,7 @@ mod tests {
         let mut script = Script::new([
             Some(Select(0)),
             Some(Input("123")),
-            device(0),
+            safe(),
             Some(Input("nodir/k")),
             Some(Input("k")),
             Some(Input("")),
@@ -631,7 +669,7 @@ mod tests {
             Some(Select(0)),
             Some(Input("Wako")),
             Some(Confirm(true)),
-            device(0),
+            safe(),
             Some(Input("")),
             Some(Input("wako kara")),
             Some(Confirm(true)),
@@ -649,8 +687,8 @@ mod tests {
     #[rstest]
     #[case::first_question(vec![Some(Cancel)])]
     #[case::target(vec![Some(Select(0)), Some(Cancel)])]
-    #[case::comment(vec![Some(Select(0)), Some(Input("123")), device(0), Some(Input("")), Some(Cancel)])]
-    #[case::declined(vec![Some(Select(2)), device(0), Some(Confirm(false))])]
+    #[case::comment(vec![Some(Select(0)), Some(Input("123")), safe(), Some(Input("")), Some(Cancel)])]
+    #[case::declined(vec![Some(Select(2)), safe(), Some(Confirm(false))])]
     fn cancel(#[case] answers: Vec<Option<Answer>>, repo: MockKeyRepository) {
         let mut script = Script::new(answers);
         let e = ask(&mut script, &repo).unwrap_err();
@@ -680,7 +718,7 @@ mod tests {
             Some(Input("ab-c")),
             Some(Input("abc")),
             Some(Confirm(false)),
-            device(0),
+            safe(),
             Some(Input("  ")),
             Some(Input("")),
             Some(Input("")),

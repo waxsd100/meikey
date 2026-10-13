@@ -65,26 +65,20 @@ pub const LOCALE_VARS: [&str; 4] = ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"]
 /// 公開鍵の計算方法（meikey の引数で切り替える）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// 既定（高速化あり）
+    /// `--low-security`（表の倍算と、乱数に通し番号を足したシード）
     Fast,
-    /// `--constant-time`（倍算だけ高速化前）
+    /// 既定（定数時間の倍算と、鍵ごとの ChaCha20 のシード）
     ConstantTime,
-    /// `--constant-time --no-batch --simd off --no-memmem`（倍算も圧縮も SIMD も検索も高速化前）
+    /// `--no-batch --simd off --no-memmem`（倍算も圧縮も SIMD も検索も高速化前）
     Baseline,
 }
 
 impl Mode {
     pub fn args(self) -> &'static [&'static str] {
         match self {
-            Mode::Fast => &[],
-            Mode::ConstantTime => &["--constant-time"],
-            Mode::Baseline => &[
-                "--constant-time",
-                "--no-batch",
-                "--simd",
-                "off",
-                "--no-memmem",
-            ],
+            Mode::Fast => &["--low-security"],
+            Mode::ConstantTime => &[],
+            Mode::Baseline => &["--no-batch", "--simd", "off", "--no-memmem"],
         }
     }
 

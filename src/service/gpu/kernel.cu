@@ -6,7 +6,8 @@
 //
 // 1鍵の流れ（CPU 版と同じ計算）:
 //   1. シード = ChaCha20(鍵 = ホストが作った乱数, ブロック番号 = 鍵の通し番号 / 2) の前半か後半の 32 バイト
-//      （通し番号が偶数なら前半、奇数なら後半。1 ブロックで 2 本ぶん）
+//      （通し番号が偶数なら前半、奇数なら後半。1 ブロックで 2 本ぶん）。低セキュリティモード（counter）では、
+//      ホストが作った乱数 32 バイトの先頭 8 バイトに通し番号を足したもの
 //   2. 秘密スカラー = clamp(SHA-512(シード)[..32])
 //   3. 公開鍵の点 = 櫛形テーブル（幅 W、ホストが作って転送）を1行ずつ足す（倍加なし。W = 16 で加算 15 回）。
 //      スカラー s = 8·(2^251 + m) の m を桁に分け、表は 8B を基点にして最上位の行に 2^254·B を足してある
@@ -139,6 +140,20 @@ DEV void chacha20_seed(const u32 key[8], u64 index, u8 seed[32]) {
     u32 block[16];
     chacha20_block(key, index >> 1, block);
     seed_from_block(block, (index & 1) != 0, seed);
+}
+
+/// 低セキュリティモードのシード: `key`（ホストが作った乱数 32 バイト）の先頭 8 バイト（リトルエンディアン）に
+/// 通し番号を足したもの（model::search の counter_seed と同じ）
+DEV void counter_seed(const u32 key[8], u64 index, u8 seed[32]) {
+    u64 head = ((u64)key[1] << 32 | key[0]) + index;
+    UNROLL
+    for (int i = 0; i < 8; i++) {
+        u32 w = i == 0 ? (u32)head : i == 1 ? (u32)(head >> 32) : key[i];
+        seed[4 * i] = (u8)w;
+        seed[4 * i + 1] = (u8)(w >> 8);
+        seed[4 * i + 2] = (u8)(w >> 16);
+        seed[4 * i + 3] = (u8)(w >> 24);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,17 +1047,22 @@ DEV u8 x_sign(const fe x, const fe zinv) {
 
 /// 通し番号 `first` から MEIKEY_BATCH 本の公開鍵を計算し、1本できるたびに emit(j, pk, x, zinv) を呼ぶ
 /// （j は 0 始まりの番号。後ろの鍵から順に呼ぶ）。pk は圧縮形式の x の符号のビットを 0 にしたもので、
-/// 符号は要るときだけ x_sign(x, zinv) で計算する
+/// 符号は要るときだけ x_sign(x, zinv) で計算する。`counter` ならシードは counter_seed（低セキュリティモード）、
+/// そうでなければ ChaCha20
 template <class Emit>
-DEV void derive_batch_each(const u32* table, const u32 key[8], u64 first, Emit emit) {
+DEV void derive_batch_each(const u32* table, const u32 key[8], u64 first, bool counter, Emit emit) {
     fe xs[MEIKEY_BATCH], ys[MEIKEY_BATCH], zs[MEIKEY_BATCH], prefix[MEIKEY_BATCH];
     // 偶数の通し番号でブロックを作り、次の奇数の通し番号ではその後半を使う
     u32 block[16];
     for (int j = 0; j < MEIKEY_BATCH; j++) {
         u8 seed[32], s[32];
         u64 index = first + (u64)j;
-        if (j == 0 || (index & 1) == 0) chacha20_block(key, index >> 1, block);
-        seed_from_block(block, (index & 1) != 0, seed);
+        if (counter) {
+            counter_seed(key, index, seed);
+        } else {
+            if (j == 0 || (index & 1) == 0) chacha20_block(key, index >> 1, block);
+            seed_from_block(block, (index & 1) != 0, seed);
+        }
         secret_scalar(seed, s);
         ext p = mul_base(table, s);
         xs[j] = p.x;
@@ -1062,8 +1082,8 @@ DEV void derive_batch_each(const u32* table, const u32 key[8], u64 first, Emit e
 }
 
 /// 通し番号 `first` から MEIKEY_BATCH 本の公開鍵（圧縮形式）を pks に書く
-DEV void derive_batch(const u32* table, const u32 key[8], u64 first, u8 pks[MEIKEY_BATCH][32]) {
-    derive_batch_each(table, key, first, [&](int j, u8 pk[32], const fe& x, const fe& zinv) {
+DEV void derive_batch(const u32* table, const u32 key[8], u64 first, bool counter, u8 pks[MEIKEY_BATCH][32]) {
+    derive_batch_each(table, key, first, counter, [&](int j, u8 pk[32], const fe& x, const fe& zinv) {
         pk[31] |= (u8)(x_sign(x, zinv) << 7);
         for (int b = 0; b < 32; b++) pks[j][b] = pk[b];
     });
@@ -1072,7 +1092,7 @@ DEV void derive_batch(const u32* table, const u32 key[8], u64 first, u8 pks[MEIK
 /// スレッド `gid`（全 `nthreads` 本）の仕事: 1回に MEIKEY_BATCH 本を `iters` 回。
 /// 鍵の通し番号は base + ((it·nthreads + gid)·MEIKEY_BATCH + j)。
 /// 見つけたら result[0] を 0 → 1 にした最初のスレッドが result[1] に通し番号を書く
-DEV u32 thread_work(u64 gid, u64 nthreads, const u32* table, const u32 key[8], const u8* needle,
+DEV u32 thread_work(u64 gid, u64 nthreads, const u32* table, const u32 key[8], u32 counter, const u8* needle,
                     u32 needle_len, u32 fold, u64 base, u32 iters, u32 stop_on_hit, u64* result) {
     u32 sink = 0;
     for (u32 it = 0; it < iters; it++) {
@@ -1082,7 +1102,7 @@ DEV u32 thread_work(u64 gid, u64 nthreads, const u32* table, const u32 key[8], c
         // （公開鍵は後ろの鍵から順にできる）
         u64 hits = 0;
         // x の符号は、文字列が含まれそうな鍵だけ計算する（ほとんどの鍵は符号によらず含まれない）
-        derive_batch_each(table, key, first, [&](int j, u8 pk[32], const fe& x, const fe& zinv) {
+        derive_batch_each(table, key, first, counter != 0, [&](int j, u8 pk[32], const fe& x, const fe& zinv) {
             sink ^= pk[31];
             bool hit = pk_contains(pk, needle, needle_len, fold != 0, true);
             if (hit) {
@@ -1106,26 +1126,28 @@ DEV u32 thread_work(u64 gid, u64 nthreads, const u32* table, const u32 key[8], c
 /// 一部を書き出す先
 // 1 SM に 4 ブロック（512 スレッド）載るよう、レジスタを 128 本以内にする（足りない分は少しスピルする。
 // 制限しないと 160〜180 本になり、載るブロックが 2〜3 に減る）
-extern "C" __global__ void __launch_bounds__(MEIKEY_BLOCK, 4) meikey_search(const u32* __restrict__ table, const u32* __restrict__ key,
-                                         const u8* __restrict__ needle, u32 needle_len, u32 fold, u64 base,
-                                         u32 iters, u32 stop_on_hit, u64* result, u32* sink) {
+extern "C" __global__ void __launch_bounds__(MEIKEY_BLOCK, 4)
+    meikey_search(const u32* __restrict__ table, const u32* __restrict__ key, u32 counter,
+                  const u8* __restrict__ needle, u32 needle_len, u32 fold, u64 base, u32 iters, u32 stop_on_hit,
+                  u64* result, u32* sink) {
     u64 gid = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     u64 nthreads = (u64)gridDim.x * blockDim.x;
     u32 k[8];
     UNROLL
     for (int i = 0; i < 8; i++) k[i] = key[i];
-    sink[gid] = thread_work(gid, nthreads, table, k, needle, needle_len, fold, base, iters, stop_on_hit, result);
+    sink[gid] = thread_work(gid, nthreads, table, k, counter, needle, needle_len, fold, base, iters, stop_on_hit,
+                            result);
 }
 
 /// テスト用: スレッド gid が通し番号 first + gid·MEIKEY_BATCH から MEIKEY_BATCH 本の公開鍵を out に書く
-extern "C" __global__ void meikey_derive(const u32* __restrict__ table, const u32* __restrict__ key, u64 first,
-                                         u8* out) {
+extern "C" __global__ void meikey_derive(const u32* __restrict__ table, const u32* __restrict__ key, u32 counter,
+                                         u64 first, u8* out) {
     u64 gid = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     u32 k[8];
     UNROLL
     for (int i = 0; i < 8; i++) k[i] = key[i];
     u8 pks[MEIKEY_BATCH][32];
-    derive_batch(table, k, first + gid * MEIKEY_BATCH, pks);
+    derive_batch(table, k, first + gid * MEIKEY_BATCH, counter != 0, pks);
     for (int j = 0; j < MEIKEY_BATCH; j++) {
         for (int b = 0; b < 32; b++) out[(gid * MEIKEY_BATCH + j) * 32 + b] = pks[j][b];
     }
@@ -1143,7 +1165,9 @@ extern "C" __global__ void meikey_derive(const u32* __restrict__ table, const u3
 #define MEIKEY_CAT(a, b) MEIKEY_CAT2(a, b)
 #define TEST_FN(name) MEIKEY_CAT(MEIKEY_TEST_PREFIX, name)
 
-extern "C" void TEST_FN(seed)(const u32 key[8], u64 counter, u8 out[32]) { chacha20_seed(key, counter, out); }
+extern "C" void TEST_FN(seed)(const u32 key[8], u64 index, u8 out[32]) { chacha20_seed(key, index, out); }
+
+extern "C" void TEST_FN(counter_seed)(const u32 key[8], u64 index, u8 out[32]) { counter_seed(key, index, out); }
 
 extern "C" void TEST_FN(secret)(const u8 seed[32], u8 out[32]) { secret_scalar(seed, out); }
 
@@ -1190,8 +1214,9 @@ extern "C" u32 TEST_FN(limbs)(void) { return MEIKEY_LIMBS; }
 
 extern "C" u32 TEST_FN(block)(void) { return MEIKEY_BLOCK; }
 
-extern "C" void TEST_FN(derive_batch)(const u32* table, const u32 key[8], u64 first, u8 out[MEIKEY_BATCH][32]) {
-    derive_batch(table, key, first, out);
+extern "C" void TEST_FN(derive_batch)(const u32* table, const u32 key[8], u32 counter, u64 first,
+                                      u8 out[MEIKEY_BATCH][32]) {
+    derive_batch(table, key, first, counter != 0, out);
 }
 
 extern "C" int TEST_FN(contains)(const u8 pk[32], const u8* needle, u32 len, u32 fold) {
@@ -1205,10 +1230,10 @@ extern "C" int TEST_FN(contains_unsigned)(const u8 pk[32], const u8* needle, u32
 extern "C" void TEST_FN(tail_b64)(const u8 pk[32], u8 out[TAIL_B64]) { tail_b64(pk, false, out); }
 
 /// カーネル全体を CPU で真似る（スレッドを順に回す）
-extern "C" void TEST_FN(search)(u64 nthreads, const u32* table, const u32 key[8], const u8* needle, u32 needle_len,
-                                   u32 fold, u64 base, u32 iters, u32 stop_on_hit, u64* result) {
+extern "C" void TEST_FN(search)(u64 nthreads, const u32* table, const u32 key[8], u32 counter, const u8* needle,
+                                   u32 needle_len, u32 fold, u64 base, u32 iters, u32 stop_on_hit, u64* result) {
     for (u64 gid = 0; gid < nthreads; gid++) {
-        thread_work(gid, nthreads, table, key, needle, needle_len, fold, base, iters, stop_on_hit, result);
+        thread_work(gid, nthreads, table, key, counter, needle, needle_len, fold, base, iters, stop_on_hit, result);
     }
 }
 

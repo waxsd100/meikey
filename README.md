@@ -32,6 +32,7 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAiytFbrDh3MEGkK6xS5oe22CBkwAkOiHqOUBG+RECKz
 ```sh
 cargo make run wakokara --bench 10                                  # 速度と期待時間を測る
 cargo make run wakokara -C wakokara -o ~/.ssh/id_ed25519_wakokara   # 鍵を探して書き出す
+cargo make run wakokara --low-security --bench 10                   # 低セキュリティモード（速さを優先）
 ```
 
 引数を付けずに起動すると、することと文字列・保存先・コメントなどを順に聞かれ、選んだり入力したりして始められる。始める前に、同じことをする引数を表示する。
@@ -46,11 +47,11 @@ ssh-keygen -p -f ~/.ssh/id_ed25519_wakokara
 
 ### GPU
 
-Turing（RTX 20 シリーズ・T4）以降の NVIDIA の GPU で動く。`--gpu` で GPU だけ、`--both` で GPU と CPU の両方で探す。
+Turing（RTX 20 シリーズ・T4）以降の NVIDIA の GPU で動く。`--gpu` で GPU だけ、`--both` で GPU と CPU の両方で探す。GPU の計算は定数時間ではないので、`--low-security` と一緒に付ける。
 
 ```sh
-cargo make run wakokara --gpu --bench 10
-cargo make run wakokara --both -C wakokara -o ~/.ssh/id_ed25519_wakokara
+cargo make run wakokara --low-security --gpu --bench 10
+cargo make run wakokara --low-security --both -C wakokara -o ~/.ssh/id_ed25519_wakokara
 ```
 
 ### オプション
@@ -64,12 +65,12 @@ cargo make run wakokara --both -C wakokara -o ~/.ssh/id_ed25519_wakokara
 | `-f`, `--force` | 既存のファイルを置き換える |
 | `--bench SECS` | 探さずに速度だけ測る |
 | `--check` | 使う CPU・GPU と計算方法を表示して終わる |
-| `--gpu` | CPU ではなく GPU で探す |
-| `--both` | GPU と CPU の両方で探す |
+| `--low-security` | 低セキュリティモード（速さを優先する。下の「安全性」を参照） |
+| `--gpu` | CPU ではなく GPU で探す（`--low-security` のとき） |
+| `--both` | GPU と CPU の両方で探す（`--low-security` のとき） |
 | `--gpu-width W` | GPU の表の幅（2〜16。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
 | `--gpu-batch N` | GPU で逆元をまとめる鍵の数（1〜64。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
 | `--gpu-limbs L` | GPU の体演算のリムの数（10 か 8。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
-| `--constant-time` | 倍算に定数時間の実装を使う（約 5 倍遅い。CPU のみ） |
 | `--simd LEVEL` | 使う SIMD の上限（`avx512-ifma`・`avx512`・`avx2`・`off`） |
 
 ### 入れられる文字列
@@ -86,7 +87,13 @@ cargo make run wakokara --both -C wakokara -o ~/.ssh/id_ed25519_wakokara
 
 ## 安全性
 
-既定の倍算は定数時間ではない。共有サーバーなど信用できない環境では、CPU で `--constant-time` を付けて探す。GPU の計算は定数時間ではないので、`--constant-time` は `--gpu`・`--both` と一緒に付けられない。
+既定では、倍算に定数時間の実装を使い、シードは鍵ごとに ChaCha20 で作る。
+
+`--low-security` を付けると、速さを優先する。
+
+- 倍算に定数時間ではない表の倍算を使う。同じマシン上のほかのプロセスから、キャッシュのタイミングで秘密鍵を推測される余地がある
+- シードは、OS の乱数（スレッドごとに 1 回）に通し番号を足したものにする
+- `--gpu`・`--both` は、このモードでだけ使える
 
 ## ライセンス
 

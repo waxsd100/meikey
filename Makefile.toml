@@ -7,7 +7,8 @@
 #   cargo make proptest-deep            # proptest の試行回数を100倍にして全テスト
 #   cargo make mutants                  # ミューテーションテスト
 #   cargo make sde                      # Intel SDE で、この PC に無い命令セット（AVX-512 など）の経路もテスト
-#   cargo make run wakokara --bench 10  # 速度と期待時間を測る（--gpu で GPU、--both で GPU と CPU の両方）
+#   cargo make run wakokara --bench 10  # 速度と期待時間を測る（--low-security で低セキュリティモード。
+#                                       # その上で --gpu で GPU、--both で GPU と CPU の両方）
 #   cargo make run wakokara -C wakokara -o ~/.ssh/id_ed25519_wakokara  # 鍵を探して書き出す
 #   cargo make build                    # 最適化ビルド（target/release/meikey）
 #   cargo make ptx                      # GPU のカーネル（kernel.cu）を変えたら、埋め込む PTX（設定ごと）を作り直す（NVRTC が要る）

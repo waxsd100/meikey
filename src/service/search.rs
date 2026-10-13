@@ -3,7 +3,7 @@
 use crate::lang::{t, tf};
 use crate::model::backend::Simd;
 use crate::model::key::{self, PUBLIC_B64_LEN, VanityKey};
-use crate::model::search::{Cancel, Outcome, SearchConfig, Stats};
+use crate::model::search::{Cancel, Outcome, SearchConfig, SeedSource, Stats, counter_seed};
 use crate::service::derive::{BATCH, Deriver, PublicKeys, Seeds};
 use crate::service::matcher::Matcher;
 use rand::Rng;
@@ -208,8 +208,20 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
     let mut publics: PublicKeys = [[0u8; 32]; BATCH];
     let mut b64 = [0u8; PUBLIC_B64_LEN];
 
+    // 低セキュリティモード（SeedSource::Counter）では、乱数はスレッドごとに1回だけ作り、通し番号を足していく
+    let mut base = [0u8; 32];
+    rng.fill_bytes(&mut base);
+    let mut counter = 0u64;
     while !stop.load(Relaxed) {
-        seeds.iter_mut().for_each(|s| rng.fill_bytes(s));
+        match config.seeds {
+            SeedSource::ChaCha20 => seeds.iter_mut().for_each(|s| rng.fill_bytes(s)),
+            SeedSource::Counter => {
+                for s in seeds.iter_mut() {
+                    *s = counter_seed(&base, counter);
+                    counter += 1;
+                }
+            }
+        }
         // x の符号は、文字列が含まれそうな鍵だけ計算する（ほとんどの鍵は符号によらず含まれない）
         deriver.public_keys_unsigned(&seeds, &mut publics);
 
