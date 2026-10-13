@@ -85,6 +85,8 @@ cargo make run wakokara --low-security --both -C wakokara -o ~/.ssh/id_ed25519_w
 
 秘密鍵は Colab の VM 上で作られる。ダウンロードしたら VM から消し、手元でパスフレーズを付ける。
 
+ほかのツール（[ツールの比較](docs/comparison.md)）と同じマシンで速さを比べるノートブックは [colab/compare.ipynb](https://colab.research.google.com/github/waxsd100/meikey/blob/master/colab/compare.ipynb)。
+
 ## 安全性
 
 既定では、倍算に定数時間の実装を使い、シードは鍵ごとに ChaCha20 で作る。
