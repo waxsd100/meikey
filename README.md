@@ -68,6 +68,7 @@ cargo make run wakokara --both -C wakokara -o ~/.ssh/id_ed25519_wakokara
 | `--both` | GPU と CPU の両方で探す |
 | `--gpu-width W` | GPU の表の幅（2〜16。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
 | `--gpu-batch N` | GPU で逆元をまとめる鍵の数（1〜64。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
+| `--gpu-limbs L` | GPU の体演算のリムの数（10 か 8。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
 | `--constant-time` | 倍算に定数時間の実装を使う（約 5 倍遅い。CPU のみ） |
 | `--simd LEVEL` | 使う SIMD の上限（`avx512-ifma`・`avx512`・`avx2`・`off`） |
 

@@ -252,13 +252,12 @@ unsafe fn prefetch_next<const N: usize>(
     }
 }
 
-/// [`Table::mul_base_batch`] と同じ計算を8鍵ずつ（`N` は 8 の倍数）
+/// [`Table::mul_base_batch`] の最後の加算の前まで（8鍵ずつの組の点と、最後の行の桁を返す）
 #[inline(always)]
-unsafe fn mul_base_batch<F: Field8, const N: usize>(
+unsafe fn mul_base_until_last<F: Field8, const N: usize>(
     table: &Table8,
     scalars: &[[u8; 32]; N],
-    out: &mut [Extended; N],
-) {
+) -> (Vec<Ext8<F>>, [i16; N]) {
     unsafe {
         const { assert!(N > 0 && N.is_multiple_of(8)) };
         // digits[i][k] = k 番目の鍵の i 桁目
@@ -283,9 +282,25 @@ unsafe fn mul_base_batch<F: Field8, const N: usize>(
                 add_niels::<F, true>(a, &gather(row, d));
             }
         }
+        (acc, digits[ROWS - 1])
+    }
+}
+
+/// [`Table::mul_base_batch`] と同じ計算を8鍵ずつ（`N` は 8 の倍数）
+#[inline(always)]
+unsafe fn mul_base_batch<F: Field8, const N: usize>(
+    table: &Table8,
+    scalars: &[[u8; 32]; N],
+    out: &mut [Extended; N],
+) {
+    unsafe {
+        let (mut acc, last) = mul_base_until_last::<F, N>(table, scalars);
         let row = table.row(ROWS - 1);
-        let last = digits[ROWS - 1].as_chunks::<8>().0;
-        for ((p, d), o) in acc.iter_mut().zip(last).zip(out.as_chunks_mut::<8>().0) {
+        for ((p, d), o) in acc
+            .iter_mut()
+            .zip(last.as_chunks::<8>().0)
+            .zip(out.as_chunks_mut::<8>().0)
+        {
             add_niels::<F, false>(p, &gather(row, d));
             let (x, y, z) = (p.x.lanes(), p.y.lanes(), p.z.lanes());
             for k in 0..8 {
@@ -297,6 +312,73 @@ unsafe fn mul_base_batch<F: Field8, const N: usize>(
                 };
             }
         }
+    }
+}
+
+/// [`mul_base_batch`] に続けて、1/Z と y の圧縮形式まで8鍵ずつ計算する（`N` は 8 の倍数）。
+/// `ys[k]` は k 番目の公開鍵の圧縮形式で x の符号のビットを 0 にしたもの、`xs[k]`・`zinvs[k]` は
+/// 符号を後から計算するための X と 1/Z。
+///
+/// 1/Z は Montgomery の一括逆元をレーンごとに（8本の鎖を並べて）する: 組を順に掛けた積の逆元を
+/// 1回だけ計算し、後ろの組から 1/Z を取り出す
+#[inline(always)]
+unsafe fn mul_base_compress<F: Field8, const N: usize>(
+    table: &Table8,
+    scalars: &[[u8; 32]; N],
+    ys: &mut [[u8; 32]; N],
+    xs: &mut [Fe; N],
+    zinvs: &mut [Fe; N],
+) {
+    unsafe {
+        let (mut acc, last) = mul_base_until_last::<F, N>(table, scalars);
+        let row = table.row(ROWS - 1);
+        // prefix[g] = 0〜g 番目の組の Z の積（レーンごと）
+        let mut prefix: Vec<F> = Vec::with_capacity(N / 8);
+        for (g, (p, d)) in acc.iter_mut().zip(last.as_chunks::<8>().0).enumerate() {
+            add_niels::<F, false>(p, &gather(row, d));
+            prefix.push(match g {
+                0 => p.z,
+                _ => prefix[g - 1].mul(&p.z),
+            });
+        }
+        let mut inv = invert(&prefix[N / 8 - 1]);
+        for g in (0..N / 8).rev() {
+            let p = &acc[g];
+            let zinv = match g {
+                0 => inv,
+                _ => inv.mul(&prefix[g - 1]),
+            };
+            if g > 0 {
+                inv = inv.mul(&p.z);
+            }
+            let (y, x, zi) = (p.y.mul(&zinv).lanes(), p.x.lanes(), zinv.lanes());
+            for k in 0..8 {
+                ys[8 * g + k] = y[k].to_bytes();
+                xs[8 * g + k] = x[k];
+                zinvs[8 * g + k] = zi[k];
+            }
+        }
+    }
+}
+
+/// 1/a = a^(p-2)（レーンごと。field.rs の invert と同じ加算連鎖で、2乗は乗算でする）
+#[inline(always)]
+unsafe fn invert<F: Field8>(a: &F) -> F {
+    unsafe {
+        let sq = |x: &F| x.mul(x);
+        let pow2k = |x: &F, k: usize| (0..k).fold(*x, |x, _| sq(&x));
+        let a2 = sq(a);
+        let a9 = sq(&sq(&a2)).mul(a);
+        let a11 = a9.mul(&a2);
+        let a_5_0 = sq(&a11).mul(&a9);
+        let a_10_0 = pow2k(&a_5_0, 5).mul(&a_5_0);
+        let a_20_0 = pow2k(&a_10_0, 10).mul(&a_10_0);
+        let a_40_0 = pow2k(&a_20_0, 20).mul(&a_20_0);
+        let a_50_0 = pow2k(&a_40_0, 10).mul(&a_10_0);
+        let a_100_0 = pow2k(&a_50_0, 50).mul(&a_50_0);
+        let a_200_0 = pow2k(&a_100_0, 100).mul(&a_100_0);
+        let a_250_0 = pow2k(&a_200_0, 50).mul(&a_50_0);
+        pow2k(&a_250_0, 5).mul(&a11)
     }
 }
 
@@ -353,26 +435,29 @@ mod tests {
             .to_bytes()
     }
 
-    /// 桁が 0（表の0列目 = 単位元を足す）・負（符号の反転）・最大・最小になりやすいスカラー
+    /// 桁が 0（m = 0）・負（符号の反転）・最大・最小になりやすいスカラー（どれもクランプ済み）
     const SPECIAL: [[u8; 32]; 5] = {
         let mut s = [[0u8; 32]; 5];
-        s[0][31] = 0x40; // 2^254: 途中の桁がすべて 0
-        // s[1] = 0: すべての桁が 0
         let mut i = 0;
         while i < 32 {
-            s[2][i] = 0xff; // 全桁で繰り上がる（最上位バイトは下で 2^255 未満に）
+            s[2][i] = 0xff; // 全桁で繰り上がる
             s[3][i] = 0x88; // 桁が正・負に入り混じる
             s[4][i] = 0x77;
             i += 1;
         }
-        s[2][31] = 0x7f;
-        s[3][31] = 0x08;
+        // s[0] = 2^254（m = 0 で、桁がすべて 0）、s[1] = 2^254 + 8（m = 1）
+        s[1][0] = 8;
+        let mut k = 0;
+        while k < 5 {
+            s[k][0] &= 0xf8;
+            s[k][31] = s[k][31] & 0x3f | 0x40;
+            k += 1;
+        }
         s
     };
 
-    /// スカラーの組（`clamp` ならクランプ、そうでなければ 2^255 未満の任意の値）に、[`SPECIAL`] を
-    /// 確率 1/4 で混ぜる
-    fn scalars<const N: usize>(clamp: bool) -> impl Strategy<Value = [[u8; 32]; N]> {
+    /// クランプしたスカラーの組に、[`SPECIAL`] を確率 1/4 で混ぜる
+    fn scalars<const N: usize>() -> impl Strategy<Value = [[u8; 32]; N]> {
         (
             vec(any::<[u8; 32]>(), N),
             vec(weighted(0.25, 0..SPECIAL.len()), N),
@@ -380,12 +465,7 @@ mod tests {
             .prop_map(move |(random, pick)| {
                 from_fn(|k| match pick[k] {
                     Some(i) => SPECIAL[i],
-                    None if clamp => clamp_integer(random[k]),
-                    None => {
-                        let mut s = random[k];
-                        s[31] &= 0x7f;
-                        s
-                    }
+                    None => clamp_integer(random[k]),
                 })
             })
     }
@@ -460,11 +540,10 @@ mod tests {
     #[rstest]
     fn mul_base_batch_matches_dalek(
         #[values(Path::F, Path::Ifma)] path: Path,
-        #[values(true, false)] clamp: bool,
         #[values(8, 16, 256)] n: usize,
     ) {
-        fn run<const N: usize>(path: Path, clamp: bool, cases: u32) {
-            check(cases, scalars::<N>(clamp), |s| {
+        fn run<const N: usize>(path: Path, cases: u32) {
+            check(cases, scalars::<N>(), |s| {
                 let Some(out) = mul_base(path, &s) else {
                     return Ok(());
                 };
@@ -475,9 +554,9 @@ mod tests {
             });
         }
         match n {
-            8 => run::<8>(path, clamp, 64),
-            16 => run::<16>(path, clamp, 32),
-            _ => run::<256>(path, clamp, 2),
+            8 => run::<8>(path, 64),
+            16 => run::<16>(path, 32),
+            _ => run::<256>(path, 2),
         }
     }
 

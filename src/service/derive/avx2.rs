@@ -398,6 +398,26 @@ impl Table4 {
         scalars: &[[u8; 32]; N],
         out: &mut [Extended; N],
     ) {
+        for (p, o) in self
+            .points_avx2(scalars)
+            .iter()
+            .zip(out.as_chunks_mut::<4>().0)
+        {
+            let (x, y, z) = (lanes(&p.x), lanes(&p.y), lanes(&p.z));
+            for k in 0..4 {
+                o[k] = Extended {
+                    x: x[k],
+                    y: y[k],
+                    z: z[k],
+                    t: Fe::ZERO,
+                };
+            }
+        }
+    }
+
+    /// 4鍵ずつの組の点（最後の加算まで。T は計算しない）
+    #[target_feature(enable = "avx2")]
+    fn points_avx2<const N: usize>(&self, scalars: &[[u8; 32]; N]) -> Vec<Ext4> {
         const { assert!(N.is_multiple_of(4)) };
         // digits[i][k] = k 番目の鍵の i 桁目
         let mut digits = [[0i16; N]; ROWS];
@@ -437,24 +457,11 @@ impl Table4 {
             }
             let row = self.row(ROWS - 1);
             let last = digits[ROWS - 1].as_chunks::<4>().0;
-            for (g, ((a, d), o)) in acc
-                .iter()
-                .zip(last)
-                .zip(out.as_chunks_mut::<4>().0)
-                .enumerate()
-            {
+            for (g, (a, d)) in acc.iter_mut().zip(last).enumerate() {
                 prefetch_next(ROWS - 1, g);
-                let p = add_niels::<false>(a, &gather(row, d));
-                let (x, y, z) = (lanes(&p.x), lanes(&p.y), lanes(&p.z));
-                for k in 0..4 {
-                    o[k] = Extended {
-                        x: x[k],
-                        y: y[k],
-                        z: z[k],
-                        t: Fe::ZERO,
-                    };
-                }
+                *a = add_niels::<false>(a, &gather(row, d));
             }
+            acc
         }
     }
 }
@@ -685,25 +692,19 @@ mod tests {
     }
 
     /// 8鍵（4レーン × 2組）をまとめて倍算すると、どの位置の鍵も curve25519-dalek と一致する。
-    /// 桁が 0（表の0列目 = 単位元を足す）・負（符号の反転）・最大の鍵を混ぜる
+    /// 桁が 0（m = 0）・負（符号の反転）・最大の鍵を混ぜる（どれもクランプ済み）
     #[rstest]
-    #[case::clamped(true)]
-    #[case::below_2_255(false)]
-    fn mul_base_batch_matches_dalek(#[case] clamp: bool, avx2: Option<Avx2>) {
+    fn mul_base_batch_matches_dalek(avx2: Option<Avx2>) {
         let Some(avx2) = avx2 else { return };
         let special = [
             {
                 let mut s = [0u8; 32];
-                s[31] = 0x40; // 2^254: 途中の桁がすべて 0
+                s[31] = 0x40; // 2^254: m = 0 で、桁がすべて 0
                 s
             },
-            [0u8; 32],
-            clamp_integer([0xff; 32]),
-            {
-                let mut s = [0xffu8; 32]; // 全桁で繰り上がる
-                s[31] = 0x7f;
-                s
-            },
+            clamp_integer([0xff; 32]), // 全桁で繰り上がる
+            clamp_integer([0x88; 32]), // 桁が正・負に入り混じる
+            clamp_integer([0x77; 32]),
         ];
         let strategy = (
             vec(any::<[u8; 32]>(), 8),
@@ -712,12 +713,7 @@ mod tests {
         check(64, strategy, |(random, pick)| {
             let s: [[u8; 32]; 8] = from_fn(|k| match pick[k] {
                 Some(i) => special[i],
-                None if clamp => clamp_integer(random[k]),
-                None => {
-                    let mut s = random[k];
-                    s[31] &= 0x7f;
-                    s
-                }
+                None => clamp_integer(random[k]),
             });
             let mut out = [Extended::IDENTITY; 8];
             Table4::get(avx2).mul_base_batch(avx2, &s, &mut out);

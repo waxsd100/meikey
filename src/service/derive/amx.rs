@@ -620,13 +620,13 @@ mod tests {
         fn run<const N: usize>(amx: Amx, cases: u32) {
             check(cases, vec(any::<[u8; 32]>(), N), |random| {
                 let scalars: [[u8; 32]; N] = from_fn(|k| match k % 4 {
-                    // 2^254（途中の桁がすべて 0）と、桁が正負に入り混じる値も混ぜる
+                    // 2^254（m = 0 で、桁がすべて 0）と、桁が正負に入り混じる値も混ぜる
                     1 => {
                         let mut s = [0u8; 32];
                         s[31] = 0x40;
                         s
                     }
-                    2 => [0x88; 32].map(|b| b & 0x7f),
+                    2 => clamp_integer([0x88; 32]),
                     _ => clamp_integer(random[k]),
                 });
                 let mut out = [Extended::IDENTITY; N];

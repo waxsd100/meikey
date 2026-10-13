@@ -12,6 +12,9 @@ use crate::model::search::{SearchConfig, Stats};
 use crate::repository::key_file::{KeyFiles, KeyRepository, pub_path};
 use crate::service::search::{Parallel, Searcher};
 use clap::Parser;
+// --gpu-limbs の値（"10"・"8"）を数にする map のため
+#[cfg(feature = "cuda")]
+use clap::builder::TypedValueParser as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -22,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// ヘルプの文は言語ごとに [`HELP`] にあり、[`command`] で付ける（ここのフィールドには書かない）
 #[derive(Parser)]
 #[command(name = "meikey", version)]
-// --gpu-width・--gpu-batch は GPU で探すとき（--gpu か --both）だけ付けられる
+// --gpu-width・--gpu-batch・--gpu-limbs は GPU で探すとき（--gpu か --both）だけ付けられる
 #[cfg_attr(
     feature = "cuda",
     command(group(clap::ArgGroup::new("gpu_device").args(["gpu", "both"])))
@@ -89,6 +92,16 @@ struct Cli {
         requires = "gpu_device"
     )]
     gpu_batch: Option<u32>,
+
+    #[cfg(feature = "cuda")]
+    #[arg(
+        long,
+        value_name = "L",
+        value_parser = clap::builder::PossibleValuesParser::new(["10", "8"])
+            .map(|s| s.parse::<u32>().expect("10 か 8")),
+        requires = "gpu_device"
+    )]
+    gpu_limbs: Option<u32>,
 }
 
 /// コマンドの説明（日本語・英語）
@@ -187,18 +200,25 @@ const HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "gpu_width",
-        "GPU の表の幅 W（2〜16）。大きいほど点の足し算が減り、表は大きくなる（12 で約 5.8 MB、16 で約 67 MB）。\
-         --gpu-width・--gpu-batch を付けなければ、探す前にこの GPU で測って一番速い組み合わせを使う。\
-         幅 12・14・16 と 16・32 鍵の組み合わせ以外は、起動時に NVRTC でカーネルをコンパイルする",
+        "GPU の表の幅 W（2〜16）。大きいほど点の足し算が減り、表は大きくなる（12 で約 4.1 MB、16 で約 50 MB）。\
+         --gpu-width・--gpu-batch・--gpu-limbs を付けなければ、探す前にこの GPU で測って一番速い組み合わせを使う。\
+         幅 12・14・16、32・64 鍵、10・8 リムの組み合わせ以外は、起動時に NVRTC でカーネルをコンパイルする",
         "Width W of the GPU table (2-16). Larger widths need fewer point additions and a bigger \
-         table (about 5.8 MB at 12, about 67 MB at 16). Without --gpu-width and --gpu-batch, the \
-         fastest combination is measured on this GPU before searching. Combinations other than \
-         widths 12, 14, 16 with 16 or 32 keys are compiled with NVRTC at startup",
+         table (about 4.1 MB at 12, about 50 MB at 16). Without --gpu-width, --gpu-batch and \
+         --gpu-limbs, the fastest combination is measured on this GPU before searching. Combinations \
+         other than widths 12, 14, 16 with 32 or 64 keys and 10 or 8 limbs are compiled with NVRTC \
+         at startup",
     ),
     (
         "gpu_batch",
         "GPU の1スレッドが、逆元を1回にまとめて計算する鍵の数（1〜64）",
         "Number of keys per GPU thread whose inverses are computed together (1-64)",
+    ),
+    (
+        "gpu_limbs",
+        "GPU の体演算のリムの数（10 = 25.5 ビット × 10、8 = 32 ビット × 8）。速いほうは GPU で違う",
+        "Number of limbs in the GPU field arithmetic (10 = 25.5 bits x 10, 8 = 32 bits x 8). \
+         Which is faster depends on the GPU",
     ),
 ];
 
@@ -450,19 +470,20 @@ fn gpu(cli: &Cli) -> Result<crate::service::gpu::Gpu, CliError> {
     Ok(Gpu::new(0, setting, notify)?)
 }
 
-/// GPU の設定の決め方: --gpu-width・--gpu-batch のどちらかがあればそれ（無いほうは既定）、
+/// GPU の設定の決め方: --gpu-width・--gpu-batch・--gpu-limbs のどれかがあればそれ（無いものは既定）、
 /// --check は測らずに既定、それ以外はこの GPU で測って一番速いもの
 #[cfg(feature = "cuda")]
 fn gpu_options(cli: &Cli) -> crate::service::gpu::GpuSetting {
     use crate::service::gpu::{GpuOptions, GpuSetting};
     let default = GpuOptions::default();
-    match (cli.gpu_width, cli.gpu_batch) {
-        (None, None) if cli.check => GpuSetting::Default,
-        (None, None) => GpuSetting::Fastest,
-        (width, batch) => GpuSetting::Fixed(GpuOptions {
-            width: width.unwrap_or(default.width),
-            batch: batch.unwrap_or(default.batch),
-        }),
+    match (cli.gpu_width, cli.gpu_batch, cli.gpu_limbs) {
+        (None, None, None) if cli.check => GpuSetting::Default,
+        (None, None, None) => GpuSetting::Fastest,
+        (width, batch, limbs) => GpuSetting::Fixed(GpuOptions::new(
+            width.unwrap_or(default.width),
+            batch.unwrap_or(default.batch),
+            limbs.unwrap_or(default.limbs),
+        )),
     }
 }
 
@@ -1114,17 +1135,19 @@ mod tests {
         assert_eq!(parsed.ok().map(|c| device(&c)), want);
     }
 
-    /// GPU の設定: 何も付けなければ測って一番速いもの、--check なら測らずに既定、--gpu-width・--gpu-batch は
-    /// 範囲内の値だけ受け付けてそのまま使う（片方だけなら、もう片方は既定）
+    /// GPU の設定: 何も付けなければ測って一番速いもの、--check なら測らずに既定、--gpu-width・--gpu-batch・
+    /// --gpu-limbs は範囲内の値だけ受け付けてそのまま使う（付けなかったものは既定）
     #[cfg(feature = "cuda")]
     #[rstest]
     #[case::fastest(&[], Some(GpuSetting::Fastest))]
     #[case::check(&["--check"], Some(GpuSetting::Default))]
-    #[case::both(&["--gpu-width", "16", "--gpu-batch", "32"], Some(GpuSetting::Fixed(GpuOptions::new(16, 32))))]
-    #[case::width_only(&["--gpu-width", "14"], Some(GpuSetting::Fixed(GpuOptions::new(14, 16))))]
-    #[case::batch_only(&["--gpu-batch", "64"], Some(GpuSetting::Fixed(GpuOptions::new(12, 64))))]
-    #[case::check_with_width(&["--check", "--gpu-width", "16"], Some(GpuSetting::Fixed(GpuOptions::new(16, 16))))]
-    #[case::smallest(&["--gpu-width", "2", "--gpu-batch", "1"], Some(GpuSetting::Fixed(GpuOptions::new(2, 1))))]
+    #[case::all(&["--gpu-width", "16", "--gpu-batch", "64", "--gpu-limbs", "8"], Some(GpuSetting::Fixed(GpuOptions::new(16, 64, 8))))]
+    #[case::width_only(&["--gpu-width", "14"], Some(GpuSetting::Fixed(GpuOptions::new(14, 32, 10))))]
+    #[case::batch_only(&["--gpu-batch", "64"], Some(GpuSetting::Fixed(GpuOptions::new(12, 64, 10))))]
+    #[case::limbs_only(&["--gpu-limbs", "8"], Some(GpuSetting::Fixed(GpuOptions::new(12, 32, 8))))]
+    #[case::check_with_width(&["--check", "--gpu-width", "16"], Some(GpuSetting::Fixed(GpuOptions::new(16, 32, 10))))]
+    #[case::smallest(&["--gpu-width", "2", "--gpu-batch", "1"], Some(GpuSetting::Fixed(GpuOptions::new(2, 1, 10))))]
+    #[case::limbs_other(&["--gpu-limbs", "9"], None)]
     #[case::width_too_large(&["--gpu-width", "17"], None)]
     #[case::width_too_small(&["--gpu-width", "1"], None)]
     #[case::batch_zero(&["--gpu-batch", "0"], None)]
@@ -1145,6 +1168,8 @@ mod tests {
     #[case::batch_without_gpu(&["--gpu-batch", "32"], false)]
     #[case::width_with_gpu(&["--gpu", "--gpu-width", "16"], true)]
     #[case::batch_with_both(&["--both", "--gpu-batch", "32"], true)]
+    #[case::limbs_without_gpu(&["--gpu-limbs", "8"], false)]
+    #[case::limbs_with_gpu(&["--gpu", "--gpu-limbs", "8"], true)]
     #[case::check_width_without_gpu(&["--check", "--gpu-width", "16"], false)]
     fn gpu_flag_combinations(#[case] options: &[&str], #[case] accepted: bool) {
         let parsed = Cli::try_parse_from(["meikey", "abc"].iter().chain(options));
@@ -1262,7 +1287,7 @@ mod tests {
         }
         for &(id, _, _) in HELP {
             let known = cmd.get_arguments().any(|a| a.get_id() == id);
-            let gpu_only = matches!(id, "gpu" | "both" | "gpu_width" | "gpu_batch");
+            let gpu_only = matches!(id, "gpu" | "both" | "gpu_width" | "gpu_batch" | "gpu_limbs");
             assert_eq!(
                 known || (gpu_only && !cfg!(feature = "cuda")),
                 true,

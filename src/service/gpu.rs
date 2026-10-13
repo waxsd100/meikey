@@ -2,18 +2,22 @@
 //!
 //! シードの生成から文字列の判定までを GPU のカーネル（`gpu/kernel.cu`）で行い、CPU は起動と結果の確認だけをする。
 //!
-//! - カーネルの設定（表の幅 W と、逆元をまとめる鍵の数。[`GpuOptions`]）ごとに、compute_75（Turing）向けの
+//! - カーネルの設定（表の幅 W、逆元をまとめる鍵の数、体演算のリムの数。[`GpuOptions`]）ごとに、compute_75（Turing）向けの
 //!   PTX（`gpu/ptx/`）を埋め込んでおく（[`EMBEDDED`]）。起動時にドライバがその GPU 向けに変換する
 //!   （変換結果はドライバがキャッシュするので2回目からは速い）。要るのは NVIDIA のドライバ（libcuda / nvcuda.dll）
 //!   だけで、CUDA Toolkit は要らない。PTX は `cargo make ptx` で kernel.cu から作る
 //! - 速い設定は GPU によって違うので、探す前に埋め込んだ設定を全部この GPU で短く測り、一番速いものを使う
-//!   （[`GpuSetting::Fastest`]）。`--gpu-width`・`--gpu-batch` で決めることもでき、埋め込んでいない設定や、
+//!   （[`GpuSetting::Fastest`]）。`--gpu-width`・`--gpu-batch`・`--gpu-limbs` で決めることもでき、埋め込んでいない設定や、
 //!   ドライバが古くて PTX を読めないときは、NVRTC（libnvrtc）があればその GPU 向けにコンパイルする
+//! - 読み込んだカーネルは、まず少しの鍵を計算させて CPU（ed25519-dalek）と比べ、合わなければその設定は使わない
+//!   （[`GpuError::SelfCheck`]。測って選ぶときは飛ばして、状態の表示に出す）
 //! - CUDA のライブラリは実行時に読み込むので、ビルドに CUDA は要らない
-//! - シードは `ChaCha20(鍵 = 起動ごとの乱数, ブロック番号 = 鍵の通し番号)` の先頭 32 バイト。
+//! - シードは `ChaCha20(鍵 = 起動ごとの乱数, ブロック番号 = 鍵の通し番号 / 2)` の 64 バイトの、通し番号が
+//!   偶数なら前半・奇数なら後半の 32 バイト（1 ブロックで 2 本ぶん）。
 //!   当たりは通し番号だけを受け取り、CPU で同じシードを作り直して ed25519-dalek で計算し、
 //!   文字列が本当に含まれるかを確かめてから返す（CPU 版と同じく、GPU の計算にバグがあっても誤った鍵は返さない）
-//! - 櫛形テーブル（comb.rs と同じ作り方、幅 W）は CPU で作って 25.5 ビット × 10 リムにして GPU に送る
+//! - 櫛形テーブル（comb.rs と同じ作り方、幅 W）は CPU で作り、各値を 32 ビット × 8 語に詰めて GPU に送る
+//!   （1 エントリ 96 バイト。カーネルが読むときに体演算の形に戻す）
 //! - 1回の起動（カーネル）が `TARGET_LAUNCH`（0.2 秒）前後で終わるように、1スレッドの繰り返し回数を測りながら調整する。
 //!   画面をつないだ GPU（Windows のタイムアウト検出の対象）では、画面が固まらないよう `DISPLAY_LAUNCH`（0.05 秒）にする
 
@@ -21,9 +25,8 @@ use crate::lang::{t, tf};
 use crate::model::key::VanityKey;
 use crate::model::search::{Outcome, SearchConfig, Stats};
 use crate::service::derive::comb::{entries_with_width, rows_cols};
+use crate::service::derive::field::Fe;
 use crate::service::search::{Progress, Searcher};
-#[cfg(test)]
-use cudarc::driver::CudaModule;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
     sys::CUdevice_attribute,
@@ -45,7 +48,13 @@ pub const PTX_ARCH: &str = "compute_75";
 pub const DEFAULT_WIDTH: u32 = 12;
 
 /// 1スレッドが1回にまとめて計算する鍵の数（逆元をまとめる数）の既定（`--check` のように測らないとき）
-pub const DEFAULT_BATCH: u32 = 16;
+pub const DEFAULT_BATCH: u32 = 32;
+
+/// 体演算のリムの数の既定（`--check` のように測らないとき）
+pub const DEFAULT_LIMBS: u32 = 10;
+
+/// 選べる体演算のリムの数（kernel.cu の MEIKEY_LIMBS。10 = 25.5 ビット × 10、8 = 32 ビット × 8）
+pub const LIMBS: [u32; 2] = [10, 8];
 
 /// 選べる表の幅 W（kernel.cu の MEIKEY_W の範囲）
 pub const WIDTHS: std::ops::RangeInclusive<u32> = 2..=16;
@@ -56,24 +65,33 @@ pub const BATCHES: std::ops::RangeInclusive<u32> = 1..=64;
 /// GPU のカーネルの設定
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuOptions {
-    /// 表の幅 W（大きいほど点の足し算が減り、表は大きくなる。W = 12 で約 5.8 MB、16 で約 67 MB）
+    /// 表の幅 W（大きいほど点の足し算が減り、表は大きくなる。W = 12 で約 4.1 MB、16 で約 50 MB）
     pub width: u32,
     /// 1スレッドが1回にまとめて計算する鍵の数（大きいほど逆元の分担が減り、1スレッドが使うメモリは増える）
     pub batch: u32,
+    /// 体演算のリムの数（10 = 25.5 ビット × 10 リムを 64 ビットの積和で、8 = 32 ビット × 8 リムを桁上がりつきの
+    /// 命令で。どちらが速いかは GPU で違う）
+    pub limbs: u32,
 }
 
 impl Default for GpuOptions {
     fn default() -> Self {
-        GpuOptions {
-            width: DEFAULT_WIDTH,
-            batch: DEFAULT_BATCH,
-        }
+        GpuOptions::new(DEFAULT_WIDTH, DEFAULT_BATCH, DEFAULT_LIMBS)
     }
 }
 
 impl GpuOptions {
-    pub const fn new(width: u32, batch: u32) -> Self {
-        GpuOptions { width, batch }
+    pub const fn new(width: u32, batch: u32, limbs: u32) -> Self {
+        GpuOptions {
+            width,
+            batch,
+            limbs,
+        }
+    }
+
+    /// kernel.cu が受け付ける設定か
+    fn in_range(&self) -> bool {
+        WIDTHS.contains(&self.width) && BATCHES.contains(&self.batch) && LIMBS.contains(&self.limbs)
     }
 
     /// 表の大きさ（バイト）
@@ -84,40 +102,54 @@ impl GpuOptions {
 
     /// 埋め込む PTX のファイル名（`gpu/ptx/` の中）
     pub fn ptx_file(&self) -> String {
-        format!("w{}_b{}.ptx", self.width, self.batch)
+        format!("w{}_b{}_l{}.ptx", self.width, self.batch, self.limbs)
     }
 }
 
 impl fmt::Display for GpuOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&tf!(
-            "W = {}・{} 鍵",
-            "W = {}, {} keys",
+            "W = {}・{} 鍵・{} リム",
+            "W = {}, {} keys, {} limbs",
             self.width,
-            self.batch
+            self.batch,
+            self.limbs
         ))
     }
 }
 
-/// PTX を埋め込んで、探す前に測る設定（表の幅 12・14・16 × まとめる鍵の数 16・32）
-pub const EMBEDDED: [GpuOptions; 6] = [
-    GpuOptions::new(12, 16),
-    GpuOptions::new(12, 32),
-    GpuOptions::new(14, 16),
-    GpuOptions::new(14, 32),
-    GpuOptions::new(16, 16),
-    GpuOptions::new(16, 32),
+/// PTX を埋め込んで、探す前に測る設定（表の幅 12・14・16 × まとめる鍵の数 32・64 × リムの数 10・8）。
+/// 先頭は既定の設定（build.rs の VARIANTS も同じ並び）
+pub const EMBEDDED: [GpuOptions; 12] = [
+    GpuOptions::new(12, 32, 10),
+    GpuOptions::new(12, 32, 8),
+    GpuOptions::new(12, 64, 10),
+    GpuOptions::new(12, 64, 8),
+    GpuOptions::new(14, 32, 10),
+    GpuOptions::new(14, 32, 8),
+    GpuOptions::new(14, 64, 10),
+    GpuOptions::new(14, 64, 8),
+    GpuOptions::new(16, 32, 10),
+    GpuOptions::new(16, 32, 8),
+    GpuOptions::new(16, 64, 10),
+    GpuOptions::new(16, 64, 8),
 ];
 
 /// [`EMBEDDED`] の設定で kernel.cu を compute_75 向けにコンパイルした PTX（`cargo make ptx` で作る）。
 /// 1行目に kernel.cu と設定のハッシュ（[`kernel_hash`]）を書いておき、ソースと食い違っていないかをテストで確かめる
-const PTXS: [&str; 6] = [
-    include_str!("gpu/ptx/w12_b16.ptx"),
-    include_str!("gpu/ptx/w12_b32.ptx"),
-    include_str!("gpu/ptx/w14_b16.ptx"),
-    include_str!("gpu/ptx/w14_b32.ptx"),
-    include_str!("gpu/ptx/w16_b16.ptx"),
-    include_str!("gpu/ptx/w16_b32.ptx"),
+const PTXS: [&str; 12] = [
+    include_str!("gpu/ptx/w12_b32_l10.ptx"),
+    include_str!("gpu/ptx/w12_b32_l8.ptx"),
+    include_str!("gpu/ptx/w12_b64_l10.ptx"),
+    include_str!("gpu/ptx/w12_b64_l8.ptx"),
+    include_str!("gpu/ptx/w14_b32_l10.ptx"),
+    include_str!("gpu/ptx/w14_b32_l8.ptx"),
+    include_str!("gpu/ptx/w14_b64_l10.ptx"),
+    include_str!("gpu/ptx/w14_b64_l8.ptx"),
+    include_str!("gpu/ptx/w16_b32_l10.ptx"),
+    include_str!("gpu/ptx/w16_b32_l8.ptx"),
+    include_str!("gpu/ptx/w16_b64_l10.ptx"),
+    include_str!("gpu/ptx/w16_b64_l8.ptx"),
 ];
 
 /// 設定 `options` の埋め込んだ PTX（埋め込んでいない設定なら None）
@@ -139,14 +171,20 @@ pub enum GpuSetting {
 /// 設定をどう決めたか（表示用）
 #[derive(Debug, Clone)]
 enum Chosen {
-    /// 測って一番速かった。測った設定と速度（鍵/秒）
-    Fastest(Vec<(GpuOptions, f64)>),
+    /// 測って一番速かった。測った設定と速度（鍵/秒）と、計算が CPU と合わなかったので使わなかった設定
+    Fastest {
+        results: Vec<(GpuOptions, f64)>,
+        rejected: Vec<GpuOptions>,
+    },
     Fixed,
     Default,
 }
 
 /// 1ブロックのスレッド数
 const BLOCK: u32 = 128;
+
+/// 読み込んだカーネルを確かめるときのスレッド数（[`Kernel::self_check`]）
+const SELF_CHECK_THREADS: u32 = 32;
 
 /// 1回の起動にかける時間の目安（長いほど起動の手間は減るが、当たりや時間切れに気づくのが遅れる）
 const TARGET_LAUNCH: Duration = Duration::from_millis(200);
@@ -162,8 +200,8 @@ const MEASURE_LAUNCHES: u32 = 3;
 /// 設定を測るときに探す文字列（判定の分も測るため。当たっても止まらない）
 const MEASURE_NEEDLE: &[u8] = b"meikey";
 
-/// 表の1エントリの語数（y+x, y-x, 2dxy の 10 リムずつと未使用の 2 語。kernel.cu の ENTRY_WORDS）
-const ENTRY_WORDS: usize = 32;
+/// 表の1エントリの語数（y+x, y-x, 2dxy を 32 ビット × 8 語ずつ。kernel.cu の ENTRY_WORDS）
+const ENTRY_WORDS: usize = 24;
 
 /// GPU を使えないときのエラー
 #[derive(Debug, thiserror::Error)]
@@ -177,10 +215,10 @@ pub enum GpuError {
     /// NVRTC（libnvrtc）が無い（埋め込む PTX を作るとき）
     #[error("{}", t!("libnvrtc が見つからない", "libnvrtc not found"))]
     NvrtcNotFound,
-    /// 表の幅・まとめる鍵の数が範囲の外
+    /// 表の幅・まとめる鍵の数・リムの数が範囲の外
     #[error("{}", tf!(
-        "表の幅は {}〜{}、まとめる鍵の数は {}〜{}（{}）",
-        "the table width must be {}-{} and the keys per batch {}-{} ({})",
+        "表の幅は {}〜{}、まとめる鍵の数は {}〜{}、リムの数は 10 か 8（{}）",
+        "the table width must be {}-{}, the keys per batch {}-{} and the limbs 10 or 8 ({})",
         WIDTHS.start(),
         WIDTHS.end(),
         BATCHES.start(),
@@ -188,6 +226,13 @@ pub enum GpuError {
         .0
     ))]
     OutOfRange(GpuOptions),
+    /// 読み込んだカーネルで計算した公開鍵が、CPU（ed25519-dalek）で計算したものと合わない
+    #[error("{}", tf!(
+        "{} の GPU の計算が CPU と合わない（この設定は使えない）",
+        "the GPU results of {} differ from the CPU (this setting cannot be used)",
+        .0
+    ))]
+    SelfCheck(GpuOptions),
     /// 埋め込んだ PTX をドライバが読めず（ドライバが古い）、代わりにコンパイルする NVRTC も無い
     #[error("{}", tf!(
         "PTX を読めない（{}。ドライバを更新するか、NVRTC を入れて LD_LIBRARY_PATH / PATH に追加）",
@@ -241,10 +286,9 @@ impl fmt::Display for GpuInfo {
 
 /// 1つの設定で読み込んだカーネルと、GPU に送った表
 struct Kernel {
-    /// テストで別のカーネル（meikey_derive）を読むため
-    #[cfg(test)]
-    module: Arc<CudaModule>,
     func: CudaFunction,
+    /// 公開鍵を計算して書き出すだけのカーネル（読み込んだときの確認と、テスト用）
+    derive: CudaFunction,
     table: CudaSlice<u32>,
     options: GpuOptions,
     /// 起動するブロック数
@@ -271,7 +315,7 @@ impl Kernel {
         info: &GpuInfo,
         options: GpuOptions,
     ) -> Result<Kernel, GpuError> {
-        if !WIDTHS.contains(&options.width) || !BATCHES.contains(&options.batch) {
+        if !options.in_range() {
             return Err(GpuError::OutOfRange(options));
         }
         let embedded =
@@ -291,20 +335,66 @@ impl Kernel {
             }
         };
         let func = module.load_function("meikey_search")?;
+        let derive = module.load_function("meikey_derive")?;
         // SM あたりに同時に載るブロック数（レジスタの使用量で決まる）の分だけ起動する
         let per_sm = func
             .occupancy_max_active_blocks_per_multiprocessor(BLOCK, 0, None)
             .unwrap_or(2)
             .max(1);
         let table = stream.clone_htod(&table_words(options.width))?;
-        Ok(Kernel {
-            #[cfg(test)]
-            module,
+        let kernel = Kernel {
             func,
+            derive,
             table,
             options,
             grid: info.sms.max(1) * per_sm,
-        })
+        };
+        kernel.self_check(stream)?;
+        Ok(kernel)
+    }
+
+    /// 1 ブロック分（[`SELF_CHECK_THREADS`] スレッド）の公開鍵を GPU で計算し、そのうち先頭と最後のスレッドの全部と、
+    /// ほかのスレッドの1本目を CPU（ed25519-dalek）で計算し直して比べる。合わなければ使えない設定
+    /// （通し番号は奇数から始めて、シードを ChaCha20 のブロックの後半から取る場合も通す）
+    fn self_check(&self, stream: &Arc<CudaStream>) -> Result<(), GpuError> {
+        let key: [u8; 32] = rand::random();
+        let first = (rand::random::<u64>() >> 8) | 1;
+        let batch = self.options.batch as usize;
+        let keys = SELF_CHECK_THREADS as usize * batch;
+        let got = self.derive_on_gpu(stream, &key, first, 1, SELF_CHECK_THREADS)?;
+        let checked =
+            (0..keys).filter(|i| i % batch == 0 || i / batch == 0 || i / batch == keys / batch - 1);
+        for i in checked {
+            let want = VanityKey::from_seed(seed(&key, first + i as u64));
+            if &got.as_chunks::<32>().0[i] != want.public_bytes() {
+                return Err(GpuError::SelfCheck(self.options));
+            }
+        }
+        Ok(())
+    }
+
+    /// meikey_derive で、通し番号 `first` から `blocks` × `threads` スレッド分の公開鍵を計算する
+    fn derive_on_gpu(
+        &self,
+        stream: &Arc<CudaStream>,
+        key: &[u8; 32],
+        first: u64,
+        blocks: u32,
+        threads: u32,
+    ) -> Result<Vec<u8>, GpuError> {
+        let n = (blocks * threads) as usize * self.options.batch as usize;
+        let key_dev = stream.clone_htod(&key_words(key))?;
+        let mut out = stream.alloc_zeros::<u8>(n * 32)?;
+        let mut b = stream.launch_builder(&self.derive);
+        b.arg(&self.table).arg(&key_dev).arg(&first).arg(&mut out);
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: 引数は kernel.cu の meikey_derive と同じ並びで、out は全スレッドの鍵の分ある
+        unsafe { b.launch(cfg)? };
+        Ok(stream.clone_dtoh(&out)?)
     }
 
     /// 1回の起動で計算する鍵の数（1スレッドの繰り返し1回あたり）
@@ -322,14 +412,8 @@ impl Kernel {
         fold: bool,
         stop_on_hit: bool,
     ) -> Result<Launch, GpuError> {
-        let key_words: Vec<u32> = key
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|w| u32::from_le_bytes(*w))
-            .collect();
         Ok(Launch {
-            key: stream.clone_htod(&key_words)?,
+            key: stream.clone_htod(&key_words(key))?,
             needle: stream.clone_htod(&[needle, &[0; 64]].concat())?,
             needle_len: needle.len() as u32,
             fold: u32::from(fold),
@@ -505,12 +589,19 @@ impl Gpu {
             ),
             GpuSetting::Fastest => {
                 on_measure();
+                let mut rejected = Vec::new();
                 let (kernel, results) = fastest(
                     &EMBEDDED,
-                    |options| Kernel::load(&ctx, &stream, &info, options),
+                    |options| {
+                        let k = Kernel::load(&ctx, &stream, &info, options);
+                        if let Err(GpuError::SelfCheck(o)) = &k {
+                            rejected.push(*o);
+                        }
+                        k
+                    },
                     |k| k.measure(&stream),
                 )?;
-                (kernel, Chosen::Fastest(results))
+                (kernel, Chosen::Fastest { results, rejected })
             }
         };
         Ok(Gpu {
@@ -621,7 +712,7 @@ impl Searcher for Gpu {
     fn status(&self, _config: &SearchConfig) -> Vec<(&'static str, String)> {
         let (i, k) = (&self.info, &self.kernel);
         let how = match &self.chosen {
-            Chosen::Fastest(results) => tf!(
+            Chosen::Fastest { results, .. } => tf!(
                 "{} 通りを測って一番速いもの",
                 "the fastest of {} measured",
                 results.len()
@@ -633,7 +724,7 @@ impl Searcher for Gpu {
             )
             .into(),
         };
-        vec![
+        let mut rows = vec![
             ("GPU", i.name.clone()),
             (
                 t!("世代", "Compute"),
@@ -668,17 +759,39 @@ impl Searcher for Gpu {
                     k.options.table_bytes() as f64 / 1e6
                 ),
             ),
-        ]
+        ];
+        // 計算が CPU と合わなかった設定（カーネルのバグか GPU の不具合。使わずに飛ばした）
+        if let Chosen::Fastest { rejected, .. } = &self.chosen
+            && !rejected.is_empty()
+        {
+            let list: Vec<String> = rejected.iter().map(|o| o.to_string()).collect();
+            rows.push((
+                t!("使えない設定", "Rejected"),
+                tf!(
+                    "{}（GPU の計算が CPU と合わない）",
+                    "{} (GPU results differ from the CPU)",
+                    list.join(t!("、", "; "))
+                ),
+            ));
+        }
+        rows
     }
 }
 
-/// 通し番号 `index` のシード（kernel.cu の chacha20_seed と同じ: ChaCha20 のブロック `index` の先頭 32 バイト）
+/// ChaCha20 の鍵を 32 ビットの語に（kernel.cu に渡す形）
+fn key_words(key: &[u8; 32]) -> [u32; 8] {
+    std::array::from_fn(|i| u32::from_le_bytes(*key[4 * i..].first_chunk().expect("32 バイト")))
+}
+
+/// 通し番号 `index` のシード（kernel.cu の chacha20_seed と同じ: ChaCha20 のブロック `index / 2` の 64 バイトの、
+/// `index` が偶数なら前半・奇数なら後半の 32 バイト）
 fn seed(key: &[u8; 32], index: u64) -> [u8; 32] {
     let mut rng = ChaCha20Rng::from_seed(*key);
-    rng.set_block_pos(index);
-    let mut s = [0u8; 32];
-    rng.fill_bytes(&mut s);
-    s
+    rng.set_block_pos(index >> 1);
+    let mut block = [0u8; 64];
+    rng.fill_bytes(&mut block);
+    let half = block.as_chunks::<32>().0;
+    half[(index & 1) as usize]
 }
 
 /// カーネルをこの GPU 向けにコンパイルする。NVRTC がその世代を知らなければ（GPU より NVRTC が古い）、
@@ -704,6 +817,7 @@ fn compile_for(arch: &str, options: GpuOptions) -> Result<cudarc::nvrtc::Ptx, Co
                 format!("--gpu-architecture={arch}"),
                 format!("-DMEIKEY_W={}", options.width),
                 format!("-DMEIKEY_BATCH={}", options.batch),
+                format!("-DMEIKEY_LIMBS={}", options.limbs),
             ],
             ..Default::default()
         },
@@ -715,8 +829,8 @@ pub fn kernel_hash(options: GpuOptions) -> String {
     use sha2::{Digest, Sha256};
     let source = KERNEL.replace('\r', "");
     let digest = Sha256::digest(format!(
-        "{source}\n// {PTX_ARCH} W={} BATCH={}",
-        options.width, options.batch
+        "{source}\n// {PTX_ARCH} W={} BATCH={} LIMBS={}",
+        options.width, options.batch, options.limbs
     ));
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -732,9 +846,10 @@ pub fn portable_ptx(options: GpuOptions) -> Result<String, GpuError> {
         .map_err(|e| GpuError::Compile(format!("{PTX_ARCH}: {}", compile_error(&e))))?;
     Ok(format!(
         // PTX は ASCII だけ（ptxas は ASCII 以外の文字を受け付けない）
-        "// meikey: sha256(kernel.cu, W={}, BATCH={}) = {} (regenerate: cargo make ptx)\n{}",
+        "// meikey: sha256(kernel.cu, W={}, BATCH={}, LIMBS={}) = {} (regenerate: cargo make ptx)\n{}",
         options.width,
         options.batch,
+        options.limbs,
         kernel_hash(options),
         ptx.to_src()
     ))
@@ -747,20 +862,28 @@ fn compile_error(e: &CompileError) -> String {
     }
 }
 
-/// 幅 `width` の表を GPU 用（1エントリ = 25.5 ビット × 10 リムを3つ + 未使用 2 語）に並べる
+/// 幅 `width` の表を GPU 用（1エントリ = y+x, y-x, 2dxy を 0 以上 p 未満にして 32 ビット × 8 語ずつ）に並べる。
+/// 1 行目の 3 つ目は 2dxy ではなく 2xy にする（最初の点を拡張座標にするとき、T = 2xy を掛け算なしで使う）
 fn table_words(width: u32) -> Vec<u32> {
+    let (_, cols) = rows_cols(width as usize);
     let entries = entries_with_width(width as usize);
+    let half = Fe([2, 0, 0, 0, 0]).invert();
     let mut words = vec![0u32; entries.len() * ENTRY_WORDS];
-    for (e, entry) in words
+    for (k, (e, mut entry)) in words
         .as_chunks_mut::<ENTRY_WORDS>()
         .0
         .iter_mut()
         .zip(entries)
+        .enumerate()
     {
+        if k < cols {
+            // (y+x)^2 - (y-x)^2 = 4xy なので、2xy = ((y+x)^2 - (y-x)^2) / 2
+            let [ypx, ymx, _] = entry;
+            entry[2] = (ypx * ypx - ymx * ymx) * half;
+        }
         for (f, fe) in entry.into_iter().enumerate() {
-            for (i, l) in fe.reduce().into_iter().enumerate() {
-                e[10 * f + 2 * i] = (l & ((1 << 26) - 1)) as u32;
-                e[10 * f + 2 * i + 1] = (l >> 26) as u32;
+            for (i, w) in fe.to_bytes().as_chunks::<4>().0.iter().enumerate() {
+                e[8 * f + i] = u32::from_le_bytes(*w);
             }
         }
     }
@@ -803,128 +926,15 @@ mod tests {
         fn meikey_test_fe_mul(a: *const u32, b: *const u32, out: *mut u32);
         fn meikey_test_fe_sq(a: *const u32, out: *mut u32);
         fn meikey_test_fe_invert_bytes(a: *const u32, out: *mut u8);
-        fn meikey_test_derive_batch(table: *const u32, key: *const u32, first: u64, out: *mut u8);
         fn meikey_test_contains(pk: *const u8, needle: *const u8, len: u32, fold: u32) -> i32;
+        fn meikey_test_contains_unsigned(
+            pk: *const u8,
+            needle: *const u8,
+            len: u32,
+            fold: u32,
+        ) -> i32;
         fn meikey_test_tail_b64(pk: *const u8, out: *mut u8);
-        fn meikey_test_search(
-            nthreads: u64,
-            table: *const u32,
-            key: *const u32,
-            needle: *const u8,
-            needle_len: u32,
-            fold: u32,
-            base: u64,
-            iters: u32,
-            stop_on_hit: u32,
-            result: *mut u64,
-        );
-        fn meikey_test_batch() -> u32;
-        fn meikey_test_width() -> u32;
-    }
-
-    // build.rs が埋め込む設定ごとにコンパイルした版（接頭辞 meikey_w<幅>_b<数>_test_。既定の設定は meikey_test_）
-    #[cfg(meikey_gpu_host)]
-    unsafe extern "C" {
-        fn meikey_w12_b32_test_derive_batch(
-            table: *const u32,
-            key: *const u32,
-            first: u64,
-            out: *mut u8,
-        );
-        fn meikey_w12_b32_test_search(
-            nthreads: u64,
-            table: *const u32,
-            key: *const u32,
-            needle: *const u8,
-            needle_len: u32,
-            fold: u32,
-            base: u64,
-            iters: u32,
-            stop_on_hit: u32,
-            result: *mut u64,
-        );
-        fn meikey_w12_b32_test_batch() -> u32;
-        fn meikey_w12_b32_test_width() -> u32;
-        fn meikey_w14_b16_test_derive_batch(
-            table: *const u32,
-            key: *const u32,
-            first: u64,
-            out: *mut u8,
-        );
-        fn meikey_w14_b16_test_search(
-            nthreads: u64,
-            table: *const u32,
-            key: *const u32,
-            needle: *const u8,
-            needle_len: u32,
-            fold: u32,
-            base: u64,
-            iters: u32,
-            stop_on_hit: u32,
-            result: *mut u64,
-        );
-        fn meikey_w14_b16_test_batch() -> u32;
-        fn meikey_w14_b16_test_width() -> u32;
-        fn meikey_w14_b32_test_derive_batch(
-            table: *const u32,
-            key: *const u32,
-            first: u64,
-            out: *mut u8,
-        );
-        fn meikey_w14_b32_test_search(
-            nthreads: u64,
-            table: *const u32,
-            key: *const u32,
-            needle: *const u8,
-            needle_len: u32,
-            fold: u32,
-            base: u64,
-            iters: u32,
-            stop_on_hit: u32,
-            result: *mut u64,
-        );
-        fn meikey_w14_b32_test_batch() -> u32;
-        fn meikey_w14_b32_test_width() -> u32;
-        fn meikey_w16_b16_test_derive_batch(
-            table: *const u32,
-            key: *const u32,
-            first: u64,
-            out: *mut u8,
-        );
-        fn meikey_w16_b16_test_search(
-            nthreads: u64,
-            table: *const u32,
-            key: *const u32,
-            needle: *const u8,
-            needle_len: u32,
-            fold: u32,
-            base: u64,
-            iters: u32,
-            stop_on_hit: u32,
-            result: *mut u64,
-        );
-        fn meikey_w16_b16_test_batch() -> u32;
-        fn meikey_w16_b16_test_width() -> u32;
-        fn meikey_w16_b32_test_derive_batch(
-            table: *const u32,
-            key: *const u32,
-            first: u64,
-            out: *mut u8,
-        );
-        fn meikey_w16_b32_test_search(
-            nthreads: u64,
-            table: *const u32,
-            key: *const u32,
-            needle: *const u8,
-            needle_len: u32,
-            fold: u32,
-            base: u64,
-            iters: u32,
-            stop_on_hit: u32,
-            result: *mut u64,
-        );
-        fn meikey_w16_b32_test_batch() -> u32;
-        fn meikey_w16_b32_test_width() -> u32;
+        fn meikey_test_block() -> u32;
     }
 
     #[cfg(meikey_gpu_host)]
@@ -949,56 +959,16 @@ mod tests {
         options: GpuOptions,
         derive: DeriveFn,
         search: SearchFn,
+        /// 32 ビット × 8 語で渡す体演算（kernel.cu の fe_op_words）
+        fe_op: unsafe extern "C" fn(u32, *const u32, *const u32, *mut u8),
         batch: unsafe extern "C" fn() -> u32,
         width: unsafe extern "C" fn() -> u32,
+        limbs: unsafe extern "C" fn() -> u32,
     }
 
-    /// [`EMBEDDED`] と同じ並び（options_match_kernel で確かめる）
+    // 設定ごとの関数の宣言と HOSTS（build.rs が作る）
     #[cfg(meikey_gpu_host)]
-    static HOSTS: [HostKernel; 6] = [
-        HostKernel {
-            options: GpuOptions::new(12, 16),
-            derive: meikey_test_derive_batch,
-            search: meikey_test_search,
-            batch: meikey_test_batch,
-            width: meikey_test_width,
-        },
-        HostKernel {
-            options: GpuOptions::new(12, 32),
-            derive: meikey_w12_b32_test_derive_batch,
-            search: meikey_w12_b32_test_search,
-            batch: meikey_w12_b32_test_batch,
-            width: meikey_w12_b32_test_width,
-        },
-        HostKernel {
-            options: GpuOptions::new(14, 16),
-            derive: meikey_w14_b16_test_derive_batch,
-            search: meikey_w14_b16_test_search,
-            batch: meikey_w14_b16_test_batch,
-            width: meikey_w14_b16_test_width,
-        },
-        HostKernel {
-            options: GpuOptions::new(14, 32),
-            derive: meikey_w14_b32_test_derive_batch,
-            search: meikey_w14_b32_test_search,
-            batch: meikey_w14_b32_test_batch,
-            width: meikey_w14_b32_test_width,
-        },
-        HostKernel {
-            options: GpuOptions::new(16, 16),
-            derive: meikey_w16_b16_test_derive_batch,
-            search: meikey_w16_b16_test_search,
-            batch: meikey_w16_b16_test_batch,
-            width: meikey_w16_b16_test_width,
-        },
-        HostKernel {
-            options: GpuOptions::new(16, 32),
-            derive: meikey_w16_b32_test_derive_batch,
-            search: meikey_w16_b32_test_search,
-            batch: meikey_w16_b32_test_batch,
-            width: meikey_w16_b32_test_width,
-        },
-    ];
+    include!(concat!(env!("OUT_DIR"), "/gpu_hosts.rs"));
 
     /// 幅 `width` の表（幅ごとに1回だけ作る）
     #[cfg(meikey_gpu_host)]
@@ -1006,10 +976,6 @@ mod tests {
         static TABLES: [std::sync::OnceLock<Vec<u32>>; 17] =
             [const { std::sync::OnceLock::new() }; 17];
         TABLES[width as usize].get_or_init(|| table_words(width))
-    }
-
-    fn key_words(key: &[u8; 32]) -> [u32; 8] {
-        from_fn(|i| u32::from_le_bytes(*key[4 * i..].first_chunk().unwrap()))
     }
 
     #[cfg(meikey_gpu_host)]
@@ -1038,26 +1004,39 @@ mod tests {
         );
         for h in &HOSTS {
             // SAFETY: 引数なしの関数
-            let (width, batch) = unsafe { ((h.width)(), (h.batch)()) };
-            assert_eq!(GpuOptions { width, batch }, h.options);
+            let got = unsafe { GpuOptions::new((h.width)(), (h.batch)(), (h.limbs)()) };
+            assert_eq!(got, h.options);
         }
-        // meikey_test_* は既定の設定
+        // meikey_test_* は既定の設定（先頭）
+        assert_eq!(HOSTS[0].options, GpuOptions::default());
+        // 1ブロックのスレッド数（カーネルのレジスタの上限をこれで決めている）
         // SAFETY: 引数なしの関数
-        let default = unsafe { GpuOptions::new(meikey_test_width(), meikey_test_batch()) };
-        assert_eq!(default, GpuOptions::default());
+        assert_eq!(unsafe { meikey_test_block() }, BLOCK);
         // 既定の幅は CPU の表（comb::W）と同じ（下の digits_match_comb で comb の桁と比べるため）
         assert_eq!(DEFAULT_WIDTH as usize, crate::service::derive::comb::W);
     }
 
-    /// 表の大きさ（W = 12 で約 5.8 MB、16 で約 67 MB）
+    /// 表の大きさ（W = 12 で約 4.1 MB、16 で約 50 MB）
     #[rstest]
-    #[case::default(GpuOptions::default(), 22 * 2049 * 128)]
-    #[case::wide(GpuOptions { width: 16, batch: 32 }, 16 * 32769 * 128)]
+    #[case::default(GpuOptions::default(), 21 * 2049 * 96)]
+    #[case::wide(GpuOptions::new(16, 32, 8), 16 * 32769 * 96)]
     fn table_bytes(#[case] options: GpuOptions, #[case] want: usize) {
         assert_eq!(options.table_bytes(), want);
     }
 
-    /// シードは rand の ChaCha20Rng（ストリーム 0）のブロック `index` の先頭 32 バイト
+    /// 通し番号 2i・2i + 1 のシードを並べると、ChaCha20Rng（ストリーム 0）のブロック i の 64 バイトになる
+    /// （2 本ぶんで 1 ブロック。重なりも抜けもない）
+    #[rstest]
+    fn seeds_are_consecutive_chacha20_output() {
+        let key: [u8; 32] = from_fn(|i| i as u8);
+        let mut rng = ChaCha20Rng::from_seed(key);
+        let mut stream = [0u8; 64 * 3];
+        rand::Rng::fill_bytes(&mut rng, &mut stream);
+        let seeds: Vec<u8> = (0..6).flat_map(|i| seed(&key, i)).collect();
+        assert_eq!(seeds, stream.to_vec());
+    }
+
+    /// シードは rand の ChaCha20Rng（ストリーム 0）のブロック `index / 2` の前半（偶数）か後半（奇数）
     #[cfg(meikey_gpu_host)]
     #[rstest]
     fn seed_matches_chacha20_rng() {
@@ -1089,8 +1068,7 @@ mod tests {
     #[cfg(meikey_gpu_host)]
     #[rstest]
     fn digits_match_comb() {
-        check(256, any::<[u8; 32]>(), |mut s| {
-            s[31] &= 0x7f;
+        check(256, any::<[u8; 32]>().prop_map(clamp_integer), |s| {
             let mut got = [0i32; ROWS];
             // SAFETY: s は 32 バイト、out は ROWS 個
             unsafe { meikey_test_digits(s.as_ptr(), got.as_mut_ptr()) };
@@ -1159,10 +1137,85 @@ mod tests {
         });
     }
 
+    /// 体演算（32 ビット × 8 語で渡す版）は、どの設定でも mod p で正しく、結果は p 未満。8 リムは 2^256 未満の
+    /// 任意の値（p 以上・2^255 以上を含む）を受け付けるので、境界の値も混ぜる。op: 0 = 加算、1 = 減算、
+    /// 2 = 乗算、3 = 2乗、4 = 逆元（0 の逆元は 0）
+    #[cfg(meikey_gpu_host)]
+    #[rstest]
+    fn fe_op_words_matches_bigint(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] variant: usize,
+        #[values(0, 1, 2, 3, 4)] op: u32,
+    ) {
+        use num_bigint::BigUint;
+        let h = &HOSTS[variant];
+        let p = (BigUint::from(1u8) << 255u32) - 19u32;
+        let full = (BigUint::from(1u8) << 256u32) - 1u32;
+        // 10 リムは 2^255 未満の値だけ（表の値は p 未満）
+        let max = if h.options.limbs == 8 {
+            full.clone()
+        } else {
+            (BigUint::from(1u8) << 255u32) - 1u32
+        };
+        let edges: Vec<BigUint> = [
+            BigUint::from(0u8),
+            BigUint::from(1u8),
+            BigUint::from(38u8),
+            &p - 1u32,
+            p.clone(),
+            &p + 1u32,
+            &p * 2u32 - 1u32,
+            &full - 37u32,
+            full.clone(),
+            BigUint::from(1u8) << 255u32,
+        ]
+        .into_iter()
+        .filter(|x| x <= &max)
+        .collect();
+        let words = |x: &BigUint| -> [u32; 8] {
+            let d = x.to_u32_digits();
+            from_fn(|i| d.get(i).copied().unwrap_or(0))
+        };
+        let pick = |raw: [u32; 8], e: Option<usize>| -> BigUint {
+            match e {
+                Some(i) => edges[i % edges.len()].clone(),
+                None => BigUint::from_slice(&raw) % (&max + 1u32),
+            }
+        };
+        let strategy = (
+            any::<[u32; 8]>(),
+            any::<[u32; 8]>(),
+            proptest::option::weighted(0.3, any::<usize>()),
+            proptest::option::weighted(0.3, any::<usize>()),
+        );
+        check(512, strategy, |(ra, rb, ea, eb)| {
+            let (a, b) = (pick(ra, ea), pick(rb, eb));
+            let want = match op {
+                0 => (&a + &b) % &p,
+                1 => (&a + &p * 4u32 - &b) % &p,
+                2 => (&a * &b) % &p,
+                3 => (&a * &a) % &p,
+                _ => (&a % &p).modpow(&(&p - 2u32), &p),
+            };
+            let mut got = [0u8; 32];
+            // SAFETY: a・b は 8 語、out は 32 バイト
+            unsafe { (h.fe_op)(op, words(&a).as_ptr(), words(&b).as_ptr(), got.as_mut_ptr()) };
+            prop_assert_eq!(
+                BigUint::from_bytes_le(&got),
+                want,
+                "{} op {} {:x} {:x}",
+                h.options,
+                op,
+                a,
+                b
+            );
+            Ok(())
+        });
+    }
+
     /// まとめて計算した公開鍵は、同じシードから ed25519-dalek で作った鍵と一致する（埋め込む設定すべて）
     #[cfg(meikey_gpu_host)]
     #[rstest]
-    fn derive_batch_matches_dalek(#[values(0, 1, 2, 3, 4, 5)] variant: usize) {
+    fn derive_batch_matches_dalek(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] variant: usize) {
         let h = &HOSTS[variant];
         let (table, batch, derive) = (table(h.options.width), h.options.batch, h.derive);
         check(16, (any::<[u8; 32]>(), any::<u64>()), |(key, first)| {
@@ -1180,6 +1233,63 @@ mod tests {
             for (j, pk) in got.as_chunks::<32>().0.iter().enumerate() {
                 let want = VanityKey::from_seed(seed(&key, first + j as u64));
                 prop_assert_eq!(pk, want.public_bytes(), "#{}", j);
+            }
+            Ok(())
+        });
+    }
+
+    /// x の符号を 0 にした pk で「含まれる可能性がある」が偽なら、符号が 0 でも 1 でも含まれない。
+    /// 符号で変わる文字（後ろから 2 文字目）を含む位置に文字列を書いた鍵も混ぜる
+    #[cfg(meikey_gpu_host)]
+    #[rstest]
+    fn contains_unsigned_never_misses(
+        #[values(false, true)] case_sensitive: bool,
+        #[values("[A-Za-z0-9+/]{1,2}", "[A-Za-z0-9+/]{3,6}")] needles: &'static str,
+    ) {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let encode = |pk: &[u8; 32]| {
+            let mut b = [0u8; crate::model::key::PUBLIC_B64_LEN];
+            crate::model::key::encode_public_b64(pk, &mut b);
+            b
+        };
+        let strategy = (any::<[u8; 32]>(), needles, 0usize..8, any::<bool>());
+        check(2048, strategy, |(mut pk, n, back, plant)| {
+            if plant {
+                // 符号が 1 の鍵の base64 の、符号で変わる文字を含む位置に文字列を書いて、鍵に戻す
+                pk[31] |= 0x80;
+                let mut text = encode(&pk);
+                let sign_char = text.len() - 2;
+                let start = (sign_char + 1)
+                    .saturating_sub(back.min(n.len()))
+                    .min(text.len() - n.len());
+                text[start..start + n.len()].copy_from_slice(n.as_bytes());
+                pk = *b64.decode(text).unwrap().last_chunk::<32>().unwrap();
+            }
+            let p = Pattern::new(&n, case_sensitive).unwrap();
+            let bytes = if case_sensitive {
+                n.clone()
+            } else {
+                n.to_ascii_lowercase()
+            };
+            let mut unsigned = pk;
+            unsigned[31] &= 0x7f;
+            // SAFETY: pk は 32 バイト、needle は len バイト
+            let maybe = unsafe {
+                meikey_test_contains_unsigned(
+                    unsigned.as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    u32::from(!case_sensitive),
+                )
+            } != 0;
+            for sign in [0u8, 0x80] {
+                let mut k = unsigned;
+                k[31] |= sign;
+                let text = encode(&k);
+                if p.is_match(&text) {
+                    prop_assert!(maybe, "見逃した: {}", String::from_utf8_lossy(&text));
+                }
             }
             Ok(())
         });
@@ -1279,7 +1389,9 @@ mod tests {
 
     /// 埋め込んだ PTX は今の kernel.cu とその設定から作ったもの（違えば `cargo make ptx` で作り直す）
     #[rstest]
-    fn embedded_ptx_matches_kernel_source(#[values(0, 1, 2, 3, 4, 5)] i: usize) {
+    fn embedded_ptx_matches_kernel_source(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] i: usize,
+    ) {
         let (options, ptx) = (EMBEDDED[i], PTXS[i]);
         let first = ptx.lines().next().unwrap_or_default();
         assert_eq!(
@@ -1299,15 +1411,12 @@ mod tests {
     #[rstest]
     fn embedded_options_are_valid() {
         for (i, o) in EMBEDDED.iter().enumerate() {
-            assert_eq!(
-                WIDTHS.contains(&o.width) && BATCHES.contains(&o.batch),
-                true,
-                "{o}"
-            );
+            assert_eq!(o.in_range(), true, "{o}");
             assert_eq!(EMBEDDED[..i].contains(o), false, "{o} が重なっている");
         }
         assert_eq!(EMBEDDED.contains(&GpuOptions::default()), true);
-        assert_eq!(embedded_ptx(GpuOptions::new(13, 16)), None);
+        assert_eq!(embedded_ptx(GpuOptions::new(13, 32, 10)), None);
+        assert_eq!(GpuOptions::new(12, 32, 9).in_range(), false);
     }
 
     /// 測った中で一番速い設定を選ぶ。読み込めない・測れない設定は飛ばし、全部だめなら最初のエラー。
@@ -1325,14 +1434,19 @@ mod tests {
         "libnvrtc not found"
     )]
     #[case::range(
-        GpuError::OutOfRange(GpuOptions::new(17, 32)),
-        "表の幅は 2〜16、まとめる鍵の数は 1〜64（W = 17・32 鍵）",
-        "the table width must be 2-16 and the keys per batch 1-64 (W = 17, 32 keys)"
+        GpuError::OutOfRange(GpuOptions::new(17, 32, 10)),
+        "表の幅は 2〜16、まとめる鍵の数は 1〜64、リムの数は 10 か 8（W = 17・32 鍵・10 リム）",
+        "the table width must be 2-16, the keys per batch 1-64 and the limbs 10 or 8 (W = 17, 32 keys, 10 limbs)"
     )]
     #[case::not_embedded(
-        GpuError::NotEmbedded(GpuOptions::new(13, 8)),
-        "W = 13・8 鍵 は埋め込んでいない設定なので NVRTC（libnvrtc）が要る（LD_LIBRARY_PATH / PATH に追加）",
-        "W = 13, 8 keys is not built in, so NVRTC (libnvrtc) is needed (add it to LD_LIBRARY_PATH / PATH)"
+        GpuError::NotEmbedded(GpuOptions::new(13, 8, 8)),
+        "W = 13・8 鍵・8 リム は埋め込んでいない設定なので NVRTC（libnvrtc）が要る（LD_LIBRARY_PATH / PATH に追加）",
+        "W = 13, 8 keys, 8 limbs is not built in, so NVRTC (libnvrtc) is needed (add it to LD_LIBRARY_PATH / PATH)"
+    )]
+    #[case::self_check(
+        GpuError::SelfCheck(GpuOptions::new(16, 64, 8)),
+        "W = 16・64 鍵・8 リム の GPU の計算が CPU と合わない（この設定は使えない）",
+        "the GPU results of W = 16, 64 keys, 8 limbs differ from the CPU (this setting cannot be used)"
     )]
     #[case::no_settings(GpuError::NoSettings, "測る設定が無い", "no settings to measure")]
     #[case::compile(GpuError::Compile("sm_90: log".into()), "カーネルのコンパイルに失敗:\nsm_90: log", "failed to compile the kernel:\nsm_90: log")]
@@ -1357,7 +1471,7 @@ mod tests {
         #[case] want: Result<usize, Option<&str>>,
     ) {
         let candidates: Vec<GpuOptions> = (0..speeds.len() as u32)
-            .map(|i| GpuOptions::new(i + 2, 1))
+            .map(|i| GpuOptions::new(i + 2, 1, 10))
             .collect();
         let got = fastest(
             &candidates,
@@ -1401,7 +1515,7 @@ mod tests {
     #[rstest]
     fn fastest_is_not_fooled_by_warming_up() {
         let base = [1.0, 0.97, 0.95];
-        let candidates: Vec<GpuOptions> = (0..3).map(|i| GpuOptions::new(i + 2, 1)).collect();
+        let candidates: Vec<GpuOptions> = (0..3).map(|i| GpuOptions::new(i + 2, 1, 10)).collect();
         let mut calls = Vec::new();
         let (k, results) = fastest(
             &candidates,
@@ -1459,8 +1573,8 @@ mod tests {
         #[values((7, 5), (8, 0), (8, 6), (8, 9), (9, 0), (12, 0))] compute: (i32, i32),
         #[values(
             GpuOptions::default(),
-            GpuOptions { width: *WIDTHS.start(), batch: *BATCHES.start() },
-            GpuOptions { width: *WIDTHS.end(), batch: *BATCHES.end() }
+            GpuOptions::new(*WIDTHS.start(), *BATCHES.start(), 10),
+            GpuOptions::new(*WIDTHS.end(), *BATCHES.end(), 8)
         )]
         options: GpuOptions,
         nvrtc: Option<()>,
@@ -1478,33 +1592,24 @@ mod tests {
         );
     }
 
-    /// GPU で計算した公開鍵は、同じシードから ed25519-dalek で作った鍵と一致する
+    /// GPU で計算した公開鍵は、同じシードから ed25519-dalek で作った鍵と一致する（埋め込んだ設定すべて。
+    /// 通し番号は奇数から始め、シードを ChaCha20 のブロックの後半から取る場合も通す）
     #[rstest]
-    fn gpu_derive_matches_dalek(gpu: Option<Gpu>) {
-        let Some(gpu) = gpu else {
+    fn gpu_derive_matches_dalek(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] i: usize,
+        gpu: Option<Gpu>,
+    ) {
+        if gpu.is_none() {
             return;
-        };
-        let f = gpu.kernel.module.load_function("meikey_derive").unwrap();
+        }
+        let gpu =
+            Gpu::new(0, GpuSetting::Fixed(EMBEDDED[i]), || {}).expect("GPU を使えるようにできる");
         let key: [u8; 32] = random();
-        let first = 1 << 40;
-        let (blocks, threads) = (8u32, BLOCK);
-        let n = (blocks * threads) as usize * gpu.kernel.options.batch as usize;
-        let stream = &gpu.stream;
-        let key_dev = stream.clone_htod(&key_words(&key)).unwrap();
-        let mut out = stream.alloc_zeros::<u8>(n * 32).unwrap();
-        let mut b = stream.launch_builder(&f);
-        b.arg(&gpu.kernel.table)
-            .arg(&key_dev)
-            .arg(&first)
-            .arg(&mut out);
-        let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        // SAFETY: 引数は kernel.cu の meikey_derive と同じ並びで、out は全スレッドの鍵の分ある
-        unsafe { b.launch(cfg).unwrap() };
-        let got = stream.clone_dtoh(&out).unwrap();
+        let first = (1 << 40) + 1;
+        let got = gpu
+            .kernel
+            .derive_on_gpu(&gpu.stream, &key, first, 8, BLOCK)
+            .unwrap();
         for (i, pk) in got.as_chunks::<32>().0.iter().enumerate() {
             let want = VanityKey::from_seed(seed(&key, first + i as u64));
             assert_eq!(pk, want.public_bytes(), "#{i}");
@@ -1521,9 +1626,10 @@ mod tests {
         let gpu =
             Gpu::new(0, GpuSetting::Fastest, || notified = true).expect("GPU を使えるようにできる");
         assert_eq!(notified, true, "測る前に知らせる");
-        let Chosen::Fastest(results) = &gpu.chosen else {
+        let Chosen::Fastest { results, rejected } = &gpu.chosen else {
             panic!("測っていない");
         };
+        assert_eq!(rejected, &Vec::new(), "計算が CPU と合わない設定がある");
         assert_eq!(
             results.iter().map(|r| r.0).collect::<Vec<_>>(),
             EMBEDDED.to_vec()
@@ -1609,7 +1715,7 @@ mod tests {
     /// （埋め込む設定すべて）
     #[cfg(meikey_gpu_host)]
     #[rstest]
-    fn search_finds_first_hit(#[values(0, 1, 2, 3, 4, 5)] variant: usize) {
+    fn search_finds_first_hit(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] variant: usize) {
         let h = &HOSTS[variant];
         let (table, search) = (table(h.options.width), h.search);
         let key: [u8; 32] = from_fn(|i| i as u8 * 7);

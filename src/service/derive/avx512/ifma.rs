@@ -209,6 +209,31 @@ fn run<const N: usize>(table: &Table8, scalars: &[[u8; 32]; N], out: &mut [Exten
     unsafe { super::mul_base_batch::<Fe5, N>(table, scalars, out) }
 }
 
+/// [`mul_base_batch`] に続けて、1/Z と y の圧縮形式まで8鍵ずつ（[`super::mul_base_compress`]。`N` は 8 の倍数）
+pub fn mul_base_compress<const N: usize>(
+    ifma: Ifma,
+    scalars: &[[u8; 32]; N],
+    ys: &mut [[u8; 32]; N],
+    xs: &mut [Fe; N],
+    zinvs: &mut [Fe; N],
+) {
+    let _ = ifma;
+    // SAFETY: Ifma があるので、CPU は下の target_feature の命令に対応している
+    unsafe { run_compress(&TABLE, scalars, ys, xs, zinvs) }
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512ifma")]
+fn run_compress<const N: usize>(
+    table: &Table8,
+    scalars: &[[u8; 32]; N],
+    ys: &mut [[u8; 32]; N],
+    xs: &mut [Fe; N],
+    zinvs: &mut [Fe; N],
+) {
+    // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
+    unsafe { super::mul_base_compress::<Fe5, N>(table, scalars, ys, xs, zinvs) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

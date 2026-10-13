@@ -181,8 +181,13 @@ pub struct Deriver {
     backend: Backend,
     lanes: Lanes,
     points: Box<[Extended; BATCH]>,
+    /// X（x の符号を後から計算するため）
+    xs: Box<[Fe; BATCH]>,
+    /// 1/Z（逆元を計算したあと）
     zs: Box<[Fe; BATCH]>,
     scratch: Vec<Fe>,
+    /// 定数時間の倍算で計算した x の符号（テーブルの倍算では [`Deriver::sign`] で後から計算する）
+    signs: Box<[u8; BATCH]>,
 }
 
 impl Deriver {
@@ -192,16 +197,42 @@ impl Deriver {
             backend,
             lanes: Lanes::detect(backend.simd),
             points: Box::new([Extended::IDENTITY; BATCH]),
+            xs: Box::new([Fe::ZERO; BATCH]),
             zs: Box::new([Fe::ZERO; BATCH]),
             scratch: Vec::with_capacity(BATCH),
+            signs: Box::new([0; BATCH]),
         }
     }
 
+    /// 全シードの公開鍵（圧縮形式）
     pub fn public_keys(&mut self, seeds: &Seeds, out: &mut PublicKeys) {
+        self.public_keys_unsigned(seeds, out);
+        for (k, o) in out.iter_mut().enumerate() {
+            o[31] |= self.sign(k) << 7;
+        }
+    }
+
+    /// 全シードの公開鍵を、x の符号（最後のバイトの最上位ビット）を 0 にして。符号は [`Deriver::sign`] で、
+    /// 要るときだけ計算する（探索では、文字列が含まれそうな鍵だけ）
+    pub fn public_keys_unsigned(&mut self, seeds: &Seeds, out: &mut PublicKeys) {
         let scalars = self.scalars(seeds);
         match self.backend.mul {
             Mul::Table => self.table(&scalars, out),
-            Mul::ConstantTime => constant_time(&scalars, out, self.backend.compress),
+            Mul::ConstantTime => {
+                constant_time(&scalars, out, self.backend.compress);
+                for (o, s) in out.iter_mut().zip(self.signs.iter_mut()) {
+                    *s = o[31] >> 7;
+                    o[31] &= 0x7f;
+                }
+            }
+        }
+    }
+
+    /// 直前の [`Deriver::public_keys_unsigned`] の `k` 番目の鍵の x の符号（0 か 1）
+    pub fn sign(&self, k: usize) -> u8 {
+        match self.backend.mul {
+            Mul::Table => (self.xs[k] * self.zs[k]).to_bytes()[0] & 1,
+            Mul::ConstantTime => self.signs[k],
         }
     }
 
@@ -235,7 +266,28 @@ impl Deriver {
         out
     }
 
+    /// テーブルの倍算。y の圧縮形式（符号のビットは 0）を `out` に、X と 1/Z を `xs`・`zs` に。
+    /// AVX-512 では、逆元と圧縮も8鍵ずつ同時に計算する（逆元を [`Compress::Each`] で 1 鍵ずつ計算するときは、
+    /// 比較用に1つずつ）。AVX2 は 4 レーンの乗算が1鍵ずつの乗算より何倍も遅く、逆元と圧縮は1つずつのほうが速い
     fn table(&mut self, scalars: &Seeds, out: &mut PublicKeys) {
+        let batch = self.backend.compress == Compress::Batch;
+        match self.lanes {
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Ifma(i) if batch => {
+                return avx512::ifma::mul_base_compress(
+                    i,
+                    scalars,
+                    out,
+                    &mut self.xs,
+                    &mut self.zs,
+                );
+            }
+            #[cfg(target_arch = "x86_64")]
+            Lanes::Avx512(a) if batch => {
+                return avx512::f::mul_base_compress(a, scalars, out, &mut self.xs, &mut self.zs);
+            }
+            _ => {}
+        }
         match self.lanes {
             #[cfg(all(target_arch = "x86_64", feature = "amx"))]
             Lanes::Amx(a) => amx::mul_base_batch(a, scalars, &mut self.points),
@@ -247,15 +299,16 @@ impl Deriver {
             Lanes::Avx2(a) => Table4::get(a).mul_base_batch(a, scalars, &mut self.points),
             Lanes::Scalar => Table::get().mul_base_batch(scalars, &mut self.points),
         }
-        for (p, z) in self.points.iter().zip(&mut self.zs) {
+        for ((p, z), x) in self.points.iter().zip(&mut *self.zs).zip(&mut *self.xs) {
             *z = p.z;
+            *x = p.x;
         }
         match self.backend.compress {
             Compress::Batch => Fe::batch_invert(&mut self.zs[..], &mut self.scratch),
             Compress::Each => self.zs.iter_mut().for_each(|z| *z = z.invert()),
         }
-        for ((p, z_inv), o) in self.points.iter().zip(&self.zs).zip(out) {
-            *o = comb::compress_with_zinv(p, *z_inv);
+        for ((p, z_inv), o) in self.points.iter().zip(&*self.zs).zip(out) {
+            *o = comb::y_with_zinv(p, *z_inv);
         }
     }
 }
@@ -368,6 +421,15 @@ mod tests {
                     VanityKey::from_seed(*seed).public_bytes(),
                     "{round} 回目の #{i}"
                 );
+            }
+            // 符号を後から計算しても同じ（符号のビットは 0 で返り、sign で後から分かる）
+            let mut unsigned: PublicKeys = [[0u8; 32]; BATCH];
+            d.public_keys_unsigned(&seeds, &mut unsigned);
+            for (i, (u, pk)) in unsigned.iter().zip(&out).enumerate() {
+                assert_eq!(u[31] >> 7, 0, "{round} 回目の #{i}");
+                let mut signed = *u;
+                signed[31] |= d.sign(i) << 7;
+                assert_eq!(&signed, pk, "{round} 回目の #{i}");
             }
         }
     }

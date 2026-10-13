@@ -1,8 +1,11 @@
 //! 可変時間の固定基点倍算（符号付き 2^W 進の櫛形テーブル）
 //!
-//! `s * B` を `Σ d_i * (2^(W*i) * B)` として計算する。各 `d_i * 2^(W*i) * B` は表から直接引くので、
-//! 倍算は加算 `ROWS` 回だけで済み、倍加は不要。テーブルのアクセス位置が秘密に依存する
-//! （＝定数時間ではない）ため、探索の高速化専用。
+//! クランプ済みのスカラー s は下 3 ビットが 0 で 2^254 のビットが立つので、`s = 8 * (2^251 + m)`
+//! （m は 251 ビット）と書ける。そこで `s * B` を `Σ d_i * (2^(W*i) * 8B) + 2^254 * B` として計算する
+//! （d_i は m の符号付き 2^W 進の桁。2^254 * B は最上位の行の表に足しておく）。各項は表から直接引くので、
+//! 倍算は加算 `ROWS - 1` 回だけで済み、倍加は不要。下 3 ビットと 2^254 のビットの分だけ桁が減る
+//! （W = 12 で 22 行が 21 行に）。テーブルのアクセス位置が秘密に依存する（＝定数時間ではない）ため、
+//! 探索の高速化専用。
 //!
 //! 複数の鍵をまとめて、表の1行ずつ処理する（[`Table::mul_base_batch`]）。表全体は数MBあるが、
 //! 同時に使うのは1行（数百KB）だけなので、全コアで回してもキャッシュに収まりやすい。
@@ -12,17 +15,20 @@ use std::sync::LazyLock;
 
 /// 1桁のビット数（8〜14 で計測して 12 に決めた。13 は全スレッドではわずかに速いが、1スレッドでは遅く、テーブルも倍近くになる）
 pub const W: usize = 12;
-/// 桁数。クランプ済みスカラーは 2^255 未満なので floor(255/W)+1 桁で足りる
-pub(crate) const ROWS: usize = 255 / W + 1;
+/// 桁数（[`rows_cols`]）
+pub(crate) const ROWS: usize = rows_cols(W).0;
 /// 1行のエントリ数（0..=2^(W-1)。負の桁は符号反転で表す）
 pub(crate) const COLS: usize = (1 << (W - 1)) + 1;
 /// 桁の絶対値の上限 2^(W-1)
 const HALF: i32 = 1 << (W - 1);
 
-// 桁は i16 に入れる。最上位桁は繰り上げないので、2^255 未満の値の残りのビットに
+// 桁は i16 に入れる。最上位桁は繰り上げないので、m（251 ビット）の残りのビットに
 // 下からの繰り上がり 1 を足しても 2^(W-1) 以下（＝表の範囲内）に収まる必要がある
 const _: () = assert!(W >= 2 && W <= 15);
-const _: () = assert!(255 - W * (ROWS - 1) < W);
+const _: () = assert!(M_BITS - W * (ROWS - 1) < W);
+
+/// m（`s = 8 * (2^251 + m)` の m）のビット数
+const M_BITS: usize = 251;
 
 /// 2d（d はエドワーズ曲線の係数 -121665/121666）
 const D2: Fe = Fe([
@@ -167,12 +173,24 @@ impl Extended {
 }
 
 /// 圧縮形式（y の32バイト、最上位ビットに x の符号）。`z_inv` は事前に計算した 1/Z
-#[inline(always)]
+/// （探索では y と符号を別々に計算する。これはテストで点を比べる用）
+#[cfg(test)]
 pub fn compress_with_zinv(p: &Extended, z_inv: Fe) -> [u8; 32] {
-    let mut y = (p.y * z_inv).to_bytes();
-    let x_sign = (p.x * z_inv).to_bytes()[0] & 1;
-    y[31] |= x_sign << 7;
+    let mut y = y_with_zinv(p, z_inv);
+    y[31] |= x_sign_with_zinv(p, z_inv) << 7;
     y
+}
+
+/// 圧縮形式のうち y の 32 バイト（x の符号のビットは 0）
+#[inline]
+pub fn y_with_zinv(p: &Extended, z_inv: Fe) -> [u8; 32] {
+    (p.y * z_inv).to_bytes()
+}
+
+/// x の符号（x の最下位ビット。圧縮形式の最後のバイトの最上位ビットになる）
+#[cfg(test)]
+pub fn x_sign_with_zinv(p: &Extended, z_inv: Fe) -> u8 {
+    (p.x * z_inv).to_bytes()[0] & 1
 }
 
 /// 前計算テーブル: `row(i)[k] = k * 2^(W*i) * B`。
@@ -180,7 +198,7 @@ pub fn compress_with_zinv(p: &Extended, z_inv: Fe) -> [u8; 32] {
 pub struct Table(Box<[Niels]>);
 
 impl Table {
-    /// プロセスで1つだけ作って共有する（W = 12 で約 5.4MB、作成は最適化ビルドで約 10ms）
+    /// プロセスで1つだけ作って共有する（W = 12 で約 5.2MB、作成は最適化ビルドで約 10ms）
     pub fn get() -> &'static Table {
         static TABLE: LazyLock<Table> = LazyLock::new(Table::build);
         &TABLE
@@ -202,7 +220,7 @@ impl Table {
         Table(build_rows(W).into_boxed_slice())
     }
 
-    /// `scalars[k] * B` を `out[k]` に（scalar はリトルエンディアン、2^255 未満であること）。
+    /// `scalars[k] * B` を `out[k]` に（scalar はリトルエンディアンで、クランプ済みであること）。
     ///
     /// 鍵ごとに倍算を終わらせるのではなく、表の1行目を全部の鍵に足し、次に2行目を…と1行ずつ進める。
     /// 同時に使う表が1行だけになるので、表全体がキャッシュに収まらなくても速い。
@@ -233,7 +251,7 @@ impl Table {
                 }
             }
         }
-        // 最上位桁（クランプで 2^254 のビットが立つので通常 0 ではない。0 でも単位元の加算になるだけ）
+        // 最上位桁（0 以上。表には 2^254 * B を足してあるので、桁が 0 でも単位元ではない）
         let row = self.row(ROWS - 1);
         for (acc, &d) in out.iter_mut().zip(&digits[ROWS - 1]) {
             *acc = acc.add_niels_last(&entry(row, d));
@@ -241,38 +259,61 @@ impl Table {
     }
 }
 
-/// 幅 `w` の表の行数（桁数）と、1行のエントリ数
+/// 幅 `w` の表の行数（桁数）と、1行のエントリ数。m（251 ビット）を w ビットずつの桁にし、最上位の桁に
+/// w - 1 ビット以下が残る（繰り上がりを足しても 2^(w-1) 以下になる）ように、行数は ceil(251 / w)
+/// （251 は素数なので、w ≤ 16 では最上位の桁に必ず w - 1 ビット以下が残る）
 pub(crate) const fn rows_cols(w: usize) -> (usize, usize) {
-    (255 / w + 1, (1 << (w - 1)) + 1)
+    (M_BITS.div_ceil(w), (1 << (w - 1)) + 1)
 }
 
-/// 幅 `w` の表: `i` 行目の `k` 番目は `k * 2^(w*i) * B`（行ごとに並べる）。[`Table`] は `w` = [`W`]
+/// 幅 `w` の表（行ごとに並べる。[`Table`] は `w` = [`W`]）。最上位以外の `i` 行目の `k` 番目は
+/// `k * 2^(w*i) * 8B`。最上位の行（`i` = 行数 - 1）の `k` 番目は `k * 2^(w*i) * 8B + 2^254 * B`
 fn build_rows(w: usize) -> Vec<Niels> {
     let (rows, cols) = rows_cols(w);
+    // 最上位の行の基準点 2^(w*(rows-1)) * 8B の何倍が 2^254 * B か（2^c 倍。c ≤ w - 1）
+    let top_shift = M_BITS - w * (rows - 1);
     let mut entries = vec![Niels::IDENTITY; rows * cols];
-    // 各行の基準点 2^(w*i) * B（アフィン）
-    let (mut bx, mut by) = (BX, BY);
+    // 各行の基準点 2^(w*i) * 8B（アフィン）。8B は B を3回2倍する
+    let double = |(x, y): (Fe, Fe)| {
+        Extended::from_affine(x, y)
+            .add_niels(&Niels::from_affine(x, y))
+            .to_affine()
+    };
+    let (mut bx, mut by) = double(double(double((BX, BY))));
     let mut scratch = Vec::new();
-    for row in entries.chunks_mut(cols) {
+    for (i, row) in entries.chunks_mut(cols).enumerate() {
+        let top = i == rows - 1;
         let base = Niels::from_affine(bx, by);
+        // multiples[j] = (j + 1) * 基準点。最上位の行は 2^c 倍を足した分まで作る
+        let count = if top {
+            cols - 1 + (1 << top_shift)
+        } else {
+            cols - 1
+        };
         let mut acc = Extended::IDENTITY;
-        let mut multiples = Vec::with_capacity(cols);
-        for _ in 1..cols {
+        let mut multiples = Vec::with_capacity(count);
+        for _ in 0..count {
             acc = acc.add_niels(&base);
             multiples.push(acc);
         }
         // 1/Z をまとめて計算してアフィンにする
         let mut zs: Vec<Fe> = multiples.iter().map(|p| p.z).collect();
         Fe::batch_invert(&mut zs, &mut scratch);
-        for (k, (p, zi)) in multiples.iter().zip(zs).enumerate() {
-            row[k + 1] = Niels::from_affine(p.x * zi, p.y * zi);
+        let affine: Vec<Niels> = multiples
+            .iter()
+            .zip(zs)
+            .map(|(p, zi)| Niels::from_affine(p.x * zi, p.y * zi))
+            .collect();
+        if top {
+            // k 番目は (k + 2^c) 倍 = k * 基準点 + 2^254 * B
+            for (k, e) in row.iter_mut().enumerate() {
+                *e = affine[k + (1 << top_shift) - 1];
+            }
+            break;
         }
+        row[1..].copy_from_slice(&affine);
         // 次の行: 2^w * (今の行の基準点) = 2 * (2^(w-1) * 基準点)
-        let half = multiples[cols - 2]; // 2^(w-1) 倍
-        let (hx, hy) = half.to_affine();
-        (bx, by) = Extended::from_affine(hx, hy)
-            .add_niels(&Niels::from_affine(hx, hy))
-            .to_affine();
+        (bx, by) = double(multiples[cols - 2].to_affine());
     }
     entries
 }
@@ -286,15 +327,26 @@ pub(crate) fn entries_with_width(w: usize) -> Vec<[Fe; 3]> {
         .collect()
 }
 
-/// スカラーを符号付き 2^W 進の桁（-2^(W-1) ≤ d < 2^(W-1)、最上位桁のみ 0 ≤ d ≤ 2^(W-1)）に分解する。
+/// クランプ済みか（下 3 ビットが 0、2^255 のビットが 0、2^254 のビットが 1）
+pub(crate) fn is_clamped(s: &[u8; 32]) -> bool {
+    s[0] & 7 == 0 && s[31] & 0xc0 == 0x40
+}
+
+/// クランプ済みのスカラー `s = 8 * (2^251 + m)` の m を、符号付き 2^W 進の桁（-2^(W-1) ≤ d < 2^(W-1)、
+/// 最上位桁のみ 0 ≤ d ≤ 2^(W-1)）に分解する。
 /// 下の桁から W ビットずつ取り出して繰り上がりを足し、2^(W-1) 以上なら 2^W を引いて上へ繰り上げる
 #[inline(always)]
 pub(crate) fn signed_digits(s: &[u8; 32]) -> [i16; ROWS] {
-    // 5語目は、最後の桁が4語目からはみ出して読むときの 0
+    debug_assert!(is_clamped(s), "クランプしていないスカラー");
+    // m = s の 3〜253 ビット目。5語目は、最後の桁が4語目からはみ出して読むときの 0
     let mut words = [0u64; 5];
     for (w, c) in words.iter_mut().zip(s.as_chunks::<8>().0) {
         *w = u64::from_le_bytes(*c);
     }
+    for i in 0..4 {
+        words[i] = words[i] >> 3 | words[i + 1] << 61;
+    }
+    words[3] &= (1 << (M_BITS - 192)) - 1;
     let mut out = [0i16; ROWS];
     let mut carry = 0i32;
     for (i, o) in out.iter_mut().enumerate() {
@@ -345,26 +397,40 @@ mod tests {
         out[0]
     }
 
+    /// クランプ済みかの判定: 下 3 ビットが 0、2^255 が 0、2^254 が 1
+    #[rstest]
+    #[case::clamped(clamp_integer([0x55; 32]), true)]
+    #[case::low_bit({ let mut s = clamp_integer([0; 32]); s[0] = 1; s }, false)]
+    #[case::bit_255({ let mut s = clamp_integer([0; 32]); s[31] |= 0x80; s }, false)]
+    #[case::no_bit_254([0; 32], false)]
+    fn is_clamped_cases(#[case] s: [u8; 32], #[case] want: bool) {
+        assert_eq!(is_clamped(&s), want);
+    }
+
     /// 桁が範囲内（最上位以外は -2^(W-1)〜2^(W-1)-1、最上位は 0〜2^(W-1)）
     fn digits_in_range(d: &[i16; ROWS]) -> bool {
         let half = HALF as i16;
         d[..ROWS - 1].iter().all(|x| (-half..half).contains(x)) && (0..=half).contains(&d[ROWS - 1])
     }
 
-    /// 桁から元の値に戻す（Σ d_i * 2^(W*i)）
+    /// 桁から元のスカラーに戻す（8 * (Σ d_i * 2^(W*i) + 2^251)）
     fn reconstruct(d: &[i16; ROWS]) -> num_bigint::BigInt {
-        d.iter()
+        let m = d
+            .iter()
             .rev()
-            .fold(num_bigint::BigInt::from(0), |acc, &x| (acc << W) + x)
+            .fold(num_bigint::BigInt::from(0), |acc, &x| (acc << W) + x);
+        (m + (num_bigint::BigInt::from(1) << M_BITS)) << 3
     }
 
-    /// 最上位以外の全桁（W ビットずつ）が `v` のスカラー
+    /// m（`s = 8 * (2^251 + m)`）の最上位以外の全桁（W ビットずつ）が `v` のスカラー（クランプ済み）
     #[fixture]
     fn repeated_digit(#[default(0)] v: u32) -> [u8; 32] {
-        let s = (0..ROWS - 1).fold(num_bigint::BigInt::from(0), |acc, i| {
+        let m = (0..ROWS - 1).fold(num_bigint::BigInt::from(0), |acc, i| {
             acc + (num_bigint::BigInt::from(v) << (W * i))
         });
-        to_le32(&s)
+        let s = to_le32(&((m + (num_bigint::BigInt::from(1) << M_BITS)) << 3));
+        assert_eq!(is_clamped(&s), true);
+        s
     }
 
     #[rstest]
@@ -388,16 +454,17 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    /// 境界のスカラー: 桁分解して戻すと元の値になり、倍算は curve25519-dalek・RFC 8032 の参照実装と一致する
+    /// 境界のスカラー（どれもクランプ済み）: 桁分解して戻すと元の値になり、倍算は curve25519-dalek・
+    /// RFC 8032 の参照実装と一致する
     #[rstest]
-    #[case::zero([0u8; 32])]
-    #[case::clamped_min({ let mut s = [0u8; 32]; s[31] = 0x40; s })] // 2^254（途中の桁はすべて 0）
-    #[case::clamped_max(clamp_integer([0xff; 32]))] // 繰り上がりが最上位まで伝わる
+    #[case::clamped_min({ let mut s = [0u8; 32]; s[31] = 0x40; s })] // 2^254（m = 0。桁はすべて 0）
+    #[case::smallest_m({ let mut s = [0u8; 32]; s[0] = 8; s[31] = 0x40; s })] // m = 1
+    #[case::clamped_max(clamp_integer([0xff; 32]))] // 全桁で繰り上がり、最上位桁が最大
     #[case::all_digits_half(repeated_digit(1 << (W - 1)))] // 各桁がちょうど繰り上がりの境界
     #[case::all_digits_half_minus_1(repeated_digit((1 << (W - 1)) - 1))] // 境界の1つ手前（繰り上がらない）
     #[case::all_digits_max(repeated_digit((1 << W) - 1))]
     #[case::ones({ let mut s = [0x01u8; 32]; s[0] = 0x08; s[31] = 0x41; s })]
-    #[case::max_below_2_255({ let mut s = [0xffu8; 32]; s[31] = 0x7f; s })] // 全桁で繰り上がる
+    #[case::mixed(clamp_integer([0x88; 32]))] // 桁が正・負に入り混じる
     fn edge_scalars(#[case] s: [u8; 32]) {
         let d = signed_digits(&s);
         assert_eq!(digits_in_range(&d), true, "{d:?}");
@@ -445,17 +512,22 @@ mod tests {
         Niels::from_affine(fe_of(&x), fe_of(&y))
     }
 
-    /// テーブルの全エントリ（22 行 × 2049）を、参照実装で `k * 2^(W*row) * B` を計算して検算する
+    /// テーブルの全エントリ（21 行 × 2049）を、参照実装で `k * 2^(W*row) * 8B`（最上位の行は
+    /// それに 2^254 * B を足した点）を計算して検算する
     #[rstest]
     fn table_matches_rfc_reference_exhaustively(
         #[values(
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
         )]
         row: usize,
     ) {
-        assert_eq!(ROWS, 22, "行を増減したら #[values] も合わせる");
-        let base = point_mul(&(num_bigint::BigInt::from(1) << (W * row)), &rfc8032::G);
-        let mut acc = [0, 1, 1, 0].map(num_bigint::BigInt::from); // 単位元
+        assert_eq!(ROWS, 21, "行を増減したら #[values] も合わせる");
+        let one = num_bigint::BigInt::from(1);
+        let base = point_mul(&(&one << (W * row + 3)), &rfc8032::G);
+        let mut acc = match row == ROWS - 1 {
+            true => point_mul(&(&one << 254), &rfc8032::G),
+            false => [0, 1, 1, 0].map(num_bigint::BigInt::from), // 単位元
+        };
         for (k, entry) in Table::get().row(row).iter().enumerate() {
             let got = compress(&Extended::IDENTITY.add_niels(entry));
             assert_eq!(got, point_compress(&acc), "row {row}, k {k}");
@@ -463,35 +535,15 @@ mod tests {
         }
     }
 
-    /// 倍算に渡すスカラー
-    #[derive(Debug, Clone, Copy)]
-    enum Scalars {
-        /// RFC 8032 Section 5.1.5 手順2でクランプしたもの（鍵の計算で実際に使う形）
-        Clamped,
-        /// 2^255 未満の任意の値（クランプしていないものも含む）
-        Below2_255,
-    }
-
-    impl Scalars {
-        fn strategy(self) -> BoxedStrategy<[u8; 32]> {
-            match self {
-                Scalars::Clamped => any::<[u8; 32]>().prop_map(clamp_integer).boxed(),
-                Scalars::Below2_255 => any::<[u8; 32]>()
-                    .prop_map(|mut s| {
-                        s[31] &= 0x7f;
-                        s
-                    })
-                    .boxed(),
-            }
-        }
+    /// 倍算に渡すスカラー（RFC 8032 Section 5.1.5 手順2でクランプしたもの。鍵の計算で実際に使う形）
+    fn clamped() -> impl Strategy<Value = [u8; 32]> {
+        any::<[u8; 32]>().prop_map(clamp_integer)
     }
 
     /// 符号付き 2^W 進の桁に分解して戻すと元の値（各桁は範囲内）
     #[rstest]
-    fn signed_digits_reconstruct_any_scalar(
-        #[values(Scalars::Clamped, Scalars::Below2_255)] scalars: Scalars,
-    ) {
-        check(1024, scalars.strategy(), |s| {
+    fn signed_digits_reconstruct_any_scalar() {
+        check(1024, clamped(), |s| {
             let d = signed_digits(&s);
             prop_assert!(digits_in_range(&d), "{:?}", d);
             prop_assert_eq!(reconstruct(&d), from_le(&s));
@@ -521,28 +573,22 @@ mod tests {
         }
     }
 
-    /// 任意のスカラーで、倍算が別の実装と一致する（参照実装は遅いので回数を減らす）
+    /// 任意のクランプ済みスカラーで、倍算が別の実装と一致する（参照実装は遅いので回数を減らす）
     #[rstest]
     #[case::dalek(Reference::Dalek, 1024)]
     #[case::rfc8032(Reference::Rfc8032, 128)]
-    fn mul_base_matches(
-        #[case] reference: Reference,
-        #[case] cases: u32,
-        #[values(Scalars::Clamped, Scalars::Below2_255)] scalars: Scalars,
-    ) {
-        check(cases, scalars.strategy(), |s| {
+    fn mul_base_matches(#[case] reference: Reference, #[case] cases: u32) {
+        check(cases, clamped(), |s| {
             prop_assert_eq!(compress(&mul_base(&s)), reference.mul_base(&s));
             Ok(())
         });
     }
 
-    /// 1つのバッチに入れた鍵どうしは混ざらない。途中の桁が 0 で加算を飛ばす鍵（2^254 など）を
+    /// 1つのバッチに入れた鍵どうしは混ざらない。途中の桁が 0 で加算を飛ばす鍵（2^254 = m が 0 など）を
     /// 混ぜても、どの位置の鍵も curve25519-dalek と一致する
     #[rstest]
-    fn mul_base_batch_keeps_keys_separate(
-        #[values(Scalars::Clamped, Scalars::Below2_255)] scalars: Scalars,
-    ) {
-        let strategy = (vec(scalars.strategy(), 8), vec(any::<bool>(), 8));
+    fn mul_base_batch_keeps_keys_separate() {
+        let strategy = (vec(clamped(), 8), vec(any::<bool>(), 8));
         check(64, strategy, |(random, sparse)| {
             let mut sparse_scalar = [0u8; 32];
             sparse_scalar[31] = 0x40; // 2^254: 途中の桁がすべて 0

@@ -71,6 +71,44 @@ impl Matcher {
     pub fn is_match(&self, b64: &PublicB64) -> bool {
         self.find(b64).is_some()
     }
+
+    /// x の符号を 0 にした公開鍵の base64 `b64` に、符号が 0 でも 1 でも文字列が含まれる可能性があるか。
+    /// 含まれる鍵ならかならず true（false なら、符号によらず含まれない）。true のときは符号を計算して
+    /// [`Matcher::is_match`] で確かめ直す。総当たり（[`Find::Naive`]）は高速化前の判定なので、いつも true
+    /// （符号を毎回計算する）
+    #[inline]
+    pub fn may_match_unsigned(&self, b64: &PublicB64) -> bool {
+        let Inner::Memmem { finder, fold } = &self.0 else {
+            return true;
+        };
+        if self.is_match(b64) {
+            return true;
+        }
+        // 符号が 1 なら変わるのは SIGN_CHAR の1文字だけなので、その文字を含む範囲だけ探し直す
+        let len = finder.needle().len();
+        let (lo, hi) = (
+            (SIGN_CHAR + 1).saturating_sub(len).max(SEARCH_START),
+            (SIGN_CHAR + len).min(PUBLIC_B64_LEN),
+        );
+        let mut window = [0u8; PUBLIC_B64_LEN];
+        let window = &mut window[..hi - lo];
+        window.copy_from_slice(&b64[lo..hi]);
+        window[SIGN_CHAR - lo] = with_sign(b64[SIGN_CHAR]);
+        if *fold {
+            window.iter_mut().for_each(|c| *c = fold_case(*c));
+        }
+        finder.find(window).is_some()
+    }
+}
+
+/// 公開鍵の base64 で、x の符号で変わる文字の位置（blob の最後のバイトの最上位ビットは、この文字の値のビット 1）
+pub const SIGN_CHAR: usize = PUBLIC_B64_LEN - 2;
+
+/// 符号が 0 のときの SIGN_CHAR の文字 `c` を、符号が 1 のときの文字にする（値のビット 1 を立てる）
+fn with_sign(c: u8) -> u8 {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let v = ALPHABET.iter().position(|&a| a == c).unwrap_or(0);
+    ALPHABET[v | 2]
 }
 
 /// base64 の文字を小文字にそろえる。base64 の文字表では、英大文字だけが 0x20 のビットを持たず、
@@ -146,6 +184,71 @@ mod tests {
             prop_assert_eq!(m.is_match(&b64), p.is_match(&b64));
             if planted {
                 prop_assert!(m.is_match(&b64), "埋め込んだのに見つからない");
+            }
+            Ok(())
+        });
+    }
+
+    /// 符号のビットは base64 の SIGN_CHAR の文字の値のビット 1 だけを変える
+    #[rstest]
+    fn sign_bit_changes_only_sign_char() {
+        check(256, any::<[u8; 32]>(), |mut pk| {
+            pk[31] &= 0x7f;
+            let mut unsigned = [0u8; PUBLIC_B64_LEN];
+            crate::model::key::encode_public_b64(&pk, &mut unsigned);
+            pk[31] |= 0x80;
+            let mut signed = [0u8; PUBLIC_B64_LEN];
+            crate::model::key::encode_public_b64(&pk, &mut signed);
+            for i in 0..PUBLIC_B64_LEN {
+                let want = if i == SIGN_CHAR {
+                    with_sign(unsigned[i])
+                } else {
+                    unsigned[i]
+                };
+                prop_assert_eq!(signed[i], want, "{}", i);
+            }
+            Ok(())
+        });
+    }
+
+    /// 符号を 0 にした base64 で may_match_unsigned が false なら、符号が 0 でも 1 でも含まれない。
+    /// 符号が 0・1 のどちらかで含まれるなら true（文字列は SIGN_CHAR の近くに埋め込むことが多い）
+    #[rstest]
+    fn may_match_unsigned_never_misses(
+        #[values("[A-Za-z0-9+/]{1,3}", "[A-Za-z0-9+/]{4,8}")] needles: &'static str,
+        #[values(false, true)] cs: bool,
+        #[values(Find::Memmem, Find::Naive)] how: Find,
+    ) {
+        let strategy = (any::<[u8; 32]>(), needles, 0usize..12, any::<bool>());
+        check(2048, strategy, |(mut pk, needle, back, plant)| {
+            let p = Pattern::new(&needle, cs).unwrap();
+            let m = Matcher::new(&p, how);
+            let encode = |pk: &[u8; 32]| {
+                let mut b = [0u8; PUBLIC_B64_LEN];
+                crate::model::key::encode_public_b64(pk, &mut b);
+                b
+            };
+            if plant {
+                // 符号が 1 の鍵の base64 の、SIGN_CHAR を含む位置に文字列を書いた鍵を作る（base64 から戻す）
+                pk[31] |= 0x80;
+                let mut b = encode(&pk);
+                let start = (SIGN_CHAR + 1)
+                    .saturating_sub(back.min(needle.len()))
+                    .min(PUBLIC_B64_LEN - needle.len());
+                b[start..start + needle.len()].copy_from_slice(needle.as_bytes());
+                use base64::Engine;
+                let blob = base64::engine::general_purpose::STANDARD.decode(b).unwrap();
+                pk = *blob.last_chunk::<32>().unwrap();
+            }
+            let mut unsigned = pk;
+            unsigned[31] &= 0x7f;
+            let mut signed = unsigned;
+            signed[31] |= 0x80;
+            let maybe = m.may_match_unsigned(&encode(&unsigned));
+            for b in [encode(&unsigned), encode(&signed)] {
+                if p.is_match(&b) {
+                    prop_assert!(maybe, "見逃した: {}", String::from_utf8_lossy(&b));
+                }
             }
             Ok(())
         });

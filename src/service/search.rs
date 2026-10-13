@@ -210,7 +210,8 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
 
     while !stop.load(Relaxed) {
         seeds.iter_mut().for_each(|s| rng.fill_bytes(s));
-        deriver.public_keys(&seeds, &mut publics);
+        // x の符号は、文字列が含まれそうな鍵だけ計算する（ほとんどの鍵は符号によらず含まれない）
+        deriver.public_keys_unsigned(&seeds, &mut publics);
 
         for (i, (seed, public)) in seeds.iter().zip(&publics).enumerate() {
             key::encode_public_b64(public, &mut b64);
@@ -218,7 +219,13 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
                 std::hint::black_box(&b64); // 判定せずに回す
                 continue;
             };
-            let hit = matcher.is_match(&b64);
+            let mut hit = matcher.may_match_unsigned(&b64);
+            if hit {
+                let mut signed = *public;
+                signed[31] |= deriver.sign(i) << 7;
+                key::encode_public_b64(&signed, &mut b64);
+                hit = matcher.is_match(&b64);
+            }
             if config.bench {
                 std::hint::black_box(hit); // 判定込みで測る: 当たっても止まらない
                 continue;
