@@ -2,12 +2,13 @@
 //!
 //! シードの生成から文字列の判定までを GPU のカーネル（`gpu/kernel.cu`）で行い、CPU は起動と結果の確認だけをする。
 //!
-//! - カーネルは compute_75（Turing）向けの PTX（`gpu/kernel.ptx`）を埋め込んでおき、起動時にドライバが
-//!   その GPU 向けに変換する（変換結果はドライバがキャッシュするので2回目からは速い）。要るのは NVIDIA の
-//!   ドライバ（libcuda / nvcuda.dll）だけで、CUDA Toolkit は要らない。ドライバが古くて PTX を読めないときだけ、
-//!   NVRTC（libnvrtc）があればその GPU 向けにコンパイルし直す。PTX は `cargo make ptx` で kernel.cu から作る
-//! - 表の幅 W と、逆元をまとめる鍵の数は選べる（[`GpuOptions`]、`--gpu-width`・`--gpu-batch`）。埋め込んだ PTX は
-//!   既定の値（[`DEFAULT_WIDTH`]・[`DEFAULT_BATCH`]）でコンパイルしたものなので、ほかの値では NVRTC でコンパイルする
+//! - カーネルの設定（表の幅 W と、逆元をまとめる鍵の数。[`GpuOptions`]）ごとに、compute_75（Turing）向けの
+//!   PTX（`gpu/ptx/`）を埋め込んでおく（[`EMBEDDED`]）。起動時にドライバがその GPU 向けに変換する
+//!   （変換結果はドライバがキャッシュするので2回目からは速い）。要るのは NVIDIA のドライバ（libcuda / nvcuda.dll）
+//!   だけで、CUDA Toolkit は要らない。PTX は `cargo make ptx` で kernel.cu から作る
+//! - 速い設定は GPU によって違うので、探す前に埋め込んだ設定を全部この GPU で短く測り、一番速いものを使う
+//!   （[`GpuSetting::Fastest`]）。`--gpu-width`・`--gpu-batch` で決めることもでき、埋め込んでいない設定や、
+//!   ドライバが古くて PTX を読めないときは、NVRTC（libnvrtc）があればその GPU 向けにコンパイルする
 //! - CUDA のライブラリは実行時に読み込むので、ビルドに CUDA は要らない
 //! - シードは `ChaCha20(鍵 = 起動ごとの乱数, ブロック番号 = 鍵の通し番号)` の先頭 32 バイト。
 //!   当たりは通し番号だけを受け取り、CPU で同じシードを作り直して ed25519-dalek で計算し、
@@ -36,17 +37,13 @@ use std::time::{Duration, Instant};
 /// カーネルのソース
 const KERNEL: &str = include_str!("gpu/kernel.cu");
 
-/// kernel.cu を compute_75 向けにコンパイルした PTX（`cargo make ptx` で作る）。1行目に kernel.cu の
-/// ハッシュ（[`kernel_hash`]）を書いておき、ソースと食い違っていないかをテストで確かめる
-const PTX: &str = include_str!("gpu/kernel.ptx");
-
 /// 埋め込む PTX の世代。これより新しい GPU でもドライバが変換して動かせる（Turing 〜 Blackwell）
 pub const PTX_ARCH: &str = "compute_75";
 
-/// 表の幅 W の既定（埋め込む PTX の値）
+/// 表の幅 W の既定（`--check` のように測らないとき）
 pub const DEFAULT_WIDTH: u32 = 12;
 
-/// 1スレッドが1回にまとめて計算する鍵の数（逆元をまとめる数）の既定（埋め込む PTX の値）
+/// 1スレッドが1回にまとめて計算する鍵の数（逆元をまとめる数）の既定（`--check` のように測らないとき）
 pub const DEFAULT_BATCH: u32 = 16;
 
 /// 選べる表の幅 W（kernel.cu の MEIKEY_W の範囲）
@@ -74,11 +71,72 @@ impl Default for GpuOptions {
 }
 
 impl GpuOptions {
+    pub const fn new(width: u32, batch: u32) -> Self {
+        GpuOptions { width, batch }
+    }
+
     /// 表の大きさ（バイト）
     pub fn table_bytes(&self) -> usize {
         let (rows, cols) = rows_cols(self.width as usize);
         rows * cols * ENTRY_WORDS * 4
     }
+
+    /// 埋め込む PTX のファイル名（`gpu/ptx/` の中）
+    pub fn ptx_file(&self) -> String {
+        format!("w{}_b{}.ptx", self.width, self.batch)
+    }
+}
+
+impl fmt::Display for GpuOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "W = {}・{} 鍵", self.width, self.batch)
+    }
+}
+
+/// PTX を埋め込んで、探す前に測る設定（表の幅 12・14・16 × まとめる鍵の数 16・32）
+pub const EMBEDDED: [GpuOptions; 6] = [
+    GpuOptions::new(12, 16),
+    GpuOptions::new(12, 32),
+    GpuOptions::new(14, 16),
+    GpuOptions::new(14, 32),
+    GpuOptions::new(16, 16),
+    GpuOptions::new(16, 32),
+];
+
+/// [`EMBEDDED`] の設定で kernel.cu を compute_75 向けにコンパイルした PTX（`cargo make ptx` で作る）。
+/// 1行目に kernel.cu と設定のハッシュ（[`kernel_hash`]）を書いておき、ソースと食い違っていないかをテストで確かめる
+const PTXS: [&str; 6] = [
+    include_str!("gpu/ptx/w12_b16.ptx"),
+    include_str!("gpu/ptx/w12_b32.ptx"),
+    include_str!("gpu/ptx/w14_b16.ptx"),
+    include_str!("gpu/ptx/w14_b32.ptx"),
+    include_str!("gpu/ptx/w16_b16.ptx"),
+    include_str!("gpu/ptx/w16_b32.ptx"),
+];
+
+/// 設定 `options` の埋め込んだ PTX（埋め込んでいない設定なら None）
+fn embedded_ptx(options: GpuOptions) -> Option<&'static str> {
+    EMBEDDED.iter().position(|&o| o == options).map(|i| PTXS[i])
+}
+
+/// カーネルの設定の決め方
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuSetting {
+    /// 埋め込んだ設定（[`EMBEDDED`]）を全部この GPU で測り、一番速いものを使う
+    Fastest,
+    /// この設定を使う（測らない）
+    Fixed(GpuOptions),
+    /// 測らずに既定の設定を使う（`--check` のように、探さないとき）
+    Default,
+}
+
+/// 設定をどう決めたか（表示用）
+#[derive(Debug, Clone)]
+enum Chosen {
+    /// 測って一番速かった。測った設定と速度（鍵/秒）
+    Fastest(Vec<(GpuOptions, f64)>),
+    Fixed,
+    Default,
 }
 
 /// 1ブロックのスレッド数
@@ -90,6 +148,13 @@ const TARGET_LAUNCH: Duration = Duration::from_millis(200);
 /// 画面をつないだ GPU での目安。Windows は GPU が約 2 秒応答しないとドライバをリセットし、
 /// 起動が長いと画面もその間固まるので短くする
 const DISPLAY_LAUNCH: Duration = Duration::from_millis(50);
+
+/// 設定を測るときの、1回の起動の長さと回数
+const MEASURE_LAUNCH: Duration = Duration::from_millis(100);
+const MEASURE_LAUNCHES: u32 = 3;
+
+/// 設定を測るときに探す文字列（判定の分も測るため。当たっても止まらない）
+const MEASURE_NEEDLE: &[u8] = b"meikey";
 
 /// 表の1エントリの語数（y+x, y-x, 2dxy の 10 リムずつと未使用の 2 語。kernel.cu の ENTRY_WORDS）
 const ENTRY_WORDS: usize = 32;
@@ -138,34 +203,208 @@ impl fmt::Display for GpuInfo {
     }
 }
 
-/// GPU で探す [`Searcher`]
-pub struct Gpu {
-    stream: Arc<CudaStream>,
+/// 1つの設定で読み込んだカーネルと、GPU に送った表
+struct Kernel {
     /// テストで別のカーネル（meikey_derive）を読むため
     #[cfg(test)]
     module: Arc<CudaModule>,
     func: CudaFunction,
     table: CudaSlice<u32>,
-    info: GpuInfo,
     options: GpuOptions,
     /// 起動するブロック数
     grid: u32,
-    /// 1回の起動にかける時間の目安
-    target: Duration,
 }
 
-impl Gpu {
-    /// `ordinal` 番目の GPU を使えるようにする（カーネルのコンパイルと表の転送をする）
-    pub fn new(ordinal: usize, options: GpuOptions) -> Result<Gpu, GpuError> {
+/// 探索の1回の起動に渡すもの（カーネルの引数のうち、起動ごとに変わらないもの）
+struct Launch {
+    key: CudaSlice<u32>,
+    needle: CudaSlice<u8>,
+    needle_len: u32,
+    fold: u32,
+    stop_on_hit: u32,
+    result: CudaSlice<u64>,
+    sink: CudaSlice<u32>,
+}
+
+impl Kernel {
+    /// 設定 `options` のカーネルを読み込み、表を送る。埋め込んだ PTX があればそれを、無いかドライバが読めなければ
+    /// NVRTC でこの GPU 向けにコンパイルしたものを使う
+    fn load(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        info: &GpuInfo,
+        options: GpuOptions,
+    ) -> Result<Kernel, GpuError> {
         if !WIDTHS.contains(&options.width) || !BATCHES.contains(&options.batch) {
             return Err(GpuError(format!(
-                "表の幅は {}〜{}、まとめる鍵の数は {}〜{}（{options:?}）",
+                "表の幅は {}〜{}、まとめる鍵の数は {}〜{}（{options}）",
                 WIDTHS.start(),
                 WIDTHS.end(),
                 BATCHES.start(),
                 BATCHES.end()
             )));
         }
+        let embedded =
+            embedded_ptx(options).map(|ptx| ctx.load_module(cudarc::nvrtc::Ptx::from_src(ptx)));
+        let module = match embedded {
+            Some(Ok(m)) => m,
+            // 埋め込んでいない設定か、ドライバが古くて埋め込んだ PTX を読めない: NVRTC でコンパイルする
+            other => {
+                // SAFETY: ライブラリを読み込めるか試すだけ
+                if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+                    return Err(GpuError(match other {
+                        Some(Err(e)) => format!(
+                            "PTX を読めない（{e}。ドライバを更新するか、NVRTC を入れて LD_LIBRARY_PATH / PATH に追加）"
+                        ),
+                        _ => format!(
+                            "{options} は埋め込んでいない設定なので NVRTC（libnvrtc）が要る（LD_LIBRARY_PATH / PATH に追加）"
+                        ),
+                    }));
+                }
+                ctx.load_module(compile(info.compute, options)?)?
+            }
+        };
+        let func = module.load_function("meikey_search")?;
+        // SM あたりに同時に載るブロック数（レジスタの使用量で決まる）の分だけ起動する
+        let per_sm = func
+            .occupancy_max_active_blocks_per_multiprocessor(BLOCK, 0, None)
+            .unwrap_or(2)
+            .max(1);
+        let table = stream.clone_htod(&table_words(options.width))?;
+        Ok(Kernel {
+            #[cfg(test)]
+            module,
+            func,
+            table,
+            options,
+            grid: info.sms.max(1) * per_sm,
+        })
+    }
+
+    /// 1回の起動で計算する鍵の数（1スレッドの繰り返し1回あたり）
+    fn keys_per_iter(&self) -> u64 {
+        u64::from(self.grid) * u64::from(BLOCK) * u64::from(self.options.batch)
+    }
+
+    /// 起動に渡すものを GPU に置く。`key` はシードを作る ChaCha20 の鍵、`needle` は探す文字列
+    /// （fold なら小文字にしたもの）
+    fn prepare(
+        &self,
+        stream: &Arc<CudaStream>,
+        key: &[u8; 32],
+        needle: &[u8],
+        fold: bool,
+        stop_on_hit: bool,
+    ) -> Result<Launch, GpuError> {
+        let key_words: Vec<u32> = key
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        Ok(Launch {
+            key: stream.clone_htod(&key_words)?,
+            needle: stream.clone_htod(&[needle, &[0; 64]].concat())?,
+            needle_len: needle.len() as u32,
+            fold: u32::from(fold),
+            stop_on_hit: u32::from(stop_on_hit),
+            result: stream.alloc_zeros::<u64>(2)?,
+            sink: stream.alloc_zeros::<u32>((self.grid * BLOCK) as usize)?,
+        })
+    }
+
+    /// 通し番号 `base` から、1スレッドが `iters` 回ずつ計算する起動を1回して、終わるまで待つ。
+    /// 当たりがあれば、その通し番号を返す
+    fn launch(
+        &self,
+        stream: &Arc<CudaStream>,
+        l: &mut Launch,
+        base: u64,
+        iters: u32,
+    ) -> Result<Option<u64>, GpuError> {
+        let mut b = stream.launch_builder(&self.func);
+        b.arg(&self.table)
+            .arg(&l.key)
+            .arg(&l.needle)
+            .arg(&l.needle_len)
+            .arg(&l.fold)
+            .arg(&base)
+            .arg(&iters)
+            .arg(&l.stop_on_hit)
+            .arg(&mut l.result)
+            .arg(&mut l.sink);
+        let cfg = LaunchConfig {
+            grid_dim: (self.grid, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: 引数の型と並びは kernel.cu の meikey_search と同じ。sink はスレッド数ぶん、
+        // result は 2 語、needle は文字列 + 余白 64 バイト確保してある
+        unsafe { b.launch(cfg)? };
+        let found = stream.clone_dtoh(&l.result)?; // 終わるまで待つ
+        Ok((found[0] != 0).then_some(found[1]))
+    }
+
+    /// この GPU での速度（鍵/秒）。1回 [`MEASURE_LAUNCH`] ほどの起動を [`MEASURE_LAUNCHES`] 回して測る
+    /// （最初の1回は、繰り返し回数を決めるための短い起動）
+    fn measure(&self, stream: &Arc<CudaStream>) -> Result<f64, GpuError> {
+        let mut l = self.prepare(stream, &[0x5a; 32], MEASURE_NEEDLE, true, false)?;
+        let start = Instant::now();
+        self.launch(stream, &mut l, 0, 1)?;
+        let once = start.elapsed().as_secs_f64().max(1e-6);
+        let iters = (MEASURE_LAUNCH.as_secs_f64() / once).clamp(1.0, f64::from(1u32 << 16)) as u32;
+        let start = Instant::now();
+        for i in 0..MEASURE_LAUNCHES {
+            let base = u64::from(i + 1) * self.keys_per_iter() * u64::from(iters);
+            self.launch(stream, &mut l, base, iters)?;
+        }
+        let keys = self.keys_per_iter() * u64::from(iters) * u64::from(MEASURE_LAUNCHES);
+        Ok(keys as f64 / start.elapsed().as_secs_f64().max(1e-9))
+    }
+}
+
+/// 設定 `candidates` を順に `measure` で読み込んで測り、一番速いものを返す。ほかのものは測ったらすぐ捨てる
+/// （GPU のメモリを空けるため）。読み込めない設定は飛ばし、全部だめなら最初のエラーを返す
+fn fastest<K>(
+    candidates: &[GpuOptions],
+    mut measure: impl FnMut(GpuOptions) -> Result<(K, f64), GpuError>,
+) -> Result<(K, Vec<(GpuOptions, f64)>), GpuError> {
+    let mut best: Option<(K, f64)> = None;
+    let mut results = Vec::new();
+    let mut first_error = None;
+    for &options in candidates {
+        match measure(options) {
+            Ok((k, speed)) => {
+                results.push((options, speed));
+                if best.as_ref().is_none_or(|(_, s)| speed > *s) {
+                    best = Some((k, speed));
+                }
+            }
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match best {
+        Some((k, _)) => Ok((k, results)),
+        None => Err(first_error.unwrap_or_else(|| GpuError("測る設定が無い".into()))),
+    }
+}
+
+/// GPU で探す [`Searcher`]
+pub struct Gpu {
+    stream: Arc<CudaStream>,
+    kernel: Kernel,
+    info: GpuInfo,
+    chosen: Chosen,
+    /// 1回の起動にかける時間の目安
+    target: Duration,
+}
+
+impl Gpu {
+    /// `ordinal` 番目の GPU を使えるようにする（カーネルの読み込みと表の転送をする。
+    /// [`GpuSetting::Fastest`] なら、埋め込んだ設定を全部測ってから一番速いものを使う）
+    pub fn new(ordinal: usize, setting: GpuSetting) -> Result<Gpu, GpuError> {
         // SAFETY: ライブラリを読み込めるか試すだけ
         if !unsafe { cudarc::driver::sys::is_culib_present() } {
             return Err(GpuError(
@@ -181,54 +420,35 @@ impl Gpu {
                 as u32,
             memory: ctx.total_mem()?,
         };
-        let module = if options == GpuOptions::default() {
-            match ctx.load_module(cudarc::nvrtc::Ptx::from_src(PTX)) {
-                Ok(m) => m,
-                // ドライバが古くて埋め込んだ PTX を読めない: NVRTC があればこの GPU 向けにコンパイルし直す
-                Err(embedded) => {
-                    // SAFETY: ライブラリを読み込めるか試すだけ
-                    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
-                        return Err(GpuError(format!(
-                            "PTX を読めない（{embedded}。ドライバを更新するか、NVRTC を入れて LD_LIBRARY_PATH / PATH に追加）"
-                        )));
-                    }
-                    ctx.load_module(compile(info.compute, options)?)?
-                }
-            }
-        } else {
-            // 埋め込んだ PTX は既定の設定のものなので、この設定でコンパイルする
-            // SAFETY: ライブラリを読み込めるか試すだけ
-            if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
-                return Err(GpuError(format!(
-                    "表の幅・まとめる鍵の数を既定（{DEFAULT_WIDTH}・{DEFAULT_BATCH}）から変えるには NVRTC（libnvrtc）が要る（LD_LIBRARY_PATH / PATH に追加）"
-                )));
-            }
-            ctx.load_module(compile(info.compute, options)?)?
-        };
-        let func = module.load_function("meikey_search")?;
         // 画面をつないだ GPU（カーネルの実行時間に制限がある）なら起動を短くする
         let target =
             match ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT) {
                 Ok(1) => DISPLAY_LAUNCH,
                 _ => TARGET_LAUNCH,
             };
-        // SM あたりに同時に載るブロック数（レジスタの使用量で決まる）の分だけ起動する
-        let per_sm = func
-            .occupancy_max_active_blocks_per_multiprocessor(BLOCK, 0, None)
-            .unwrap_or(2)
-            .max(1);
-        let grid = info.sms.max(1) * per_sm;
         let stream = ctx.default_stream();
-        let table = stream.clone_htod(&table_words(options.width))?;
+        let (kernel, chosen) = match setting {
+            GpuSetting::Fixed(options) => {
+                (Kernel::load(&ctx, &stream, &info, options)?, Chosen::Fixed)
+            }
+            GpuSetting::Default => (
+                Kernel::load(&ctx, &stream, &info, GpuOptions::default())?,
+                Chosen::Default,
+            ),
+            GpuSetting::Fastest => {
+                let (kernel, results) = fastest(&EMBEDDED, |options| {
+                    let k = Kernel::load(&ctx, &stream, &info, options)?;
+                    let speed = k.measure(&stream)?;
+                    Ok((k, speed))
+                })?;
+                (kernel, Chosen::Fastest(results))
+            }
+        };
         Ok(Gpu {
             stream,
-            #[cfg(test)]
-            module,
-            func,
-            table,
+            kernel,
             info,
-            options,
-            grid,
+            chosen,
             target,
         })
     }
@@ -237,9 +457,9 @@ impl Gpu {
         &self.info
     }
 
-    /// 1回の起動で計算する鍵の数（1スレッドの繰り返し1回あたり）
-    fn keys_per_iter(&self) -> u64 {
-        u64::from(self.grid) * u64::from(BLOCK) * u64::from(self.options.batch)
+    /// 使っている設定
+    pub fn options(&self) -> GpuOptions {
+        self.kernel.options
     }
 
     fn search(
@@ -247,30 +467,18 @@ impl Gpu {
         config: &SearchConfig,
         on_progress: &mut dyn Progress,
     ) -> Result<Outcome, GpuError> {
-        let stream = &self.stream;
+        let (stream, kernel) = (&self.stream, &self.kernel);
         // シードを作る ChaCha20 の鍵（起動ごとに新しい乱数）
         let key: [u8; 32] = rand::random();
-        let key_words: Vec<u32> = key
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|w| u32::from_le_bytes(*w))
-            .collect();
-        let key_dev = stream.clone_htod(&key_words)?;
         // 探す文字列（大小文字を区別しないなら、GPU 側で base64 を小文字にして比べるので小文字に）
         let (needle, fold) = match &config.pattern {
-            Some(p) if p.case_sensitive() => (p.as_str().as_bytes().to_vec(), 0u32),
-            Some(p) => (p.as_str().to_ascii_lowercase().into_bytes(), 1u32),
+            Some(p) if p.case_sensitive() => (p.as_str().as_bytes().to_vec(), false),
+            Some(p) => (p.as_str().to_ascii_lowercase().into_bytes(), true),
             // ベンチマークで判定しないとき: 長さ 0 は一致しない
-            None => (Vec::new(), 0u32),
+            None => (Vec::new(), false),
         };
-        let needle_len = needle.len() as u32;
-        let needle_dev = stream.clone_htod(&[needle, vec![0; 64]].concat())?;
-        let mut result = stream.alloc_zeros::<u64>(2)?;
-        let nthreads = (self.grid * BLOCK) as usize;
-        let mut sink = stream.alloc_zeros::<u32>(nthreads)?;
         // ベンチマークでは当たっても止まらない
-        let stop_on_hit = u32::from(!config.bench);
+        let mut l = kernel.prepare(stream, &key, &needle, fold, !config.bench)?;
 
         let start = Instant::now();
         let mut tries = 0u64;
@@ -278,36 +486,18 @@ impl Gpu {
         let mut next_report = start + config.progress_interval;
         loop {
             let launch = Instant::now();
-            let base = tries;
-            let mut b = stream.launch_builder(&self.func);
-            b.arg(&self.table)
-                .arg(&key_dev)
-                .arg(&needle_dev)
-                .arg(&needle_len)
-                .arg(&fold)
-                .arg(&base)
-                .arg(&iters)
-                .arg(&stop_on_hit)
-                .arg(&mut result)
-                .arg(&mut sink);
-            let cfg = LaunchConfig {
-                grid_dim: (self.grid, 1, 1),
-                block_dim: (BLOCK, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            // SAFETY: 引数の型と並びは kernel.cu の meikey_search と同じ。sink はスレッド数ぶん、
-            // result は 2 語、needle は文字列 + 余白 64 バイト確保してある
-            unsafe { b.launch(cfg)? };
-            let found = stream.clone_dtoh(&result)?; // 終わるまで待つ
+            let found = kernel.launch(stream, &mut l, tries, iters)?;
             let took = launch.elapsed();
-            tries += self.keys_per_iter() * u64::from(iters);
+            tries += kernel.keys_per_iter() * u64::from(iters);
             let stats = Stats {
                 tries,
                 elapsed: start.elapsed(),
             };
 
-            if stop_on_hit == 1 && found[0] != 0 {
-                let key = self.confirm(&key, found[1], config);
+            if let Some(index) = found
+                && !config.bench
+            {
+                let key = self.confirm(&key, index, config);
                 return Ok(Outcome {
                     key: Some(key),
                     stats,
@@ -352,26 +542,32 @@ impl Searcher for Gpu {
     }
 
     fn status(&self, _config: &SearchConfig) -> Vec<(&'static str, String)> {
-        let i = &self.info;
+        let (i, k) = (&self.info, &self.kernel);
+        let how = match &self.chosen {
+            Chosen::Fastest(results) => format!("{} 通りを測って一番速いもの", results.len()),
+            Chosen::Fixed => "指定".into(),
+            Chosen::Default => "既定。--check では測らない".into(),
+        };
         vec![
             ("GPU", i.name.clone()),
             ("世代", format!("sm_{}{}", i.compute.0, i.compute.1)),
             ("SM", i.sms.to_string()),
             ("メモリ", format!("{:.0} GB", i.memory as f64 / 1e9)),
+            ("設定", format!("{}（{how}）", k.options)),
             // CPU と同時に探すとき、CPU の「並列」と並ぶので別の名前にする
             (
                 "グリッド",
                 format!(
                     "{} ブロック × {} スレッド × {} 鍵",
-                    self.grid, BLOCK, self.options.batch
+                    k.grid, BLOCK, k.options.batch
                 ),
             ),
             (
                 "表",
                 format!(
                     "W = {}（{:.1} MB）",
-                    self.options.width,
-                    self.options.table_bytes() as f64 / 1e6
+                    k.options.width,
+                    k.options.table_bytes() as f64 / 1e6
                 ),
             ),
         ]
@@ -420,28 +616,30 @@ fn compile_for(arch: &str, options: GpuOptions) -> Result<cudarc::nvrtc::Ptx, Co
 }
 
 /// kernel.cu（改行は LF にそろえる）とコンパイルの設定のハッシュ（埋め込む PTX の1行目に書く）
-pub fn kernel_hash() -> String {
+pub fn kernel_hash(options: GpuOptions) -> String {
     use sha2::{Digest, Sha256};
     let source = KERNEL.replace('\r', "");
     let digest = Sha256::digest(format!(
-        "{source}\n// {PTX_ARCH} W={DEFAULT_WIDTH} BATCH={DEFAULT_BATCH}"
+        "{source}\n// {PTX_ARCH} W={} BATCH={}",
+        options.width, options.batch
     ));
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 埋め込む PTX（kernel.ptx の中身）を NVRTC で作る（`cargo make ptx`）。互換性のため、なるべく古い NVRTC で作る
-/// （PTX の版はコンパイルした NVRTC の版で決まり、それより古いドライバでは読めない）
-pub fn portable_ptx() -> Result<String, GpuError> {
+/// 設定 `options` の埋め込む PTX（`gpu/ptx/` のファイルの中身）を NVRTC で作る（`cargo make ptx`）。
+/// 互換性のため、なるべく古い NVRTC で作る（PTX の版はコンパイルした NVRTC の版で決まり、それより古いドライバでは読めない）
+pub fn portable_ptx(options: GpuOptions) -> Result<String, GpuError> {
     // SAFETY: ライブラリを読み込めるか試すだけ
     if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
         return Err(GpuError("libnvrtc が見つからない".into()));
     }
-    let ptx =
-        compile_for(PTX_ARCH, GpuOptions::default()).map_err(|e| GpuError(compile_error(&e)))?;
+    let ptx = compile_for(PTX_ARCH, options).map_err(|e| GpuError(compile_error(&e)))?;
     Ok(format!(
         // PTX は ASCII だけ（ptxas は ASCII 以外の文字を受け付けない）
-        "// meikey: sha256(kernel.cu) = {} (regenerate: cargo make ptx)\n{}",
-        kernel_hash(),
+        "// meikey: sha256(kernel.cu, W={}, BATCH={}) = {} (regenerate: cargo make ptx)\n{}",
+        options.width,
+        options.batch,
+        kernel_hash(options),
         ptx.to_src()
     ))
 }
@@ -849,19 +1047,73 @@ mod tests {
         });
     }
 
-    /// 埋め込んだ PTX は今の kernel.cu から作ったもの（違えば `cargo make ptx` で作り直す）
+    /// 埋め込んだ PTX は今の kernel.cu とその設定から作ったもの（違えば `cargo make ptx` で作り直す）
     #[rstest]
-    fn embedded_ptx_matches_kernel_source() {
-        let first = PTX.lines().next().unwrap_or_default();
+    fn embedded_ptx_matches_kernel_source(#[values(0, 1, 2, 3, 4, 5)] i: usize) {
+        let (options, ptx) = (EMBEDDED[i], PTXS[i]);
+        let first = ptx.lines().next().unwrap_or_default();
         assert_eq!(
-            first.contains(&kernel_hash()),
+            first.contains(&kernel_hash(options)),
             true,
-            "kernel.ptx が kernel.cu と食い違っている（cargo make ptx で作り直す）: {first}"
+            "{} が kernel.cu と食い違っている（cargo make ptx で作り直す）: {first}",
+            options.ptx_file()
         );
         assert_eq!(
-            PTX.contains(".target sm_75") && PTX.contains(".entry meikey_search"),
+            ptx.contains(".target sm_75") && ptx.contains(".entry meikey_search"),
             true
         );
+        assert_eq!(embedded_ptx(options), Some(ptx));
+    }
+
+    /// 埋め込んだ設定はどれも選べる範囲にあり、重ならず、測らないときの既定も含む
+    #[rstest]
+    fn embedded_options_are_valid() {
+        for (i, o) in EMBEDDED.iter().enumerate() {
+            assert_eq!(
+                WIDTHS.contains(&o.width) && BATCHES.contains(&o.batch),
+                true,
+                "{o}"
+            );
+            assert_eq!(EMBEDDED[..i].contains(o), false, "{o} が重なっている");
+        }
+        assert_eq!(EMBEDDED.contains(&GpuOptions::default()), true);
+        assert_eq!(embedded_ptx(GpuOptions::new(13, 16)), None);
+    }
+
+    /// 測った中で一番速い設定を選び、ほかは捨てる。読み込めない設定は飛ばし、全部だめなら最初のエラー
+    #[rstest]
+    #[case::picks_fastest(&[Ok(5.7), Ok(6.1), Ok(7.0), Ok(6.8)], Ok(2))]
+    #[case::first_of_ties(&[Ok(3.0), Ok(3.0)], Ok(0))]
+    #[case::skips_errors(&[Err("a"), Ok(1.0), Err("b"), Ok(2.0)], Ok(3))]
+    #[case::all_errors(&[Err("a"), Err("b")], Err("a"))]
+    #[case::nothing(&[], Err("測る設定が無い"))]
+    fn fastest_picks_the_fastest(
+        #[case] speeds: &[Result<f64, &str>],
+        #[case] want: Result<usize, &str>,
+    ) {
+        let candidates: Vec<GpuOptions> = (0..speeds.len() as u32)
+            .map(|i| GpuOptions::new(i + 2, 1))
+            .collect();
+        let mut measured = Vec::new();
+        let got = fastest(&candidates, |o| {
+            let i = (o.width - 2) as usize;
+            measured.push(i);
+            speeds[i].map(|s| (i, s)).map_err(|e| GpuError(e.into()))
+        });
+        assert_eq!(
+            measured,
+            (0..speeds.len()).collect::<Vec<_>>(),
+            "全部を順に測る"
+        );
+        match (got, want) {
+            (Ok((k, results)), Ok(w)) => {
+                assert_eq!(k, w);
+                let ok: Vec<f64> = speeds.iter().filter_map(|s| s.ok()).collect();
+                assert_eq!(results.iter().map(|r| r.1).collect::<Vec<_>>(), ok);
+            }
+            (Err(e), Err(w)) => assert_eq!(e.to_string(), w),
+            (got, want) => panic!("{:?} ではなく {want:?}", got.map(|(k, _)| k)),
+        }
     }
 
     // ---- NVRTC・GPU があるときだけ（無ければ飛ばす。MEIKEY_REQUIRE_SIMD に nvrtc・cuda があれば失敗させる） ----
@@ -879,7 +1131,10 @@ mod tests {
         let present =
             unsafe { driver_present() } && CudaContext::device_count().is_ok_and(|n| n > 0);
         available("cuda", present.then_some(()))?;
-        Some(Gpu::new(0, GpuOptions::default()).expect("GPU を使えるようにできる"))
+        Some(
+            Gpu::new(0, GpuSetting::Fixed(GpuOptions::default()))
+                .expect("GPU を使えるようにできる"),
+        )
     }
 
     /// カーネルは Turing（T4）から Blackwell（RTX PRO 6000）まで、各世代向けに、選べる設定の端の値でも
@@ -914,16 +1169,19 @@ mod tests {
         let Some(gpu) = gpu else {
             return;
         };
-        let f = gpu.module.load_function("meikey_derive").unwrap();
+        let f = gpu.kernel.module.load_function("meikey_derive").unwrap();
         let key: [u8; 32] = random();
         let first = 1 << 40;
         let (blocks, threads) = (8u32, BLOCK);
-        let n = (blocks * threads) as usize * gpu.options.batch as usize;
+        let n = (blocks * threads) as usize * gpu.kernel.options.batch as usize;
         let stream = &gpu.stream;
         let key_dev = stream.clone_htod(&key_words(&key)).unwrap();
         let mut out = stream.alloc_zeros::<u8>(n * 32).unwrap();
         let mut b = stream.launch_builder(&f);
-        b.arg(&gpu.table).arg(&key_dev).arg(&first).arg(&mut out);
+        b.arg(&gpu.kernel.table)
+            .arg(&key_dev)
+            .arg(&first)
+            .arg(&mut out);
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -936,6 +1194,34 @@ mod tests {
             let want = VanityKey::from_seed(seed(&key, first + i as u64));
             assert_eq!(pk, want.public_bytes(), "#{i}");
         }
+    }
+
+    /// 設定を測って選ぶと、埋め込んだ設定を全部測って、その中で一番速いものを使う。その設定でも鍵が見つかる
+    #[rstest]
+    fn gpu_uses_the_fastest_setting(gpu: Option<Gpu>) {
+        if gpu.is_none() {
+            return;
+        }
+        let gpu = Gpu::new(0, GpuSetting::Fastest).expect("GPU を使えるようにできる");
+        let Chosen::Fastest(results) = &gpu.chosen else {
+            panic!("測っていない");
+        };
+        assert_eq!(
+            results.iter().map(|r| r.0).collect::<Vec<_>>(),
+            EMBEDDED.to_vec()
+        );
+        let best = results.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        assert_eq!(gpu.options(), best.0);
+        let p = Pattern::new("Ab1", false).unwrap();
+        let config = SearchConfig {
+            time_limit: Some(Duration::from_secs(60)),
+            ..SearchConfig::new(Some(p.clone()))
+        };
+        let key = gpu
+            .run(&config, &mut |_| {})
+            .key
+            .expect("3文字ならすぐ見つかる");
+        assert_eq!(p.is_match(&key.public_b64()), true);
     }
 
     /// GPU で探すと、文字列を含む鍵が見つかる（大小文字の区別あり・なし）。ベンチマークは時間で止まる

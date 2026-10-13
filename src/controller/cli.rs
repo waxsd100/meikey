@@ -91,26 +91,16 @@ struct Cli {
     both: bool,
 
     /// GPU の表の幅 W（2〜16）。大きいほど点の足し算が減り、表は大きくなる（12 で約 5.8 MB、16 で約 67 MB）。
-    /// 既定の 12 から変えると、起動時に NVRTC でカーネルをコンパイルする
+    /// --gpu-width・--gpu-batch を付けなければ、探す前にこの GPU で測って一番速い組み合わせを使う。
+    /// 幅 12・14・16 と 16・32 鍵の組み合わせ以外は、起動時に NVRTC でカーネルをコンパイルする
     #[cfg(feature = "cuda")]
-    #[arg(
-        long,
-        value_name = "W",
-        default_value_t = crate::service::gpu::DEFAULT_WIDTH,
-        value_parser = clap::value_parser!(u32).range(2..=16)
-    )]
-    gpu_width: u32,
+    #[arg(long, value_name = "W", value_parser = clap::value_parser!(u32).range(2..=16))]
+    gpu_width: Option<u32>,
 
-    /// GPU の1スレッドが、逆元を1回にまとめて計算する鍵の数（1〜64）。
-    /// 既定の 16 から変えると、起動時に NVRTC でカーネルをコンパイルする
+    /// GPU の1スレッドが、逆元を1回にまとめて計算する鍵の数（1〜64）
     #[cfg(feature = "cuda")]
-    #[arg(
-        long,
-        value_name = "N",
-        default_value_t = crate::service::gpu::DEFAULT_BATCH,
-        value_parser = clap::value_parser!(u32).range(1..=64)
-    )]
-    gpu_batch: u32,
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=64))]
+    gpu_batch: Option<u32>,
 }
 
 /// 探すのに使うもの（既定は CPU、--gpu で GPU、--both で両方）
@@ -165,24 +155,47 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     match device(cli) {
         Device::Cpu => run(cli, &Parallel, &KeyFiles),
         #[cfg(feature = "cuda")]
-        Device::Gpu => run(
+        Device::Gpu => run(cli, &gpu(cli)?, &KeyFiles),
+        #[cfg(feature = "cuda")]
+        Device::Both => run(
             cli,
-            &crate::service::gpu::Gpu::new(0, gpu_options(cli))?,
+            &crate::service::search::Both(gpu(cli)?, Parallel),
             &KeyFiles,
         ),
-        #[cfg(feature = "cuda")]
-        Device::Both => {
-            let gpu = crate::service::gpu::Gpu::new(0, gpu_options(cli))?;
-            run(cli, &crate::service::search::Both(gpu, Parallel), &KeyFiles)
-        }
     }
 }
 
+/// GPU を使えるようにする。設定を測ると数秒かかるので、引数の誤りや既にある出力先は先に確かめる
 #[cfg(feature = "cuda")]
-fn gpu_options(cli: &Cli) -> crate::service::gpu::GpuOptions {
-    crate::service::gpu::GpuOptions {
-        width: cli.gpu_width,
-        batch: cli.gpu_batch,
+fn gpu(cli: &Cli) -> Result<crate::service::gpu::Gpu, Box<dyn std::error::Error>> {
+    use crate::service::gpu::{EMBEDDED, Gpu, GpuSetting};
+    if !cli.check {
+        Pattern::new(cli.target.as_ref().unwrap(), cli.case_sensitive)?;
+        check_comment(&cli.comment)?;
+        if cli.bench.is_none() {
+            check_output(cli, &KeyFiles)?;
+        }
+    }
+    let setting = gpu_options(cli);
+    if setting == GpuSetting::Fastest {
+        eprintln!("GPU の設定を測っています（{} 通り）", EMBEDDED.len());
+    }
+    Ok(Gpu::new(0, setting)?)
+}
+
+/// GPU の設定の決め方: --gpu-width・--gpu-batch のどちらかがあればそれ（無いほうは既定）、
+/// --check は測らずに既定、それ以外はこの GPU で測って一番速いもの
+#[cfg(feature = "cuda")]
+fn gpu_options(cli: &Cli) -> crate::service::gpu::GpuSetting {
+    use crate::service::gpu::{GpuOptions, GpuSetting};
+    let default = GpuOptions::default();
+    match (cli.gpu_width, cli.gpu_batch) {
+        (None, None) if cli.check => GpuSetting::Default,
+        (None, None) => GpuSetting::Fastest,
+        (width, batch) => GpuSetting::Fixed(GpuOptions {
+            width: width.unwrap_or(default.width),
+            batch: batch.unwrap_or(default.batch),
+        }),
     }
 }
 
@@ -311,6 +324,16 @@ fn bench(
     Ok(())
 }
 
+/// 出力先に鍵のファイルが既にあれば（--force でなければ）エラー
+fn check_output(cli: &Cli, repo: &impl KeyRepository) -> Result<(), Box<dyn std::error::Error>> {
+    if !cli.force
+        && let Some(p) = repo.existing(&cli.output)?
+    {
+        return Err(format!("既に存在: {}（--force で上書き）", p.display()).into());
+    }
+    Ok(())
+}
+
 fn generate(
     cli: &Cli,
     searcher: &impl Searcher,
@@ -318,13 +341,9 @@ fn generate(
     config: SearchConfig,
     pattern: &Pattern,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !cli.force
-        && let Some(p) = repo.existing(&cli.output)?
-    {
-        // 何時間も回したあとで書き込めない、を防ぐため先に確認する
-        // （書き込み時も確かめ、間に作られたファイルは上書きしない）
-        return Err(format!("既に存在: {}（--force で上書き）", p.display()).into());
-    }
+    // 何時間も回したあとで書き込めない、を防ぐため先に確認する
+    // （書き込み時も確かめ、間に作られたファイルは上書きしない）
+    check_output(cli, repo)?;
 
     let expected = pattern.expected_tries();
 
@@ -406,6 +425,8 @@ mod tests {
     use crate::model::key::VanityKey;
     use crate::model::search::Outcome;
     use crate::repository::key_file::MockKeyRepository;
+    #[cfg(feature = "cuda")]
+    use crate::service::gpu::{GpuOptions, GpuSetting};
     use crate::service::search::MockSearcher;
     use mockall::Sequence;
     use mockall::predicate::eq;
@@ -690,26 +711,24 @@ mod tests {
         assert_eq!(parsed.ok().map(|c| device(&c)), want);
     }
 
-    /// --gpu-width・--gpu-batch は範囲内の値だけ受け付け、GPU の設定に届く（無ければ既定）
+    /// GPU の設定: 何も付けなければ測って一番速いもの、--check なら測らずに既定、--gpu-width・--gpu-batch は
+    /// 範囲内の値だけ受け付けてそのまま使う（片方だけなら、もう片方は既定）
     #[cfg(feature = "cuda")]
     #[rstest]
-    #[case::defaults(&[], Some((12, 16)))]
-    #[case::wide(&["--gpu-width", "16", "--gpu-batch", "32"], Some((16, 32)))]
-    #[case::smallest(&["--gpu-width", "2", "--gpu-batch", "1"], Some((2, 1)))]
-    #[case::largest_batch(&["--gpu-batch", "64"], Some((12, 64)))]
+    #[case::fastest(&[], Some(GpuSetting::Fastest))]
+    #[case::check(&["--check"], Some(GpuSetting::Default))]
+    #[case::both(&["--gpu-width", "16", "--gpu-batch", "32"], Some(GpuSetting::Fixed(GpuOptions::new(16, 32))))]
+    #[case::width_only(&["--gpu-width", "14"], Some(GpuSetting::Fixed(GpuOptions::new(14, 16))))]
+    #[case::batch_only(&["--gpu-batch", "64"], Some(GpuSetting::Fixed(GpuOptions::new(12, 64))))]
+    #[case::check_with_width(&["--check", "--gpu-width", "16"], Some(GpuSetting::Fixed(GpuOptions::new(16, 16))))]
+    #[case::smallest(&["--gpu-width", "2", "--gpu-batch", "1"], Some(GpuSetting::Fixed(GpuOptions::new(2, 1))))]
     #[case::width_too_large(&["--gpu-width", "17"], None)]
     #[case::width_too_small(&["--gpu-width", "1"], None)]
     #[case::batch_zero(&["--gpu-batch", "0"], None)]
     #[case::batch_too_large(&["--gpu-batch", "65"], None)]
-    fn gpu_options_from_flags(#[case] options: &[&str], #[case] want: Option<(u32, u32)>) {
+    fn gpu_options_from_flags(#[case] options: &[&str], #[case] want: Option<GpuSetting>) {
         let parsed = Cli::try_parse_from(["meikey", "abc", "--gpu"].iter().chain(options));
-        assert_eq!(
-            parsed
-                .ok()
-                .map(|c| gpu_options(&c))
-                .map(|o| (o.width, o.batch)),
-            want
-        );
+        assert_eq!(parsed.ok().map(|c| gpu_options(&c)), want);
     }
 
     /// --gpu・--both は feature cuda が無ければ受け付けない
