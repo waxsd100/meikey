@@ -65,7 +65,7 @@ meikey の速さは [ベンチマーク](benchmark.md) にある。
   - Rust のツールは `-C target-cpu=native` を付けてビルドする。Go のツールは最新の Go でビルドする
   - vanity-ssh-rs と vanissh は crates.io から、ほかは GitHub の最新のコミットから入れる
   - vanity-ssh-keygen は Go の内部の関数を `go:linkname` で呼んでいるので、`-ldflags=-checklinkname=0` を付けてビルドする
-  - ed25519brute-cuda は README では Windows（MSVC と CMake）でビルドするので、Colab では `nvcc` で直接ビルドする
+  - ed25519brute-cuda は README では Windows（MSVC と CMake）でビルドするので、Colab では `build.bat` と同じオプション（`-rdc=true` など）で `nvcc` を直接呼び、世代だけ `-arch=native` にする
   - vanity-key-ssh の GPU 版は `-arch=native` でビルドする
 - オプションは、スレッド数などを含めて各ツールの既定のまま。スレッド数の既定が 1 の ssh-keygen-ed25519-vanity の Rust 版だけ、`-j` に CPU のスレッド数を渡す。1 スレッドで動く C 版は、CPU のスレッド数だけ同時に動かす
 - 速さの読み方

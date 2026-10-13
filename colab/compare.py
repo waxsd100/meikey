@@ -161,7 +161,10 @@ BUILDS = [
           has_opencl_gpu, "OpenCL で使える NVIDIA の GPU"),
     Build("ed25519brute-cuda", "https://github.com/4equest/ed25519brute-cuda",
           clone("https://github.com/4equest/ed25519brute-cuda", "ed25519brute-cuda")
-          + " && nvcc -O3 --use_fast_math -std=c++17 -arch=native -Isrc -o ed25519brute_cuda src/main.cu",
+          # build.bat と同じ指定（-rdc=true が無いと、extern で宣言した __device__ の変数を定義したところで
+          # ホストのコンパイラがエラーにする）。世代は -arch=native
+          + " && nvcc -O3 --use_fast_math --extra-device-vectorization -arch=native -rdc=true -lcudadevrt -t 0"
+          + " -o ed25519brute_cuda src/main.cu -I src",
           has_nvcc, "nvcc（CUDA Toolkit）"),
 ]
 
