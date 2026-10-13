@@ -261,7 +261,7 @@ impl Table {
 
 /// 幅 `w` の表の行数（桁数）と、1行のエントリ数。m（251 ビット）を w ビットずつの桁にし、最上位の桁に
 /// w - 1 ビット以下が残る（繰り上がりを足しても 2^(w-1) 以下になる）ように、行数は ceil(251 / w)
-/// （251 は素数なので、w ≤ 16 では最上位の桁に必ず w - 1 ビット以下が残る）
+/// （251 は素数なので、w < 251 なら最上位の桁に必ず w - 1 ビット以下が残る）
 pub(crate) const fn rows_cols(w: usize) -> (usize, usize) {
     (M_BITS.div_ceil(w), (1 << (w - 1)) + 1)
 }
@@ -318,14 +318,54 @@ fn build_rows(w: usize) -> Vec<Niels> {
     entries
 }
 
-/// 幅 `w` の表（[`build_rows`]）の各エントリの `[y+x, y-x, 2dxy]`（GPU 用。GPU は表の幅を選べる）
+/// 幅 `w` の表（[`build_rows`] と同じ点）の `i` 行目の各エントリの `[y+x, y-x, 2dxy]` を、前から順に
+/// `f(k, エントリ)` に渡す（GPU 用。GPU は表の幅を選べる）。行ごとに独立して作れるので、行を並列に作れる。
+/// W = 20 で表が数百 MB になるので、点は [`ROW_CHUNK`] 個ずつ作ってアフィンにし、行全体は持たない
 #[cfg(feature = "cuda")]
-pub(crate) fn entries_with_width(w: usize) -> Vec<[Fe; 3]> {
-    build_rows(w)
-        .iter()
-        .map(|n| [n.ypx, n.ymx, n.xy2d])
-        .collect()
+pub(crate) fn for_each_entry_in_row(w: usize, i: usize, mut f: impl FnMut(usize, [Fe; 3])) {
+    let (rows, cols) = rows_cols(w);
+    let double = |(x, y): (Fe, Fe)| {
+        Extended::from_affine(x, y)
+            .add_niels(&Niels::from_affine(x, y))
+            .to_affine()
+    };
+    // 行の基準点 2^(w*i) * 8B
+    let mut b = (BX, BY);
+    for _ in 0..3 + w * i {
+        b = double(b);
+    }
+    let base = Niels::from_affine(b.0, b.1);
+    // k 番目は k * 基準点。最上位の行は (k + 2^c) * 基準点（2^c * 基準点 = 2^254 * B。build_rows の top_shift）
+    let mut acc = match i == rows - 1 {
+        true => {
+            for _ in 0..M_BITS - w * (rows - 1) {
+                b = double(b);
+            }
+            Extended::from_affine(b.0, b.1)
+        }
+        false => Extended::IDENTITY,
+    };
+    let (mut points, mut zs, mut scratch) = (Vec::new(), Vec::new(), Vec::new());
+    for start in (0..cols).step_by(ROW_CHUNK) {
+        points.clear();
+        for _ in start..cols.min(start + ROW_CHUNK) {
+            points.push(acc);
+            acc = acc.add_niels(&base);
+        }
+        // 1/Z をまとめて計算してアフィンにする（単位元は Z = 1 なのでそのまま (0, 1) になる）
+        zs.clear();
+        zs.extend(points.iter().map(|p| p.z));
+        Fe::batch_invert(&mut zs, &mut scratch);
+        for (j, (p, zi)) in points.iter().zip(&zs).enumerate() {
+            let n = Niels::from_affine(p.x * *zi, p.y * *zi);
+            f(start + j, [n.ypx, n.ymx, n.xy2d]);
+        }
+    }
 }
+
+/// [`for_each_entry_in_row`] が一度にアフィンにする点の数
+#[cfg(feature = "cuda")]
+const ROW_CHUNK: usize = 4096;
 
 /// クランプ済みか（下 3 ビットが 0、2^255 のビットが 0、2^254 のビットが 1）
 pub(crate) fn is_clamped(s: &[u8; 32]) -> bool {
@@ -395,6 +435,22 @@ mod tests {
         let mut out = [Extended::IDENTITY];
         Table::get().mul_base_batch(&[*s], &mut out);
         out[0]
+    }
+
+    /// GPU 用に1行ずつ作った表は、build_rows で作った表と同じ（最上位の行と、ROW_CHUNK をまたぐ行も含む）
+    #[cfg(feature = "cuda")]
+    #[rstest]
+    fn rows_with_width_match_build_rows(#[values(2, 5, 12, 14)] w: usize) {
+        let (rows, cols) = rows_cols(w);
+        let want: Vec<[[u8; 32]; 3]> = build_rows(w)
+            .iter()
+            .map(|n| [n.ypx.to_bytes(), n.ymx.to_bytes(), n.xy2d.to_bytes()])
+            .collect();
+        let mut got = vec![[[0u8; 32]; 3]; rows * cols];
+        for i in 0..rows {
+            for_each_entry_in_row(w, i, |k, e| got[i * cols + k] = e.map(|f| f.to_bytes()));
+        }
+        assert_eq!(got, want);
     }
 
     /// クランプ済みかの判定: 下 3 ビットが 0、2^255 が 0、2^254 が 1

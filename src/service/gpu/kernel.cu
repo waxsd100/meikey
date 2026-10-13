@@ -62,7 +62,7 @@ typedef unsigned long long u64;
 #define MEIKEY_W 12
 #endif
 // 桁は -2^(W-1)〜2^(W-1)。m は 251 ビットで、行数は ceil(251 / W)（comb.rs の rows_cols と同じ）
-static_assert(MEIKEY_W >= 2 && MEIKEY_W <= 16, "MEIKEY_W は 2〜16");
+static_assert(MEIKEY_W >= 2 && MEIKEY_W <= 20, "MEIKEY_W は 2〜20");
 #define M_BITS 251
 #define ROWS ((M_BITS + MEIKEY_W - 1) / MEIKEY_W)
 // 最上位の桁は W - 1 ビット以下（繰り上がりを足しても 2^(W-1) 以下）

@@ -24,7 +24,7 @@
 use crate::lang::{t, tf};
 use crate::model::key::VanityKey;
 use crate::model::search::{Outcome, SearchConfig, SeedSource, Stats, counter_seed};
-use crate::service::derive::comb::{entries_with_width, rows_cols};
+use crate::service::derive::comb::{for_each_entry_in_row, rows_cols};
 use crate::service::derive::field::Fe;
 use crate::service::search::{Progress, Searcher};
 use cudarc::driver::{
@@ -57,7 +57,7 @@ pub const DEFAULT_LIMBS: u32 = 10;
 pub const LIMBS: [u32; 2] = [10, 8];
 
 /// 選べる表の幅 W（kernel.cu の MEIKEY_W の範囲）
-pub const WIDTHS: std::ops::RangeInclusive<u32> = 2..=16;
+pub const WIDTHS: std::ops::RangeInclusive<u32> = 2..=20;
 
 /// 選べる、逆元をまとめる鍵の数（kernel.cu の MEIKEY_BATCH の範囲）
 pub const BATCHES: std::ops::RangeInclusive<u32> = 1..=64;
@@ -65,7 +65,7 @@ pub const BATCHES: std::ops::RangeInclusive<u32> = 1..=64;
 /// GPU のカーネルの設定
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuOptions {
-    /// 表の幅 W（大きいほど点の足し算が減り、表は大きくなる。W = 12 で約 4.1 MB、16 で約 50 MB）
+    /// 表の幅 W（大きいほど点の足し算が減り、表は大きくなる。W = 12 で約 4.1 MB、16 で約 50 MB、20 で約 650 MB）
     pub width: u32,
     /// 1スレッドが1回にまとめて計算する鍵の数（大きいほど逆元の分担が減り、1スレッドが使うメモリは増える）
     pub batch: u32,
@@ -118,9 +118,9 @@ impl fmt::Display for GpuOptions {
     }
 }
 
-/// PTX を埋め込んで、探す前に測る設定（表の幅 12・14・16 × まとめる鍵の数 32・64 × リムの数 10・8）。
+/// PTX を埋め込んで、探す前に測る設定（表の幅 12・14・16・18・20 × まとめる鍵の数 32・64 × リムの数 10・8）。
 /// 先頭は既定の設定（build.rs の VARIANTS も同じ並び）
-pub const EMBEDDED: [GpuOptions; 12] = [
+pub const EMBEDDED: [GpuOptions; 20] = [
     GpuOptions::new(12, 32, 10),
     GpuOptions::new(12, 32, 8),
     GpuOptions::new(12, 64, 10),
@@ -133,11 +133,19 @@ pub const EMBEDDED: [GpuOptions; 12] = [
     GpuOptions::new(16, 32, 8),
     GpuOptions::new(16, 64, 10),
     GpuOptions::new(16, 64, 8),
+    GpuOptions::new(18, 32, 10),
+    GpuOptions::new(18, 32, 8),
+    GpuOptions::new(18, 64, 10),
+    GpuOptions::new(18, 64, 8),
+    GpuOptions::new(20, 32, 10),
+    GpuOptions::new(20, 32, 8),
+    GpuOptions::new(20, 64, 10),
+    GpuOptions::new(20, 64, 8),
 ];
 
 /// [`EMBEDDED`] の設定で kernel.cu を compute_75 向けにコンパイルした PTX（`cargo make ptx` で作る）。
 /// 1行目に kernel.cu と設定のハッシュ（[`kernel_hash`]）を書いておき、ソースと食い違っていないかをテストで確かめる
-const PTXS: [&str; 12] = [
+const PTXS: [&str; 20] = [
     include_str!("gpu/ptx/w12_b32_l10.ptx"),
     include_str!("gpu/ptx/w12_b32_l8.ptx"),
     include_str!("gpu/ptx/w12_b64_l10.ptx"),
@@ -150,6 +158,14 @@ const PTXS: [&str; 12] = [
     include_str!("gpu/ptx/w16_b32_l8.ptx"),
     include_str!("gpu/ptx/w16_b64_l10.ptx"),
     include_str!("gpu/ptx/w16_b64_l8.ptx"),
+    include_str!("gpu/ptx/w18_b32_l10.ptx"),
+    include_str!("gpu/ptx/w18_b32_l8.ptx"),
+    include_str!("gpu/ptx/w18_b64_l10.ptx"),
+    include_str!("gpu/ptx/w18_b64_l8.ptx"),
+    include_str!("gpu/ptx/w20_b32_l10.ptx"),
+    include_str!("gpu/ptx/w20_b32_l8.ptx"),
+    include_str!("gpu/ptx/w20_b64_l10.ptx"),
+    include_str!("gpu/ptx/w20_b64_l8.ptx"),
 ];
 
 /// 設定 `options` の埋め込んだ PTX（埋め込んでいない設定なら None）
@@ -289,10 +305,31 @@ struct Kernel {
     func: CudaFunction,
     /// 公開鍵を計算して書き出すだけのカーネル（読み込んだときの確認と、テスト用）
     derive: CudaFunction,
-    table: CudaSlice<u32>,
+    /// 表（幅が同じ設定で共有する。測るときに幅ごとに1回だけ作って送る）
+    table: Arc<CudaSlice<u32>>,
     options: GpuOptions,
     /// 起動するブロック数
     grid: u32,
+}
+
+/// GPU に送った表（幅ごと）
+#[derive(Default)]
+struct Tables(Vec<(u32, Arc<CudaSlice<u32>>)>);
+
+impl Tables {
+    /// 幅 `width` の表（まだ無ければ作って送る）
+    fn get(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        width: u32,
+    ) -> Result<Arc<CudaSlice<u32>>, GpuError> {
+        if let Some((_, t)) = self.0.iter().find(|(w, _)| *w == width) {
+            return Ok(t.clone());
+        }
+        let table = Arc::new(stream.clone_htod(&table_words(width))?);
+        self.0.push((width, table.clone()));
+        Ok(table)
+    }
 }
 
 /// 探索の1回の起動に渡すもの（カーネルの引数のうち、起動ごとに変わらないもの）
@@ -309,13 +346,14 @@ struct Launch {
 }
 
 impl Kernel {
-    /// 設定 `options` のカーネルを読み込み、表を送る。埋め込んだ PTX があればそれを、無いかドライバが読めなければ
-    /// NVRTC でこの GPU 向けにコンパイルしたものを使う
+    /// 設定 `options` のカーネルを読み込み、表を送る（`tables` に同じ幅の表があればそれを使う）。
+    /// 埋め込んだ PTX があればそれを、無いかドライバが読めなければ NVRTC でこの GPU 向けにコンパイルしたものを使う
     fn load(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         info: &GpuInfo,
         options: GpuOptions,
+        tables: &mut Tables,
     ) -> Result<Kernel, GpuError> {
         if !options.in_range() {
             return Err(GpuError::OutOfRange(options));
@@ -343,7 +381,7 @@ impl Kernel {
             .occupancy_max_active_blocks_per_multiprocessor(BLOCK, 0, None)
             .unwrap_or(2)
             .max(1);
-        let table = stream.clone_htod(&table_words(options.width))?;
+        let table = tables.get(stream, options.width)?;
         let kernel = Kernel {
             func,
             derive,
@@ -392,7 +430,7 @@ impl Kernel {
         let counter = u32::from(source == SeedSource::Counter);
         let mut out = stream.alloc_zeros::<u8>(n * 32)?;
         let mut b = stream.launch_builder(&self.derive);
-        b.arg(&self.table)
+        b.arg(&*self.table)
             .arg(&key_dev)
             .arg(&counter)
             .arg(&first)
@@ -445,7 +483,7 @@ impl Kernel {
         iters: u32,
     ) -> Result<Option<u64>, GpuError> {
         let mut b = stream.launch_builder(&self.func);
-        b.arg(&self.table)
+        b.arg(&*self.table)
             .arg(&l.key)
             .arg(&l.counter)
             .arg(&l.needle)
@@ -601,20 +639,28 @@ impl Gpu {
             };
         let stream = ctx.default_stream();
         let (kernel, chosen) = match setting {
-            GpuSetting::Fixed(options) => {
-                (Kernel::load(&ctx, &stream, &info, options)?, Chosen::Fixed)
-            }
+            GpuSetting::Fixed(options) => (
+                Kernel::load(&ctx, &stream, &info, options, &mut Tables::default())?,
+                Chosen::Fixed,
+            ),
             GpuSetting::Default => (
-                Kernel::load(&ctx, &stream, &info, GpuOptions::default())?,
+                Kernel::load(
+                    &ctx,
+                    &stream,
+                    &info,
+                    GpuOptions::default(),
+                    &mut Tables::default(),
+                )?,
                 Chosen::Default,
             ),
             GpuSetting::Fastest => {
                 on_measure();
                 let mut rejected = Vec::new();
+                let mut tables = Tables::default();
                 let (kernel, results) = fastest(
                     &EMBEDDED,
                     |options| {
-                        let k = Kernel::load(&ctx, &stream, &info, options);
+                        let k = Kernel::load(&ctx, &stream, &info, options, &mut tables);
                         if let Err(GpuError::SelfCheck(o)) = &k {
                             rejected.push(*o);
                         }
@@ -892,30 +938,31 @@ fn compile_error(e: &CompileError) -> String {
 }
 
 /// 幅 `width` の表を GPU 用（1エントリ = y+x, y-x, 2dxy を 0 以上 p 未満にして 32 ビット × 8 語ずつ）に並べる。
-/// 1 行目の 3 つ目は 2dxy ではなく 2xy にする（最初の点を拡張座標にするとき、T = 2xy を掛け算なしで使う）
+/// 1 行目の 3 つ目は 2dxy ではなく 2xy にする（最初の点を拡張座標にするとき、T = 2xy を掛け算なしで使う）。
+/// 行ごとに別のスレッドで作る（W = 20 で約 650 MB あり、1スレッドでは数秒かかる）
 fn table_words(width: u32) -> Vec<u32> {
     let (_, cols) = rows_cols(width as usize);
-    let entries = entries_with_width(width as usize);
+    let mut words = vec![0u32; GpuOptions::new(width, 1, 10).table_bytes() / 4];
     let half = Fe([2, 0, 0, 0, 0]).invert();
-    let mut words = vec![0u32; entries.len() * ENTRY_WORDS];
-    for (k, (e, mut entry)) in words
-        .as_chunks_mut::<ENTRY_WORDS>()
-        .0
-        .iter_mut()
-        .zip(entries)
-        .enumerate()
-    {
-        if k < cols {
-            // (y+x)^2 - (y-x)^2 = 4xy なので、2xy = ((y+x)^2 - (y-x)^2) / 2
-            let [ypx, ymx, _] = entry;
-            entry[2] = (ypx * ypx - ymx * ymx) * half;
+    std::thread::scope(|s| {
+        for (i, row) in words.chunks_mut(cols * ENTRY_WORDS).enumerate() {
+            s.spawn(move || {
+                let row = row.as_chunks_mut::<ENTRY_WORDS>().0;
+                for_each_entry_in_row(width as usize, i, |k, mut entry| {
+                    if i == 0 {
+                        // (y+x)^2 - (y-x)^2 = 4xy なので、2xy = ((y+x)^2 - (y-x)^2) / 2
+                        let [ypx, ymx, _] = entry;
+                        entry[2] = (ypx * ypx - ymx * ymx) * half;
+                    }
+                    for (f, fe) in entry.into_iter().enumerate() {
+                        for (j, w) in fe.to_bytes().as_chunks::<4>().0.iter().enumerate() {
+                            row[k][8 * f + j] = u32::from_le_bytes(*w);
+                        }
+                    }
+                });
+            });
         }
-        for (f, fe) in entry.into_iter().enumerate() {
-            for (i, w) in fe.to_bytes().as_chunks::<4>().0.iter().enumerate() {
-                e[8 * f + i] = u32::from_le_bytes(*w);
-            }
-        }
-    }
+    });
     words
 }
 
@@ -1004,8 +1051,8 @@ mod tests {
     /// 幅 `width` の表（幅ごとに1回だけ作る）
     #[cfg(meikey_gpu_host)]
     fn table(width: u32) -> &'static [u32] {
-        static TABLES: [std::sync::OnceLock<Vec<u32>>; 17] =
-            [const { std::sync::OnceLock::new() }; 17];
+        static TABLES: [std::sync::OnceLock<Vec<u32>>; 21] =
+            [const { std::sync::OnceLock::new() }; 21];
         TABLES[width as usize].get_or_init(|| table_words(width))
     }
 
@@ -1047,10 +1094,11 @@ mod tests {
         assert_eq!(DEFAULT_WIDTH as usize, crate::service::derive::comb::W);
     }
 
-    /// 表の大きさ（W = 12 で約 4.1 MB、16 で約 50 MB）
+    /// 表の大きさ（W = 12 で約 4.1 MB、16 で約 50 MB、20 で約 650 MB）
     #[rstest]
     #[case::default(GpuOptions::default(), 21 * 2049 * 96)]
     #[case::wide(GpuOptions::new(16, 32, 8), 16 * 32769 * 96)]
+    #[case::widest(GpuOptions::new(20, 64, 10), 13 * 524289 * 96)]
     fn table_bytes(#[case] options: GpuOptions, #[case] want: usize) {
         assert_eq!(options.table_bytes(), want);
     }
@@ -1177,7 +1225,8 @@ mod tests {
     #[cfg(meikey_gpu_host)]
     #[rstest]
     fn fe_op_words_matches_bigint(
-        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] variant: usize,
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)]
+        variant: usize,
         #[values(0, 1, 2, 3, 4)] op: u32,
     ) {
         use num_bigint::BigUint;
@@ -1250,7 +1299,8 @@ mod tests {
     #[cfg(meikey_gpu_host)]
     #[rstest]
     fn derive_batch_matches_dalek(
-        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] variant: usize,
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)]
+        variant: usize,
         #[values(SeedSource::ChaCha20, SeedSource::Counter)] source: SeedSource,
     ) {
         let h = &HOSTS[variant];
@@ -1428,7 +1478,7 @@ mod tests {
     /// 埋め込んだ PTX は今の kernel.cu とその設定から作ったもの（違えば `cargo make ptx` で作り直す）
     #[rstest]
     fn embedded_ptx_matches_kernel_source(
-        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] i: usize,
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)] i: usize,
     ) {
         let (options, ptx) = (EMBEDDED[i], PTXS[i]);
         let first = ptx.lines().next().unwrap_or_default();
@@ -1472,9 +1522,9 @@ mod tests {
         "libnvrtc not found"
     )]
     #[case::range(
-        GpuError::OutOfRange(GpuOptions::new(17, 32, 10)),
-        "表の幅は 2〜16、まとめる鍵の数は 1〜64、リムの数は 10 か 8（W = 17・32 鍵・10 リム）",
-        "the table width must be 2-16, the keys per batch 1-64 and the limbs 10 or 8 (W = 17, 32 keys, 10 limbs)"
+        GpuError::OutOfRange(GpuOptions::new(21, 32, 10)),
+        "表の幅は 2〜20、まとめる鍵の数は 1〜64、リムの数は 10 か 8（W = 21・32 鍵・10 リム）",
+        "the table width must be 2-20, the keys per batch 1-64 and the limbs 10 or 8 (W = 21, 32 keys, 10 limbs)"
     )]
     #[case::not_embedded(
         GpuError::NotEmbedded(GpuOptions::new(13, 8, 8)),
@@ -1634,7 +1684,7 @@ mod tests {
     /// 通し番号は奇数から始め、シードを ChaCha20 のブロックの後半から取る場合も通す）
     #[rstest]
     fn gpu_derive_matches_dalek(
-        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] i: usize,
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)] i: usize,
         gpu: Option<Gpu>,
     ) {
         if gpu.is_none() {
@@ -1754,7 +1804,8 @@ mod tests {
     #[cfg(meikey_gpu_host)]
     #[rstest]
     fn search_finds_first_hit(
-        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] variant: usize,
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)]
+        variant: usize,
         #[values(SeedSource::ChaCha20, SeedSource::Counter)] source: SeedSource,
     ) {
         let h = &HOSTS[variant];

@@ -7,7 +7,7 @@
 /// (表の幅, まとめる鍵の数, リムの数)。service::gpu::EMBEDDED と同じ並び（テストで確かめる）。
 /// 先頭は既定の設定で、テスト用の関数名の接頭辞は meikey_test_（ほかは meikey_w<幅>_b<数>_l<リム>_test_）
 #[cfg(feature = "cuda")]
-const VARIANTS: [(u32, u32, u32); 12] = [
+const VARIANTS: [(u32, u32, u32); 20] = [
     (12, 32, 10),
     (12, 32, 8),
     (12, 64, 10),
@@ -20,6 +20,14 @@ const VARIANTS: [(u32, u32, u32); 12] = [
     (16, 32, 8),
     (16, 64, 10),
     (16, 64, 8),
+    (18, 32, 10),
+    (18, 32, 8),
+    (18, 64, 10),
+    (18, 64, 8),
+    (20, 32, 10),
+    (20, 32, 8),
+    (20, 64, 10),
+    (20, 64, 8),
 ];
 
 #[cfg(feature = "cuda")]
@@ -87,6 +95,9 @@ fn main() {
                 .define("MEIKEY_TEST_PREFIX", prefix(i, v).as_str())
                 .flag_if_supported("-std=c++17")
                 .flag_if_supported("/std:c++17")
+                // MSVC は既定でソースを OS の文字コード（日本語の Windows なら CP932）として読み、
+                // 日本語のコメントの後ろの改行が食われて次の行までコメントになる
+                .flag_if_supported("/utf-8")
                 .opt_level(2)
                 .cargo_warnings(false)
                 .try_compile(&format!("meikey_gpu_host_w{width}_b{batch}_l{limbs}"));

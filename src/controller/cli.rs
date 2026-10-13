@@ -80,7 +80,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "W",
-        value_parser = |s: &str| int_in(s, 2, 16),
+        value_parser = |s: &str| int_in(s, 2, 20),
         requires = "gpu_device"
     )]
     gpu_width: Option<u32>,
@@ -207,14 +207,15 @@ const HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "gpu_width",
-        "GPU の表の幅 W（2〜16）。大きいほど点の足し算が減り、表は大きくなる（12 で約 4.1 MB、16 で約 50 MB）。\
-         --gpu-width・--gpu-batch・--gpu-limbs を付けなければ、探す前にこの GPU で測って一番速い組み合わせを使う。\
-         幅 12・14・16、32・64 鍵、10・8 リムの組み合わせ以外は、起動時に NVRTC でカーネルをコンパイルする",
-        "Width W of the GPU table (2-16). Larger widths need fewer point additions and a bigger \
-         table (about 4.1 MB at 12, about 50 MB at 16). Without --gpu-width, --gpu-batch and \
-         --gpu-limbs, the fastest combination is measured on this GPU before searching. Combinations \
-         other than widths 12, 14, 16 with 32 or 64 keys and 10 or 8 limbs are compiled with NVRTC \
-         at startup",
+        "GPU の表の幅 W（2〜20）。大きいほど点の足し算が減り、表は大きくなる（12 で約 4.1 MB、16 で約 50 MB、\
+         20 で約 650 MB）。--gpu-width・--gpu-batch・--gpu-limbs を付けなければ、探す前にこの GPU で測って\
+         一番速い組み合わせを使う。幅 12・14・16・18・20、32・64 鍵、10・8 リムの組み合わせ以外は、\
+         起動時に NVRTC でカーネルをコンパイルする",
+        "Width W of the GPU table (2-20). Larger widths need fewer point additions and a bigger \
+         table (about 4.1 MB at 12, about 50 MB at 16, about 650 MB at 20). Without --gpu-width, \
+         --gpu-batch and --gpu-limbs, the fastest combination is measured on this GPU before \
+         searching. Combinations other than widths 12, 14, 16, 18, 20 with 32 or 64 keys and 10 or 8 \
+         limbs are compiled with NVRTC at startup",
     ),
     (
         "gpu_batch",
@@ -438,6 +439,8 @@ pub fn main() -> ExitCode {
 
 /// 探すのに使うもの（CPU・GPU・両方）を決めて実行する
 fn execute(cli: &Cli) -> Result<(), CliError> {
+    // Windows で、前面にないと数秒で CPU を絞られる（探索が数分の一に遅くなる）のを防ぐ
+    crate::service::power::keep_full_speed();
     match device(cli) {
         Device::Cpu => run(cli, &Parallel, &KeyFiles),
         #[cfg(feature = "cuda")]
@@ -1172,7 +1175,8 @@ mod tests {
     #[case::check_with_width(&["--check", "--gpu-width", "16"], Some(GpuSetting::Fixed(GpuOptions::new(16, 32, 10))))]
     #[case::smallest(&["--gpu-width", "2", "--gpu-batch", "1"], Some(GpuSetting::Fixed(GpuOptions::new(2, 1, 10))))]
     #[case::limbs_other(&["--gpu-limbs", "9"], None)]
-    #[case::width_too_large(&["--gpu-width", "17"], None)]
+    #[case::widest(&["--gpu-width", "20"], Some(GpuSetting::Fixed(GpuOptions::new(20, 32, 10))))]
+    #[case::width_too_large(&["--gpu-width", "21"], None)]
     #[case::width_too_small(&["--gpu-width", "1"], None)]
     #[case::batch_zero(&["--gpu-batch", "0"], None)]
     #[case::batch_too_large(&["--gpu-batch", "65"], None)]
@@ -1369,7 +1373,7 @@ mod tests {
     #[cfg_attr(feature = "cuda", case::conflict(&["abc", "--low-security", "--gpu", "--both"], "'--gpu' と '--both' は一緒に付けられない"))]
     #[cfg_attr(feature = "cuda", case::gpu_without_low_security(&["abc", "--gpu"], "必要な引数が無い: --low-security"))]
     #[cfg_attr(feature = "cuda", case::gpu_width_alone(&["abc", "--gpu-width", "16"], "必要な引数が無い: <--gpu|--both>"))]
-    #[cfg_attr(feature = "cuda", case::gpu_width_range(&["abc", "--low-security", "--gpu", "--gpu-width", "17"], "'--gpu-width <W>' の値 '17' が正しくない: 2〜16 の整数が必要"))]
+    #[cfg_attr(feature = "cuda", case::gpu_width_range(&["abc", "--low-security", "--gpu", "--gpu-width", "21"], "'--gpu-width <W>' の値 '21' が正しくない: 2〜20 の整数が必要"))]
     fn clap_errors_in_japanese(#[case] args: &[&str], #[case] want: &str) {
         let parse = || {
             parse_from(once("meikey").chain(args.iter().copied()))

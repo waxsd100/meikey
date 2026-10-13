@@ -68,7 +68,7 @@ cargo make run wakokara --low-security --both -C wakokara -o ~/.ssh/id_ed25519_w
 | `--low-security` | 低セキュリティモード（速さを優先する。下の「安全性」を参照） |
 | `--gpu` | CPU ではなく GPU で探す（`--low-security` のとき） |
 | `--both` | GPU と CPU の両方で探す（`--low-security` のとき） |
-| `--gpu-width W` | GPU の表の幅（2〜16。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
+| `--gpu-width W` | GPU の表の幅（2〜20。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
 | `--gpu-batch N` | GPU で逆元をまとめる鍵の数（1〜64。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
 | `--gpu-limbs L` | GPU の体演算のリムの数（10 か 8。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
 | `--simd LEVEL` | 使う SIMD の上限（`avx512-ifma`・`avx512`・`avx2`・`off`） |
