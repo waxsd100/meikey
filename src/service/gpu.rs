@@ -1642,16 +1642,26 @@ mod tests {
         available("nvrtc", present.then_some(()))
     }
 
+    /// 本物の GPU と、それを使うテストを1つずつ動かすためのロック（テストの間持っておく）。
+    /// 同時に動かすと、ほかのテストが表を作る（W = 20 で約 650 MB）・設定を全部測るのと CPU・GPU を取り合い、
+    /// 時間を確かめるテスト（gpu_with_cpu）が遅れる
+    struct OnGpu {
+        gpu: Gpu,
+        lock: std::sync::MutexGuard<'static, ()>,
+    }
+
     #[fixture]
-    fn gpu() -> Option<Gpu> {
+    fn gpu() -> Option<OnGpu> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         // SAFETY: ライブラリを読み込めるか試すだけ
         let present =
             unsafe { driver_present() } && CudaContext::device_count().is_ok_and(|n| n > 0);
         available("cuda", present.then_some(()))?;
-        Some(
-            Gpu::new(0, GpuSetting::Fixed(GpuOptions::default()), || {})
-                .expect("GPU を使えるようにできる"),
-        )
+        // ほかのテストが失敗してロックが壊れていても続ける
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gpu = Gpu::new(0, GpuSetting::Fixed(GpuOptions::default()), || {})
+            .expect("GPU を使えるようにできる");
+        Some(OnGpu { gpu, lock })
     }
 
     /// カーネルは Turing（T4）から Blackwell（RTX PRO 6000）まで、各世代向けに、選べる設定の端の値でも
@@ -1685,11 +1695,11 @@ mod tests {
     #[rstest]
     fn gpu_derive_matches_dalek(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)] i: usize,
-        gpu: Option<Gpu>,
+        gpu: Option<OnGpu>,
     ) {
-        if gpu.is_none() {
+        let Some(OnGpu { lock: _lock, .. }) = gpu else {
             return;
-        }
+        };
         let gpu =
             Gpu::new(0, GpuSetting::Fixed(EMBEDDED[i]), || {}).expect("GPU を使えるようにできる");
         let key: [u8; 32] = random();
@@ -1706,10 +1716,10 @@ mod tests {
 
     /// 設定を測って選ぶと、埋め込んだ設定を全部測って、その中で一番速いものを使う。その設定でも鍵が見つかる
     #[rstest]
-    fn gpu_uses_the_fastest_setting(gpu: Option<Gpu>) {
-        if gpu.is_none() {
+    fn gpu_uses_the_fastest_setting(gpu: Option<OnGpu>) {
+        let Some(OnGpu { lock: _lock, .. }) = gpu else {
             return;
-        }
+        };
         let mut notified = false;
         let gpu =
             Gpu::new(0, GpuSetting::Fastest, || notified = true).expect("GPU を使えるようにできる");
@@ -1738,8 +1748,8 @@ mod tests {
 
     /// GPU で探すと、文字列を含む鍵が見つかる（大小文字の区別あり・なし）。ベンチマークは時間で止まる
     #[rstest]
-    fn gpu_search_finds_key(#[values(false, true)] case_sensitive: bool, gpu: Option<Gpu>) {
-        let Some(gpu) = gpu else {
+    fn gpu_search_finds_key(#[values(false, true)] case_sensitive: bool, gpu: Option<OnGpu>) {
+        let Some(OnGpu { gpu, lock: _lock }) = gpu else {
             return;
         };
         let p = Pattern::new("Ab1", case_sensitive).unwrap();
@@ -1762,8 +1772,8 @@ mod tests {
 
     /// GPU の探索は外からの合図で止まる（時間制限が無くても）。CPU と同時に探すと、どちらかが見つける
     #[rstest]
-    fn gpu_with_cpu(#[values(false, true)] cancel_only: bool, gpu: Option<Gpu>) {
-        let Some(gpu) = gpu else {
+    fn gpu_with_cpu(#[values(false, true)] cancel_only: bool, gpu: Option<OnGpu>) {
+        let Some(OnGpu { gpu, lock: _lock }) = gpu else {
             return;
         };
         if cancel_only {
@@ -1771,19 +1781,22 @@ mod tests {
                 Pattern::new(&"z".repeat(Pattern::MAX_LEN), false).unwrap(),
             ));
             let cancel = config.cancel.clone();
-            let started = Instant::now();
+            let cancelled = std::sync::OnceLock::new();
             let out = scope(|s| {
                 s.spawn(|| {
                     sleep(Duration::from_millis(300));
+                    cancelled.set(Instant::now()).unwrap();
                     cancel.cancel();
                 });
                 gpu.run(&config, &mut |_| {})
             });
+            // 合図してから止まるまで（1回の起動は 0.2 秒前後）
+            let delay = cancelled.get().expect("止まる前に合図している").elapsed();
             assert_eq!(out.key.is_none() && out.stats.tries > 0, true);
             assert_eq!(
-                started.elapsed() < Duration::from_secs(5),
+                delay < Duration::from_secs(5),
                 true,
-                "止まるのが遅い"
+                "止まるのが遅い（{delay:?}）"
             );
         } else {
             let p = Pattern::new("Ab1c", false).unwrap();
