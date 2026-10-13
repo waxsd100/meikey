@@ -89,6 +89,28 @@ struct Cli {
     #[cfg(feature = "cuda")]
     #[arg(long)]
     both: bool,
+
+    /// GPU の表の幅 W（2〜16）。大きいほど点の足し算が減り、表は大きくなる（12 で約 5.8 MB、16 で約 67 MB）。
+    /// 既定の 12 から変えると、起動時に NVRTC でカーネルをコンパイルする
+    #[cfg(feature = "cuda")]
+    #[arg(
+        long,
+        value_name = "W",
+        default_value_t = crate::service::gpu::DEFAULT_WIDTH,
+        value_parser = clap::value_parser!(u32).range(2..=16)
+    )]
+    gpu_width: u32,
+
+    /// GPU の1スレッドが、逆元を1回にまとめて計算する鍵の数（1〜64）。
+    /// 既定の 16 から変えると、起動時に NVRTC でカーネルをコンパイルする
+    #[cfg(feature = "cuda")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = crate::service::gpu::DEFAULT_BATCH,
+        value_parser = clap::value_parser!(u32).range(1..=64)
+    )]
+    gpu_batch: u32,
 }
 
 /// 探すのに使うもの（既定は CPU、--gpu で GPU、--both で両方）
@@ -143,12 +165,24 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     match device(cli) {
         Device::Cpu => run(cli, &Parallel, &KeyFiles),
         #[cfg(feature = "cuda")]
-        Device::Gpu => run(cli, &crate::service::gpu::Gpu::new(0)?, &KeyFiles),
+        Device::Gpu => run(
+            cli,
+            &crate::service::gpu::Gpu::new(0, gpu_options(cli))?,
+            &KeyFiles,
+        ),
         #[cfg(feature = "cuda")]
         Device::Both => {
-            let gpu = crate::service::gpu::Gpu::new(0)?;
+            let gpu = crate::service::gpu::Gpu::new(0, gpu_options(cli))?;
             run(cli, &crate::service::search::Both(gpu, Parallel), &KeyFiles)
         }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_options(cli: &Cli) -> crate::service::gpu::GpuOptions {
+    crate::service::gpu::GpuOptions {
+        width: cli.gpu_width,
+        batch: cli.gpu_batch,
     }
 }
 
@@ -656,11 +690,37 @@ mod tests {
         assert_eq!(parsed.ok().map(|c| device(&c)), want);
     }
 
+    /// --gpu-width・--gpu-batch は範囲内の値だけ受け付け、GPU の設定に届く（無ければ既定）
+    #[cfg(feature = "cuda")]
+    #[rstest]
+    #[case::defaults(&[], Some((12, 16)))]
+    #[case::wide(&["--gpu-width", "16", "--gpu-batch", "32"], Some((16, 32)))]
+    #[case::smallest(&["--gpu-width", "2", "--gpu-batch", "1"], Some((2, 1)))]
+    #[case::largest_batch(&["--gpu-batch", "64"], Some((12, 64)))]
+    #[case::width_too_large(&["--gpu-width", "17"], None)]
+    #[case::width_too_small(&["--gpu-width", "1"], None)]
+    #[case::batch_zero(&["--gpu-batch", "0"], None)]
+    #[case::batch_too_large(&["--gpu-batch", "65"], None)]
+    fn gpu_options_from_flags(#[case] options: &[&str], #[case] want: Option<(u32, u32)>) {
+        let parsed = Cli::try_parse_from(["meikey", "abc", "--gpu"].iter().chain(options));
+        assert_eq!(
+            parsed
+                .ok()
+                .map(|c| gpu_options(&c))
+                .map(|o| (o.width, o.batch)),
+            want
+        );
+    }
+
     /// --gpu・--both は feature cuda が無ければ受け付けない
     #[cfg(not(feature = "cuda"))]
     #[rstest]
-    fn gpu_flags_need_feature(#[values("--gpu", "--both")] flag: &str) {
-        assert_eq!(Cli::try_parse_from(["meikey", "abc", flag]).is_err(), true);
+    fn gpu_flags_need_feature(
+        #[values(&["--gpu"], &["--both"], &["--gpu-width", "16"], &["--gpu-batch", "32"])]
+        flags: &[&str],
+    ) {
+        let args = ["meikey", "abc"].iter().chain(flags);
+        assert_eq!(Cli::try_parse_from(args).is_err(), true);
     }
 
     /// CPU のスレッド数: -j が無ければ、CPU だけなら全コア、GPU と両方なら 全コア − 1（最低 1）。-j があればそのまま

@@ -62,6 +62,8 @@ cargo make run wakokara --both -C wakokara -o ~/.ssh/id_ed25519_wakokara
 | `--check` | 使う CPU・GPU と計算方法を表示して終わる |
 | `--gpu` | CPU ではなく GPU で探す |
 | `--both` | GPU と CPU の両方で探す |
+| `--gpu-width W` | GPU の表の幅（2〜16、既定 12）。既定以外は NVRTC が要る |
+| `--gpu-batch N` | GPU で逆元をまとめる鍵の数（1〜64、既定 16）。既定以外は NVRTC が要る |
 | `--constant-time` | 倍算に定数時間の実装を使う（約 5 倍遅い） |
 | `--simd LEVEL` | 使う SIMD の上限（`avx512-ifma`・`avx512`・`avx2`・`off`） |
 

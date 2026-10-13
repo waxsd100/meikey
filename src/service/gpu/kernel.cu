@@ -20,7 +20,6 @@
 #if defined(__CUDACC_RTC__) || defined(__CUDACC__)
 #define MEIKEY_CUDA 1
 typedef unsigned char u8;
-typedef short i16;
 typedef int i32;
 typedef unsigned int u32;
 typedef unsigned long long u64;
@@ -37,7 +36,6 @@ typedef unsigned long long u64;
 #else
 #include <stdint.h>
 typedef uint8_t u8;
-typedef int16_t i16;
 typedef int32_t i32;
 typedef uint32_t u32;
 typedef unsigned long long u64;
@@ -51,10 +49,12 @@ typedef unsigned long long u64;
     }
 #endif
 
-// 櫛形テーブル（service/derive/comb.rs と同じ。ホストが W を -D で渡す）
+// 櫛形テーブル（service/derive/comb.rs と同じ作り方。ホストが W を -D で渡す）
 #ifndef MEIKEY_W
 #define MEIKEY_W 12
 #endif
+// 桁は -2^(W-1)〜2^(W-1)。最上位の桁が収まる（255 - W·(行数 - 1) < W）のも W ≤ 16 まで確かめてある
+static_assert(MEIKEY_W >= 2 && MEIKEY_W <= 16, "MEIKEY_W は 2〜16");
 #define ROWS (255 / MEIKEY_W + 1)
 #define COLS ((1 << (MEIKEY_W - 1)) + 1)
 #define HALF (1 << (MEIKEY_W - 1))
@@ -201,7 +201,7 @@ DEV void secret_scalar(const u8 seed[32], u8 out[32]) {
 // 符号付き 2^W 進の桁（comb.rs の signed_digits と同じ）
 // ---------------------------------------------------------------------------
 
-DEV void signed_digits(const u8 s[32], i16 out[ROWS]) {
+DEV void signed_digits(const u8 s[32], i32 out[ROWS]) {
     u64 words[5];
     UNROLL
     for (int i = 0; i < 4; i++) {
@@ -219,10 +219,10 @@ DEV void signed_digits(const u8 s[32], i16 out[ROWS]) {
         if (r + MEIKEY_W > 64) bits |= words[q + 1] << (64 - r);
         i32 v = (i32)(bits & ((1u << MEIKEY_W) - 1)) + carry;
         if (i == ROWS - 1) {
-            out[i] = (i16)v;
+            out[i] = v;
         } else {
             carry = (v + HALF) >> MEIKEY_W;
-            out[i] = (i16)(v - (carry << MEIKEY_W));
+            out[i] = v - (carry << MEIKEY_W);
         }
     }
 }
@@ -459,7 +459,7 @@ DEV ext add_niels(const ext p, const niels q, bool with_t) {
 
 /// 秘密スカラー s の s·B（T は計算しない）
 DEV ext mul_base(const u32* table, const u8 s[32]) {
-    i16 d[ROWS];
+    i32 d[ROWS];
     signed_digits(s, d);
     ext acc = to_extended(table_entry(table, 0, d[0]));
     for (int i = 1; i < ROWS - 1; i++) acc = add_niels(acc, table_entry(table, i, d[i]), true);
@@ -661,51 +661,57 @@ extern "C" __global__ void meikey_derive(const u32* __restrict__ table, const u3
 #else
 
 // ---- テスト用（CPU でコンパイルしたときだけ。service/gpu.rs のテストから呼ぶ） ----
+// 名前は meikey_test_*。W・MEIKEY_BATCH を変えた版も並べてコンパイルできるよう、host_wide.cpp では名前を変える
+#ifndef TEST_FN
+#define TEST_FN(name) meikey_test_##name
+#endif
 
-extern "C" void meikey_test_seed(const u32 key[8], u64 counter, u8 out[32]) { chacha20_seed(key, counter, out); }
+extern "C" void TEST_FN(seed)(const u32 key[8], u64 counter, u8 out[32]) { chacha20_seed(key, counter, out); }
 
-extern "C" void meikey_test_secret(const u8 seed[32], u8 out[32]) { secret_scalar(seed, out); }
+extern "C" void TEST_FN(secret)(const u8 seed[32], u8 out[32]) { secret_scalar(seed, out); }
 
-extern "C" void meikey_test_digits(const u8 s[32], i16 out[ROWS]) { signed_digits(s, out); }
+extern "C" void TEST_FN(digits)(const u8 s[32], i32 out[ROWS]) { signed_digits(s, out); }
 
-extern "C" void meikey_test_fe_mul(const u32 a[10], const u32 b[10], u32 out[10]) {
+extern "C" void TEST_FN(fe_mul)(const u32 a[10], const u32 b[10], u32 out[10]) {
     fe x, y;
     for (int i = 0; i < 10; i++) { x.v[i] = a[i]; y.v[i] = b[i]; }
     fe r = fe_mul(x, y);
     for (int i = 0; i < 10; i++) out[i] = r.v[i];
 }
 
-extern "C" void meikey_test_fe_sq(const u32 a[10], u32 out[10]) {
+extern "C" void TEST_FN(fe_sq)(const u32 a[10], u32 out[10]) {
     fe x;
     for (int i = 0; i < 10; i++) x.v[i] = a[i];
     fe r = fe_sq(x);
     for (int i = 0; i < 10; i++) out[i] = r.v[i];
 }
 
-extern "C" void meikey_test_fe_invert_bytes(const u32 a[10], u8 out[32]) {
+extern "C" void TEST_FN(fe_invert_bytes)(const u32 a[10], u8 out[32]) {
     fe x;
     for (int i = 0; i < 10; i++) x.v[i] = a[i];
     fe_to_bytes(fe_invert(x), out);
 }
 
-extern "C" void meikey_test_derive_batch(const u32* table, const u32 key[8], u64 first, u8 out[MEIKEY_BATCH][32]) {
+extern "C" void TEST_FN(derive_batch)(const u32* table, const u32 key[8], u64 first, u8 out[MEIKEY_BATCH][32]) {
     derive_batch(table, key, first, out);
 }
 
-extern "C" int meikey_test_contains(const u8 pk[32], const u8* needle, u32 len, u32 fold) {
+extern "C" int TEST_FN(contains)(const u8 pk[32], const u8* needle, u32 len, u32 fold) {
     return pk_contains(pk, needle, len, fold != 0);
 }
 
-extern "C" void meikey_test_tail_b64(const u8 pk[32], u8 out[TAIL_B64]) { tail_b64(pk, false, out); }
+extern "C" void TEST_FN(tail_b64)(const u8 pk[32], u8 out[TAIL_B64]) { tail_b64(pk, false, out); }
 
 /// カーネル全体を CPU で真似る（スレッドを順に回す）
-extern "C" void meikey_test_search(u64 nthreads, const u32* table, const u32 key[8], const u8* needle, u32 needle_len,
+extern "C" void TEST_FN(search)(u64 nthreads, const u32* table, const u32 key[8], const u8* needle, u32 needle_len,
                                    u32 fold, u64 base, u32 iters, u32 stop_on_hit, u64* result) {
     for (u64 gid = 0; gid < nthreads; gid++) {
         thread_work(gid, nthreads, table, key, needle, needle_len, fold, base, iters, stop_on_hit, result);
     }
 }
 
-extern "C" u32 meikey_test_batch(void) { return MEIKEY_BATCH; }
+extern "C" u32 TEST_FN(batch)(void) { return MEIKEY_BATCH; }
+
+extern "C" u32 TEST_FN(width)(void) { return MEIKEY_W; }
 
 #endif

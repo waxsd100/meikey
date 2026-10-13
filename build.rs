@@ -9,9 +9,11 @@ fn main() {
     {
         println!("cargo:rerun-if-changed=src/service/gpu/kernel.cu");
         println!("cargo:rerun-if-changed=src/service/gpu/host.cpp");
+        println!("cargo:rerun-if-changed=src/service/gpu/host_wide.cpp");
         let built = cc::Build::new()
             .cpp(true)
             .file("src/service/gpu/host.cpp")
+            .file("src/service/gpu/host_wide.cpp")
             .flag_if_supported("-std=c++17")
             .flag_if_supported("/std:c++17")
             .opt_level(2)

@@ -199,32 +199,7 @@ impl Table {
     }
 
     pub(crate) fn build() -> Table {
-        let mut entries = vec![Niels::IDENTITY; ROWS * COLS];
-        // 各行の基準点 2^(W*i) * B（アフィン）
-        let (mut bx, mut by) = (BX, BY);
-        let mut scratch = Vec::new();
-        for row in entries.as_chunks_mut::<COLS>().0 {
-            let base = Niels::from_affine(bx, by);
-            let mut acc = Extended::IDENTITY;
-            let mut multiples = Vec::with_capacity(COLS);
-            for _ in 1..COLS {
-                acc = acc.add_niels(&base);
-                multiples.push(acc);
-            }
-            // 1/Z をまとめて計算してアフィンにする
-            let mut zs: Vec<Fe> = multiples.iter().map(|p| p.z).collect();
-            Fe::batch_invert(&mut zs, &mut scratch);
-            for (k, (p, zi)) in multiples.iter().zip(zs).enumerate() {
-                row[k + 1] = Niels::from_affine(p.x * zi, p.y * zi);
-            }
-            // 次の行: 2^W * (今の行の基準点) = 2 * (2^(W-1) * 基準点)
-            let half = multiples[COLS - 2]; // 2^(W-1) 倍
-            let (hx, hy) = half.to_affine();
-            (bx, by) = Extended::from_affine(hx, hy)
-                .add_niels(&Niels::from_affine(hx, hy))
-                .to_affine();
-        }
-        Table(entries.into_boxed_slice())
+        Table(build_rows(W).into_boxed_slice())
     }
 
     /// `scalars[k] * B` を `out[k]` に（scalar はリトルエンディアン、2^255 未満であること）。
@@ -264,6 +239,51 @@ impl Table {
             *acc = acc.add_niels_last(&entry(row, d));
         }
     }
+}
+
+/// 幅 `w` の表の行数（桁数）と、1行のエントリ数
+pub(crate) const fn rows_cols(w: usize) -> (usize, usize) {
+    (255 / w + 1, (1 << (w - 1)) + 1)
+}
+
+/// 幅 `w` の表: `i` 行目の `k` 番目は `k * 2^(w*i) * B`（行ごとに並べる）。[`Table`] は `w` = [`W`]
+fn build_rows(w: usize) -> Vec<Niels> {
+    let (rows, cols) = rows_cols(w);
+    let mut entries = vec![Niels::IDENTITY; rows * cols];
+    // 各行の基準点 2^(w*i) * B（アフィン）
+    let (mut bx, mut by) = (BX, BY);
+    let mut scratch = Vec::new();
+    for row in entries.chunks_mut(cols) {
+        let base = Niels::from_affine(bx, by);
+        let mut acc = Extended::IDENTITY;
+        let mut multiples = Vec::with_capacity(cols);
+        for _ in 1..cols {
+            acc = acc.add_niels(&base);
+            multiples.push(acc);
+        }
+        // 1/Z をまとめて計算してアフィンにする
+        let mut zs: Vec<Fe> = multiples.iter().map(|p| p.z).collect();
+        Fe::batch_invert(&mut zs, &mut scratch);
+        for (k, (p, zi)) in multiples.iter().zip(zs).enumerate() {
+            row[k + 1] = Niels::from_affine(p.x * zi, p.y * zi);
+        }
+        // 次の行: 2^w * (今の行の基準点) = 2 * (2^(w-1) * 基準点)
+        let half = multiples[cols - 2]; // 2^(w-1) 倍
+        let (hx, hy) = half.to_affine();
+        (bx, by) = Extended::from_affine(hx, hy)
+            .add_niels(&Niels::from_affine(hx, hy))
+            .to_affine();
+    }
+    entries
+}
+
+/// 幅 `w` の表（[`build_rows`]）の各エントリの `[y+x, y-x, 2dxy]`（GPU 用。GPU は表の幅を選べる）
+#[cfg(feature = "cuda")]
+pub(crate) fn entries_with_width(w: usize) -> Vec<[Fe; 3]> {
+    build_rows(w)
+        .iter()
+        .map(|n| [n.ypx, n.ymx, n.xy2d])
+        .collect()
 }
 
 /// スカラーを符号付き 2^W 進の桁（-2^(W-1) ≤ d < 2^(W-1)、最上位桁のみ 0 ≤ d ≤ 2^(W-1)）に分解する。
