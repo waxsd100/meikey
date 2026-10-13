@@ -42,7 +42,7 @@ const PTX: &str = include_str!("gpu/kernel.ptx");
 pub const PTX_ARCH: &str = "compute_75";
 
 /// 1スレッドが1回にまとめて計算する鍵の数（逆元をまとめる数）
-const BATCH: u64 = 8;
+const BATCH: u64 = 16;
 
 /// 1ブロックのスレッド数
 const BLOCK: u32 = 128;
@@ -436,6 +436,7 @@ mod tests {
         fn meikey_test_secret(seed: *const u8, out: *mut u8);
         fn meikey_test_digits(s: *const u8, out: *mut i16);
         fn meikey_test_fe_mul(a: *const u32, b: *const u32, out: *mut u32);
+        fn meikey_test_fe_sq(a: *const u32, out: *mut u32);
         fn meikey_test_fe_invert_bytes(a: *const u32, out: *mut u8);
         fn meikey_test_derive_batch(table: *const u32, key: *const u32, first: u64, out: *mut u8);
         fn meikey_test_contains(pk: *const u8, needle: *const u8, len: u32, fold: u32) -> i32;
@@ -557,6 +558,37 @@ mod tests {
         });
     }
 
+    /// 2 乗の専用の計算（fe_sq）は fe_mul(a, a) とビット単位で同じ。リムは fe_sq の上限
+    /// （偶数番目 1.5·2^26 未満、奇数番目 1.5·2^25 未満）まで、上限ちょうど手前の値も含めて試す
+    #[cfg(meikey_gpu_host)]
+    #[rstest]
+    fn fe_sq_matches_fe_mul() {
+        let limit = |i: usize| {
+            if i.is_multiple_of(2) {
+                3u32 << 25
+            } else {
+                3u32 << 24
+            }
+        };
+        let limbs = proptest::collection::vec(any::<u32>(), 10).prop_map(move |v| {
+            from_fn::<u32, 10, _>(|i| match v[i] % 8 {
+                0 => limit(i) - 1,
+                1 => 0,
+                _ => v[i] % limit(i),
+            })
+        });
+        check(1024, limbs, |a| {
+            let (mut sq, mut mul) = ([0u32; 10], [0u32; 10]);
+            // SAFETY: どれも 10 リム
+            unsafe {
+                meikey_test_fe_sq(a.as_ptr(), sq.as_mut_ptr());
+                meikey_test_fe_mul(a.as_ptr(), a.as_ptr(), mul.as_mut_ptr());
+            }
+            prop_assert_eq!(sq, mul);
+            Ok(())
+        });
+    }
+
     /// まとめて計算した公開鍵は、同じシードから ed25519-dalek で作った鍵と一致する
     #[cfg(meikey_gpu_host)]
     #[rstest]
@@ -610,6 +642,65 @@ mod tests {
                 )
             } != 0;
             prop_assert_eq!(got, p.is_match(&key.public_b64()));
+            Ok(())
+        });
+    }
+
+    /// 鍵の base64 の一部（位置・長さはいろいろ。大小文字を変えたり1文字変えたりもする）を探すと、
+    /// Pattern と同じ結果になる（先頭 2 文字で候補を絞ったあとの、残りを比べる部分も通す）
+    #[cfg(meikey_gpu_host)]
+    #[rstest]
+    fn match_agrees_with_pattern_for_parts_of_the_key(#[values(false, true)] case_sensitive: bool) {
+        let cases = (
+            any::<[u8; 32]>(),
+            0usize..44,
+            1usize..=44,
+            any::<u64>(),
+            proptest::option::of((0usize..44, 0u8..64)),
+        );
+        check(4096, cases, |(seed, start, len, flips, edit)| {
+            let key = VanityKey::from_seed(seed);
+            let b64 = key.public_b64();
+            let tail = &b64[24..];
+            let len = len.min(44 - start);
+            let mut n: Vec<u8> = tail[start..start + len].to_vec();
+            // 大小文字をビットごとに入れ替える（区別しないなら一致のまま、区別するなら変わる）
+            for (i, c) in n.iter_mut().enumerate() {
+                if flips >> (i % 64) & 1 == 1 {
+                    c.make_ascii_uppercase();
+                } else {
+                    c.make_ascii_lowercase();
+                }
+            }
+            if let Some((i, v)) = edit {
+                let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                n[i % len] = alphabet[v as usize];
+            }
+            let n = String::from_utf8(n).unwrap();
+            let Ok(p) = Pattern::new(&n, case_sensitive) else {
+                return Ok(()); // 長すぎるなど、Pattern が受け付けない文字列
+            };
+            let bytes = if case_sensitive {
+                n.clone()
+            } else {
+                n.to_ascii_lowercase()
+            };
+            // SAFETY: pk は 32 バイト、needle は len バイト
+            let got = unsafe {
+                meikey_test_contains(
+                    key.public_bytes().as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    u32::from(!case_sensitive),
+                )
+            } != 0;
+            prop_assert_eq!(
+                got,
+                p.is_match(&b64),
+                "{:?} in {:?}",
+                n,
+                String::from_utf8_lossy(tail)
+            );
             Ok(())
         });
     }

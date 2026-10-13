@@ -8,12 +8,13 @@
 //   1. シード = ChaCha20(鍵 = ホストが作った乱数, ブロック番号 = 鍵の通し番号) の先頭 32 バイト
 //   2. 秘密スカラー = clamp(SHA-512(シード)[..32])
 //   3. 公開鍵の点 = 櫛形テーブル（W = 12、ホストが作って転送）を1行ずつ足す（加算 22 回、倍加なし）
-//   4. MEIKEY_BATCH 本の 1/Z を逆元1回でまとめて求め、圧縮する
-//   5. 公開鍵 blob の base64 の後半 44 文字を作り、文字列を探す。見つけたら通し番号を書いて知らせる
+//   4. MEIKEY_BATCH 本の 1/Z を逆元1回でまとめて求め、1本ずつ圧縮する
+//   5. 圧縮したらすぐ、公開鍵 blob の base64 の後半 44 文字に文字列があるか調べる。見つけたら通し番号を書いて知らせる
 //
 // 体演算は AVX2 版（avx2.rs）と同じ 25.5 ビット × 10 リム（偶数番目 26 ビット、奇数番目 25 ビット）で、
 // 32 × 32 → 64 ビットの積を 64 ビットで足し込む。リムの上限（2^26・2^25 の何倍か）も AVX2 版と同じ:
 //   fe_mul(a, b): a は 5 倍未満、b は 3.25 倍未満。結果は 1.01 倍未満
+//   fe_sq(a): a は 1.5 倍未満（38a を 32 ビットに収めるため）。結果は fe_mul(a, a) とビット単位で同じ
 //   fe_sub(a, b): b は 1.5 倍未満（2p を足してから引く）
 
 #if defined(__CUDACC_RTC__) || defined(__CUDACC__)
@@ -24,8 +25,15 @@ typedef int i32;
 typedef unsigned int u32;
 typedef unsigned long long u64;
 #define DEV __device__ __forceinline__
+#define NOINLINE __device__ __noinline__
 #define CONSTANT __constant__
 #define UNROLL _Pragma("unroll")
+/// 16 バイト境界の4語を1回で読む（読み出し専用のキャッシュを通す）
+#define LOAD4(dst, p)                                   \
+    {                                                   \
+        uint4 q_ = __ldg((const uint4*)(p));            \
+        (dst)[0] = q_.x; (dst)[1] = q_.y; (dst)[2] = q_.z; (dst)[3] = q_.w; \
+    }
 #else
 #include <stdint.h>
 typedef uint8_t u8;
@@ -34,8 +42,13 @@ typedef int32_t i32;
 typedef uint32_t u32;
 typedef unsigned long long u64;
 #define DEV static inline
+#define NOINLINE static
 #define CONSTANT static const
 #define UNROLL
+#define LOAD4(dst, p)                                                   \
+    {                                                                   \
+        (dst)[0] = (p)[0]; (dst)[1] = (p)[1]; (dst)[2] = (p)[2]; (dst)[3] = (p)[3]; \
+    }
 #endif
 
 // 櫛形テーブル（service/derive/comb.rs と同じ。ホストが W を -D で渡す）
@@ -48,10 +61,11 @@ typedef unsigned long long u64;
 // 表の1エントリ: y+x, y-x, 2dxy の 10 リムずつと未使用の 2 語（128 バイト）
 #define ENTRY_WORDS 32
 
-// 1スレッドが1回にまとめて計算する鍵の数（逆元をまとめる数）
+// 1スレッドが1回にまとめて計算する鍵の数（逆元をまとめる数。当たりを 64 ビットに集めるので 64 まで）
 #ifndef MEIKEY_BATCH
-#define MEIKEY_BATCH 8
+#define MEIKEY_BATCH 16
 #endif
+static_assert(MEIKEY_BATCH >= 1 && MEIKEY_BATCH <= 64, "MEIKEY_BATCH は 1〜64");
 
 // 公開鍵の base64（68 文字）のうち、鍵で変わる後半 44 文字（blob の 18 バイト目から）と、
 // そのうち判定に使う範囲の先頭（FIXED_PREFIX の直後 = 全体の 25 文字目 = 後半の 1 文字目）
@@ -290,7 +304,34 @@ DEV fe fe_mul(const fe a, const fe b) {
     return fe_carry64(c);
 }
 
-DEV fe fe_sq(const fe a) { return fe_mul(a, a); }
+/// a²。fe_mul(a, a) の c[k] の項を i ≤ j の組にまとめる（積は 100 回から 55 回に減る）。
+/// 係数（i ≠ j で 2 倍、i・j とも奇数で 2 倍、i + j ≥ 10 で 19 倍）は 2a・19a・38a を先に作って掛ける
+/// （a が 1.5 倍未満なら 38a は 32 ビットに収まる）。c[k] は fe_mul(a, a) と同じ値なので、結果もビット単位で同じ
+DEV fe fe_sq(const fe a) {
+    u32 a2[10], a19[10], a38[10];
+    UNROLL
+    for (int i = 0; i < 10; i++) {
+        a2[i] = 2 * a.v[i];
+        a19[i] = 19 * a.v[i];
+        a38[i] = 38 * a.v[i];
+    }
+    u64 c[10];
+    UNROLL
+    for (int k = 0; k < 10; k++) c[k] = 0;
+    UNROLL
+    for (int i = 0; i < 10; i++) {
+        UNROLL
+        for (int j = i; j < 10; j++) {
+            bool wrap = i + j >= 10;
+            // 1・2・4 倍（19 倍は下で掛ける）
+            int coef = (i != j ? 2 : 1) * ((i & 1) && (j & 1) ? 2 : 1);
+            u32 l = coef >= 2 ? a2[i] : a.v[i];
+            u32 r = wrap ? (coef == 4 ? a38[j] : a19[j]) : (coef == 4 ? a2[j] : a.v[j]);
+            c[(i + j) % 10] += (u64)l * r;
+        }
+    }
+    return fe_carry64(c);
+}
 
 DEV fe fe_pow2k(fe a, int k) {
     for (int i = 0; i < k; i++) a = fe_sq(a);
@@ -359,15 +400,19 @@ DEV void fe_to_bytes(const fe a, u8 out[32]) {
 typedef struct { fe x, y, z, t; } ext;
 typedef struct { fe ypx, ymx, xy2d; } niels;
 
-/// 表の i 行目の桁 d の点（負の桁は y+x と y-x を入れ替え、2dxy を反転）
+/// 表の i 行目の桁 d の点（負の桁は y+x と y-x を入れ替え、2dxy を反転）。
+/// エントリは 128 バイト境界にあるので、16 バイトずつ読む（未使用の 2 語も読む）
 DEV niels table_entry(const u32* table, int i, int d) {
     const u32* e = table + ((u64)i * COLS + (u32)(d < 0 ? -d : d)) * ENTRY_WORDS;
+    u32 w[ENTRY_WORDS];
+    UNROLL
+    for (int q = 0; q < ENTRY_WORDS / 4; q++) LOAD4(w + 4 * q, e + 4 * q);
     niels n;
     UNROLL
     for (int k = 0; k < 10; k++) {
-        n.ypx.v[k] = e[k];
-        n.ymx.v[k] = e[10 + k];
-        n.xy2d.v[k] = e[20 + k];
+        n.ypx.v[k] = w[k];
+        n.ymx.v[k] = w[10 + k];
+        n.xy2d.v[k] = w[20 + k];
     }
     if (d < 0) {
         fe t = n.ypx;
@@ -425,9 +470,15 @@ DEV ext mul_base(const u32* table, const u8 s[32]) {
 // base64 と文字列の判定
 // ---------------------------------------------------------------------------
 
-DEV u8 b64_char(u32 v) {
-    // A-Z a-z 0-9 + /
-    return (u8)(v < 26 ? 'A' + v : v < 52 ? 'a' + (v - 26) : v < 62 ? '0' + (v - 52) : v == 62 ? '+' : '/');
+/// 6 ビットの値 v の base64 の文字（A-Z a-z 0-9 + /）。分岐を使わず、範囲ごとの差を足す。`fold` なら英大文字を小文字に
+DEV u8 b64_char(u32 v, bool fold) {
+    u32 c = v + 'A';
+    c += 6u * (v >= 26);   // 26 → 'a'
+    c -= 75u * (v >= 52);  // 52 → '0'
+    c -= 15u * (v >= 62);  // 62 → '+'
+    c += 3u * (v >= 63);   // 63 → '/'
+    c += 32u * (fold && v < 26);
+    return (u8)c;
 }
 
 /// 公開鍵 blob の 18 バイト目からの 33 バイト（32 と公開鍵）の base64（44 文字）。`fold` なら英字を小文字に
@@ -439,23 +490,70 @@ DEV void tail_b64(const u8 pk[32], bool fold, u8 out[TAIL_B64]) {
         u32 b2 = pk[3 * g + 1];
         u32 n = b0 << 16 | b1 << 8 | b2;
         UNROLL
-        for (int k = 0; k < 4; k++) {
-            u8 ch = b64_char((n >> (18 - 6 * k)) & 63);
-            if (fold && ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
-            out[4 * g + k] = ch;
-        }
+        for (int k = 0; k < 4; k++) out[4 * g + k] = b64_char((n >> (18 - 6 * k)) & 63, fold);
     }
 }
 
-/// 判定の範囲（後半の 1 文字目から）に needle があるか。needle は fold なら小文字にしてある
-DEV bool b64_contains(const u8 b64[TAIL_B64], const u8* needle, u32 len) {
-    if (len == 0 || len > TAIL_B64 - SEARCH_FROM) return false;
-    for (u32 s = SEARCH_FROM; s + len <= TAIL_B64; s++) {
+/// 候補の位置（`candidates` のビット）のどれかから needle 全体が一致するか。候補が見つかったときだけ呼ぶので、
+/// base64 を作り直して配列で比べる
+NOINLINE bool b64_contains_at(const u8 pk[32], bool fold, const u8* needle, u32 len, u64 candidates) {
+    u8 b64[TAIL_B64];
+    tail_b64(pk, fold, b64);
+    while (candidates != 0) {
+        u32 s = 0;
+        while (((candidates >> s) & 1) == 0) s++;
+        candidates &= candidates - 1;
         u32 k = 0;
         while (k < len && b64[s + k] == needle[k]) k++;
         if (k == len) return true;
     }
     return false;
+}
+
+/// base64 の文字 c の 6 ビットの値（文字表に無ければ、どの値とも一致しない 64）
+DEV u32 b64_value(u8 c) {
+    return c >= 'A' && c <= 'Z'   ? c - 'A'
+           : c >= 'a' && c <= 'z' ? c - 'a' + 26
+           : c >= '0' && c <= '9' ? c - '0' + 52
+           : c == '+'             ? 62
+           : c == '/'             ? 63
+                                  : 64;
+}
+
+/// needle の1文字に一致する 6 ビットの値の組。大小文字を区別しない（fold）なら needle は小文字なので、
+/// 英字は小文字と大文字の2つ。それ以外は同じ値を2つ
+DEV void needle_values(u8 c, bool fold, u32 v[2]) {
+    v[0] = b64_value(c);
+    v[1] = fold && c >= 'a' && c <= 'z' ? v[0] - 26 : v[0];
+}
+
+/// pk の base64 の判定の範囲（後半の 1 文字目から）に needle があるか。needle は fold なら小文字にしてある。
+/// 文字にはせず 6 ビットの値のまま、全部の位置で先頭 2 文字（1 文字なら 1 文字）を比べて候補を絞り、
+/// 候補があるときだけ残りを比べる
+DEV bool pk_contains(const u8 pk[32], const u8* needle, u32 len, bool fold) {
+    if (len == 0 || len > TAIL_B64 - SEARCH_FROM) return false;
+    u32 c0[2], c1[2];
+    needle_values(needle[0], fold, c0);
+    needle_values(len >= 2 ? needle[1] : needle[0], fold, c1);
+    // m0・m1 のビット s: s 文字目が needle の 1・2 文字目と一致する
+    u64 m0 = 0, m1 = 0;
+    UNROLL
+    for (int g = 0; g < 11; g++) {
+        u32 b0 = g == 0 ? 32u : pk[3 * g - 1];
+        u32 n = b0 << 16 | (u32)pk[3 * g] << 8 | pk[3 * g + 1];
+        UNROLL
+        for (int k = 0; k < 4; k++) {
+            u32 v = (n >> (18 - 6 * k)) & 63;
+            m0 |= (u64)(v == c0[0] || v == c0[1]) << (4 * g + k);
+            m1 |= (u64)(v == c1[0] || v == c1[1]) << (4 * g + k);
+        }
+    }
+    u64 candidates = len >= 2 ? m0 & (m1 >> 1) : m0;
+    // 判定の範囲（SEARCH_FROM から）で、needle が収まる位置（s + len ≤ 44）だけ
+    candidates &= ((2ull << (TAIL_B64 - len)) - 1) & ~((1ull << SEARCH_FROM) - 1);
+    if (candidates == 0) return false;
+    if (len <= 2) return true;
+    return b64_contains_at(pk, fold, needle, len, candidates);
 }
 
 // ---------------------------------------------------------------------------
@@ -471,8 +569,10 @@ DEV u64 host_cas64(u64* p, u64 cmp, u64 val) { u64 old = *p; if (old == cmp) *p 
 #define VOLATILE_LOAD64(p) (*(volatile u64*)(p))
 #endif
 
-/// 通し番号 `first` から MEIKEY_BATCH 本の公開鍵（圧縮形式）を計算する
-DEV void derive_batch(const u32* table, const u32 key[8], u64 first, u8 pks[MEIKEY_BATCH][32]) {
+/// 通し番号 `first` から MEIKEY_BATCH 本の公開鍵（圧縮形式）を計算し、1本できるたびに emit(j, pk) を呼ぶ
+/// （j は 0 始まりの番号。後ろの鍵から順に呼ぶ）
+template <class Emit>
+DEV void derive_batch_each(const u32* table, const u32 key[8], u64 first, Emit emit) {
     fe xs[MEIKEY_BATCH], ys[MEIKEY_BATCH], zs[MEIKEY_BATCH], prefix[MEIKEY_BATCH];
     for (int j = 0; j < MEIKEY_BATCH; j++) {
         u8 seed[32], s[32];
@@ -489,11 +589,19 @@ DEV void derive_batch(const u32* table, const u32 key[8], u64 first, u8 pks[MEIK
     for (int j = MEIKEY_BATCH - 1; j >= 0; j--) {
         fe zinv = j == 0 ? inv : fe_mul(inv, prefix[j - 1]);
         if (j > 0) inv = fe_mul(inv, zs[j]);
-        u8 x[32];
-        fe_to_bytes(fe_mul(ys[j], zinv), pks[j]);
+        u8 pk[32], x[32];
+        fe_to_bytes(fe_mul(ys[j], zinv), pk);
         fe_to_bytes(fe_mul(xs[j], zinv), x);
-        pks[j][31] |= (u8)((x[0] & 1) << 7);
+        pk[31] |= (u8)((x[0] & 1) << 7);
+        emit(j, pk);
     }
+}
+
+/// 通し番号 `first` から MEIKEY_BATCH 本の公開鍵（圧縮形式）を pks に書く
+DEV void derive_batch(const u32* table, const u32 key[8], u64 first, u8 pks[MEIKEY_BATCH][32]) {
+    derive_batch_each(table, key, first, [&](int j, const u8 pk[32]) {
+        for (int b = 0; b < 32; b++) pks[j][b] = pk[b];
+    });
 }
 
 /// スレッド `gid`（全 `nthreads` 本）の仕事: 1回に MEIKEY_BATCH 本を `iters` 回。
@@ -505,15 +613,17 @@ DEV u32 thread_work(u64 gid, u64 nthreads, const u32* table, const u32 key[8], c
     for (u32 it = 0; it < iters; it++) {
         if (stop_on_hit && VOLATILE_LOAD64(result) != 0) break;
         u64 first = base + ((u64)it * nthreads + gid) * MEIKEY_BATCH;
-        u8 pks[MEIKEY_BATCH][32];
-        derive_batch(table, key, first, pks);
-        for (int j = 0; j < MEIKEY_BATCH; j++) {
-            u8 b64[TAIL_B64];
-            tail_b64(pks[j], fold != 0, b64);
-            sink ^= b64[TAIL_B64 - 1];
-            if (b64_contains(b64, needle, needle_len)) {
-                if (ATOMIC_CAS64(result, 0ull, 1ull) == 0ull) result[1] = first + (u64)j;
-            }
+        // 当たった鍵の番号 j をビットで集め、まとめて計算し終えてから、いちばん前の当たりを書く
+        // （公開鍵は後ろの鍵から順にできる）
+        u64 hits = 0;
+        derive_batch_each(table, key, first, [&](int j, const u8 pk[32]) {
+            sink ^= pk[31];
+            hits |= (u64)pk_contains(pk, needle, needle_len, fold != 0) << j;
+        });
+        if (hits != 0 && ATOMIC_CAS64(result, 0ull, 1ull) == 0ull) {
+            u32 j = 0;
+            while (((hits >> j) & 1) == 0) j++;
+            result[1] = first + j;
         }
     }
     return sink;
@@ -565,6 +675,13 @@ extern "C" void meikey_test_fe_mul(const u32 a[10], const u32 b[10], u32 out[10]
     for (int i = 0; i < 10; i++) out[i] = r.v[i];
 }
 
+extern "C" void meikey_test_fe_sq(const u32 a[10], u32 out[10]) {
+    fe x;
+    for (int i = 0; i < 10; i++) x.v[i] = a[i];
+    fe r = fe_sq(x);
+    for (int i = 0; i < 10; i++) out[i] = r.v[i];
+}
+
 extern "C" void meikey_test_fe_invert_bytes(const u32 a[10], u8 out[32]) {
     fe x;
     for (int i = 0; i < 10; i++) x.v[i] = a[i];
@@ -576,9 +693,7 @@ extern "C" void meikey_test_derive_batch(const u32* table, const u32 key[8], u64
 }
 
 extern "C" int meikey_test_contains(const u8 pk[32], const u8* needle, u32 len, u32 fold) {
-    u8 b64[TAIL_B64];
-    tail_b64(pk, fold != 0, b64);
-    return b64_contains(b64, needle, len);
+    return pk_contains(pk, needle, len, fold != 0);
 }
 
 extern "C" void meikey_test_tail_b64(const u8 pk[32], u8 out[TAIL_B64]) { tail_b64(pk, false, out); }
