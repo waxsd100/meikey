@@ -529,32 +529,42 @@ mod tests {
     use super::*;
     use crate::property::check;
     use crate::rfc8032;
+    use crate::rfc8032::secret_expand;
+    use crate::rfc8032::to_le32;
+    use crate::rfc8032::{Vector, vectors};
+    use crate::service::derive::comb::compress_with_zinv;
+    use crate::simd_support::available;
     use curve25519_dalek::edwards::EdwardsPoint;
     use curve25519_dalek::scalar::clamp_integer;
     use num_bigint::BigInt;
     use num_integer::Integer;
+    use proptest::collection::vec;
+    use proptest::option::weighted;
     use proptest::prelude::*;
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
+    use similar_asserts::assert_eq;
+    use std::array::from_fn;
+    use std::mem::transmute;
 
     /// このマシンで AVX2 が使えなければテストを飛ばす（MEIKEY_REQUIRE_SIMD に avx2 があれば失敗させる）
+    #[fixture]
     fn avx2() -> Option<Avx2> {
-        crate::simd_support::available("avx2", Avx2::detect())
+        available("avx2", Avx2::detect())
     }
 
     /// 4レーンぶんのリム（lanes[k][i] = k 番目の元の i 番目のリム）から
     fn fe4(lanes: [[u64; 10]; 4]) -> Fe4 {
-        Fe4(std::array::from_fn(|i| {
+        Fe4(from_fn(|i| {
             let v = [lanes[0][i], lanes[1][i], lanes[2][i], lanes[3][i]];
             // SAFETY: 同じ大きさで、どんなビット列も有効な値
-            unsafe { std::mem::transmute::<[u64; 4], __m256i>(v) }
+            unsafe { transmute::<[u64; 4], __m256i>(v) }
         }))
     }
 
     fn raw_lanes(f: &Fe4) -> [[u64; 10]; 4] {
         // SAFETY: 同じ大きさで、どんなビット列も有効な値
-        let l =
-            f.0.map(|v| unsafe { std::mem::transmute::<__m256i, [u64; 4]>(v) });
-        std::array::from_fn(|k| std::array::from_fn(|i| l[i][k]))
+        let l = f.0.map(|v| unsafe { transmute::<__m256i, [u64; 4]>(v) });
+        from_fn(|k| from_fn(|i| l[i][k]))
     }
 
     /// リムが表す整数（mod を取らない）
@@ -580,7 +590,7 @@ mod tests {
     fn fe4_below(num: u64, den: u64) -> impl Strategy<Value = [[u64; 10]; 4]> {
         any::<[[u64; 10]; 4]>().prop_map(move |r| {
             r.map(|l| {
-                std::array::from_fn(|i| {
+                from_fn(|i| {
                     let max = base(i) * num / den - 1;
                     match l[i] % 9 {
                         0 => 0,
@@ -611,8 +621,9 @@ mod tests {
     #[rstest]
     fn arithmetic_matches_bigint(
         #[values(Arith::Add, Arith::Sub, Arith::Mul, Arith::Carry)] op: Arith,
+        avx2: Option<Avx2>,
     ) {
-        let Some(_) = avx2() else { return };
+        let Some(_) = avx2 else { return };
         // (a の上限, b の上限) を分数で
         let ((an, ad), (bn, bd)) = match op {
             Arith::Add => ((4, 1), (4, 1)),
@@ -664,7 +675,7 @@ mod tests {
     }
 
     fn compress(p: &Extended) -> [u8; 32] {
-        crate::service::derive::comb::compress_with_zinv(p, p.z.invert())
+        compress_with_zinv(p, p.z.invert())
     }
 
     fn dalek(s: &[u8; 32]) -> [u8; 32] {
@@ -678,8 +689,8 @@ mod tests {
     #[rstest]
     #[case::clamped(true)]
     #[case::below_2_255(false)]
-    fn mul_base_batch_matches_dalek(#[case] clamp: bool) {
-        let Some(avx2) = avx2() else { return };
+    fn mul_base_batch_matches_dalek(#[case] clamp: bool, avx2: Option<Avx2>) {
+        let Some(avx2) = avx2 else { return };
         let special = [
             {
                 let mut s = [0u8; 32];
@@ -695,11 +706,11 @@ mod tests {
             },
         ];
         let strategy = (
-            prop::collection::vec(any::<[u8; 32]>(), 8),
-            prop::collection::vec(prop::option::weighted(0.25, 0..special.len()), 8),
+            vec(any::<[u8; 32]>(), 8),
+            vec(weighted(0.25, 0..special.len()), 8),
         );
         check(64, strategy, |(random, pick)| {
-            let s: [[u8; 32]; 8] = std::array::from_fn(|k| match pick[k] {
+            let s: [[u8; 32]; 8] = from_fn(|k| match pick[k] {
                 Some(i) => special[i],
                 None if clamp => clamp_integer(random[k]),
                 None => {
@@ -719,11 +730,10 @@ mod tests {
 
     /// RFC 8032 Section 7.1 のテストベクタの秘密スカラーで、参照実装と一致する
     #[rstest]
-    fn mul_base_batch_matches_rfc_vectors() {
-        let Some(avx2) = avx2() else { return };
-        let v = rfc8032::vectors();
-        let s: [[u8; 32]; 4] =
-            std::array::from_fn(|k| rfc8032::to_le32(&rfc8032::secret_expand(&v[k].secret).0));
+    fn mul_base_batch_matches_rfc_vectors(avx2: Option<Avx2>, vectors: Vec<Vector>) {
+        let Some(avx2) = avx2 else { return };
+        let v = vectors;
+        let s: [[u8; 32]; 4] = from_fn(|k| to_le32(&secret_expand(&v[k].secret).0));
         let mut out = [Extended::IDENTITY; 4];
         Table4::get(avx2).mul_base_batch(avx2, &s, &mut out);
         for (k, p) in out.iter().enumerate() {

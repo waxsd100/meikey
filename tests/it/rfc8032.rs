@@ -4,7 +4,9 @@
 //! 署名と検証のテストは ed25519-dalek にも同じものを通し、独立した2つの実装が RFC の値で揃うことも確かめる。
 
 use crate::common::rfc8032::*;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use num_bigint::BigInt;
+use rstest::fixture;
 
 /// RFC 8032 Section 5.1 Table 1 の値（原文から機械的に抜き出したもの）
 mod table1 {
@@ -27,7 +29,8 @@ fn euler(x: &BigInt) -> BigInt {
 }
 
 /// 先頭バイトだけが `k` の 32 バイト（リトルエンディアンの小さい整数）
-fn small(k: u8) -> [u8; 32] {
+#[fixture]
+fn small(#[default(1)] k: u8) -> [u8; 32] {
     let mut b = [0u8; 32];
     b[0] = k;
     b
@@ -46,28 +49,22 @@ impl Impl {
     fn public_key(self, secret: &[u8; 32]) -> [u8; 32] {
         match self {
             Impl::Reference => secret_to_public(secret),
-            Impl::Dalek => ed25519_dalek::SigningKey::from_bytes(secret)
-                .verifying_key()
-                .to_bytes(),
+            Impl::Dalek => SigningKey::from_bytes(secret).verifying_key().to_bytes(),
         }
     }
 
     fn sign(self, secret: &[u8; 32], message: &[u8]) -> [u8; 64] {
-        use ed25519_dalek::Signer;
         match self {
             Impl::Reference => sign(secret, message),
-            Impl::Dalek => ed25519_dalek::SigningKey::from_bytes(secret)
-                .sign(message)
-                .to_bytes(),
+            Impl::Dalek => SigningKey::from_bytes(secret).sign(message).to_bytes(),
         }
     }
 
     fn verify(self, public: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
-        use ed25519_dalek::Verifier;
         match self {
             Impl::Reference => verify(public, message, signature),
-            Impl::Dalek => ed25519_dalek::VerifyingKey::from_bytes(public).is_ok_and(|key| {
-                key.verify(message, &ed25519_dalek::Signature::from_bytes(signature))
+            Impl::Dalek => VerifyingKey::from_bytes(public).is_ok_and(|key| {
+                key.verify(message, &Signature::from_bytes(signature))
                     .is_ok()
             }),
         }
@@ -89,12 +86,13 @@ enum Tamper {
 mod tests {
     use super::*;
     use rstest::rstest;
+    use similar_asserts::assert_eq;
 
     // ---- Section 7.1 のテストベクタ ----
 
     #[rstest]
-    fn data_file_has_all_section_7_1_vectors() {
-        let names: Vec<String> = vectors().into_iter().map(|v| v.name).collect();
+    fn data_file_has_all_section_7_1_vectors(vectors: Vec<Vector>) {
+        let names: Vec<String> = vectors.into_iter().map(|v| v.name).collect();
         assert_eq!(names, ["1", "2", "3", "1024", "SHA(abc)"]);
     }
 
@@ -107,7 +105,11 @@ mod tests {
         let v = vector(name);
         assert_eq!(imp.public_key(&v.secret), v.public, "PUBLIC KEY");
         assert_eq!(imp.sign(&v.secret, &v.message), v.signature, "SIGNATURE");
-        assert!(imp.verify(&v.public, &v.message, &v.signature), "検証");
+        assert_eq!(
+            imp.verify(&v.public, &v.message, &v.signature),
+            true,
+            "検証"
+        );
     }
 
     /// どこを変えても検証は通らない（verify が何でも true を返していないことの確認）
@@ -137,27 +139,32 @@ mod tests {
                 sig[32..].copy_from_slice(&to_le32(&s));
             }
         }
-        assert!(!imp.verify(&public, &message, &sig));
+        assert_eq!(imp.verify(&public, &message, &sig), false);
     }
 
     // ---- Section 5.1 の定数と曲線の性質 ----
 
-    /// Table 1 の定数と、曲線・群の性質（Section 5.1.4 の「a = -1 は平方、d は非平方」と Section 5.1 の位数）
+    /// Table 1 の定数と、曲線・群の性質（Section 5.1.4 の「a = -1 は平方、d は非平方」）
     #[rstest]
-    #[case::d(|| assert_eq!(*D, big(table1::D)))]
-    #[case::basepoint_x(|| assert_eq!(to_affine(&G).0, big(table1::BX)))]
-    #[case::basepoint_y(|| assert_eq!(to_affine(&G).1, big(table1::BY)))]
-    #[case::group_order(|| assert_eq!(*Q, (BigInt::from(1) << 252) + big(table1::L_MINUS_2_252)))]
-    #[case::basepoint_on_curve(|| {
-        let (x, y) = to_affine(&G);
-        assert_eq!(pm(&(-(&x * &x) + &y * &y - 1 - &*D * &x * &x * &y * &y)), BigInt::ZERO);
-    })]
-    #[case::basepoint_has_order_l(|| assert!(is_identity(&point_mul(&Q, &G))))]
-    #[case::sqrt_m1(|| assert_eq!(pm(&(&*MODP_SQRT_M1 * &*MODP_SQRT_M1)), &*P - 1))]
-    #[case::d_is_non_square(|| assert_eq!(euler(&D), &*P - 1))]
-    #[case::minus_one_is_square(|| assert_eq!(euler(&(&*P - 1)), BigInt::from(1)))]
-    fn section_5_1(#[case] check: fn()) {
-        check();
+    #[case::d(D.clone(), big(table1::D))]
+    #[case::basepoint_x(to_affine(&G).0, big(table1::BX))]
+    #[case::basepoint_y(to_affine(&G).1, big(table1::BY))]
+    #[case::group_order(Q.clone(), (BigInt::from(1) << 252) + big(table1::L_MINUS_2_252))]
+    #[case::basepoint_on_curve(
+        { let (x, y) = to_affine(&G); pm(&(-(&x * &x) + &y * &y - 1 - &*D * &x * &x * &y * &y)) },
+        BigInt::ZERO
+    )]
+    #[case::sqrt_m1(pm(&(&*MODP_SQRT_M1 * &*MODP_SQRT_M1)), &*P - 1)]
+    #[case::d_is_non_square(euler(&D), &*P - 1)]
+    #[case::minus_one_is_square(euler(&(&*P - 1)), BigInt::from(1))]
+    fn section_5_1(#[case] got: BigInt, #[case] want: BigInt) {
+        assert_eq!(got, want);
+    }
+
+    /// Section 5.1: 基点の位数は L（L 倍すると単位元）
+    #[rstest]
+    fn basepoint_has_order_l() {
+        assert_eq!(is_identity(&point_mul(&Q, &G)), true);
     }
 
     /// Section 5.1.3: 復号できるもの・できないもの（y ≥ p、x = 0 なのに符号ビットが 1）

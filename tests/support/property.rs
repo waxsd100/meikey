@@ -14,6 +14,8 @@
 
 use proptest::strategy::Strategy;
 use proptest::test_runner::{Config, TestCaseResult, TestRunner};
+use std::env::var;
+use std::panic::Location;
 
 /// `strategy` が作るランダムな値で `test` を `cases` 回（× `MEIKEY_PROPTEST_SCALE`）試す。
 /// `test` の中では `prop_assert!` などで確かめ、最後に `Ok(())` を返す
@@ -22,7 +24,7 @@ pub fn check<S: Strategy>(cases: u32, strategy: S, test: impl Fn(S::Value) -> Te
     let config = Config {
         cases: scaled(cases),
         // 反例の保存先（proptest-regressions/ の下の、呼び出したファイルと同じ名前）を決める
-        source_file: Some(std::panic::Location::caller().file()),
+        source_file: Some(Location::caller().file()),
         ..Config::default()
     };
     let mut runner = TestRunner::new(config);
@@ -33,7 +35,7 @@ pub fn check<S: Strategy>(cases: u32, strategy: S, test: impl Fn(S::Value) -> Te
 
 /// 試行回数に `MEIKEY_PROPTEST_SCALE` を掛ける（0.1 のような小数も使える。最低 1 回）
 fn scaled(cases: u32) -> u32 {
-    let scale: f64 = std::env::var("MEIKEY_PROPTEST_SCALE")
+    let scale: f64 = var("MEIKEY_PROPTEST_SCALE")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|s: &f64| s.is_finite() && *s > 0.0)

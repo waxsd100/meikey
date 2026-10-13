@@ -19,7 +19,9 @@
 use num_bigint::{BigInt, Sign};
 use num_integer::Integer;
 use num_traits::{One, Zero};
+use rstest::fixture;
 use sha2::{Digest, Sha512};
+use similar_asserts::assert_eq;
 use std::sync::LazyLock;
 
 /// 拡張座標 (X, Y, Z, T)、x = X/Z, y = Y/Z, x*y = T/Z
@@ -36,9 +38,9 @@ pub fn from_le(s: &[u8]) -> BigInt {
 
 /// 整数 → 32 バイトのリトルエンディアン（Python の `int.to_bytes(n, 32, "little")`）
 pub fn to_le32(n: &BigInt) -> [u8; 32] {
-    assert!(n.sign() != Sign::Minus, "to_bytes: 負の数");
+    assert_eq!(n.sign() == Sign::Minus, false, "to_bytes: 負の数");
     let (_, bytes) = n.to_bytes_le();
-    assert!(bytes.len() <= 32, "to_bytes: 32 バイトに収まらない");
+    assert_eq!(bytes.len() <= 32, true, "to_bytes: 32 バイトに収まらない");
     let mut out = [0u8; 32];
     out[..bytes.len()].copy_from_slice(&bytes);
     out
@@ -259,6 +261,7 @@ pub struct Vector {
 }
 
 /// RFC 8032 Section 7.1 の全テストベクタ（tests/data/rfc8032-ed25519.txt）
+#[fixture]
 pub fn vectors() -> Vec<Vector> {
     const DATA: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -281,7 +284,8 @@ pub fn vectors() -> Vec<Vector> {
 }
 
 /// RFC 8032 Section 7.1 のテストベクタを名前（"1", "2", "3", "1024", "SHA(abc)"）で取り出す
-pub fn vector(name: &str) -> Vector {
+#[fixture]
+pub fn vector(#[default("1")] name: &str) -> Vector {
     vectors()
         .into_iter()
         .find(|v| v.name == name)
@@ -289,7 +293,7 @@ pub fn vector(name: &str) -> Vector {
 }
 
 pub fn hex(s: &str) -> Vec<u8> {
-    assert!(s.len().is_multiple_of(2), "16進の桁数が奇数");
+    assert_eq!(s.len().is_multiple_of(2), true, "16進の桁数が奇数");
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())

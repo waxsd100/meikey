@@ -220,7 +220,12 @@ impl Mul for Fe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rfc8032::from_le;
+    use crate::rfc8032::to_le32;
+    use proptest::array::uniform5;
+    use proptest::collection::vec;
     use rstest::rstest;
+    use similar_asserts::assert_eq;
 
     /// p + k（k ≤ 18 なら 255 ビットに収まる）
     const fn p_plus(k: u8) -> [u8; 32] {
@@ -335,7 +340,7 @@ mod tests {
     }
 
     fn fe(bits: u32) -> impl Strategy<Value = Fe> {
-        prop::array::uniform5(limb(bits)).prop_map(Fe)
+        uniform5(limb(bits)).prop_map(Fe)
     }
 
     fn limbs_below(x: Fe, bits: u32) -> bool {
@@ -431,7 +436,7 @@ mod tests {
     #[rstest]
     fn to_bytes_is_canonical_encoding() {
         check(4096, fe(63), |a| {
-            prop_assert_eq!(a.to_bytes(), rfc8032::to_le32(&modp(&value(a))));
+            prop_assert_eq!(a.to_bytes(), to_le32(&modp(&value(a))));
             Ok(())
         });
     }
@@ -442,7 +447,7 @@ mod tests {
         check(4096, any::<[u8; 32]>(), |b| {
             let x = Fe::from_bytes(&b);
             prop_assert!(limbs_below(x, 51));
-            let want = rfc8032::from_le(&b) & ((BigInt::from(1) << 255) - 1);
+            let want = from_le(&b) & ((BigInt::from(1) << 255) - 1);
             prop_assert_eq!(value(x), want);
             Ok(())
         });
@@ -455,7 +460,7 @@ mod tests {
     #[case::lengths_1_to_63(1..64, 448)]
     #[case::batch_of_256(BATCH..BATCH + 1, 64)] // 探索で実際に使う長さ
     fn batch_invert_gives_inverses(#[case] len: Range<usize>, #[case] cases: u32) {
-        check(cases, prop::collection::vec(fe(54), len), |xs| {
+        check(cases, vec(fe(54), len), |xs| {
             // 0 を含むと全体が 0 になる（呼び出し側は 0 を渡さない）ので除く
             let xs: Vec<Fe> = xs.into_iter().filter(|x| x.to_bytes() != [0; 32]).collect();
             let mut inv = xs.clone();

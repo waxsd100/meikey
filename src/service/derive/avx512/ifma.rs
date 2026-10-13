@@ -218,17 +218,21 @@ mod tests {
     use num_bigint::BigInt;
     use num_integer::Integer;
     use proptest::prelude::*;
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
+    use similar_asserts::assert_eq;
+    use std::array::from_fn;
+    use std::mem::transmute;
 
+    #[fixture]
     fn ifma() -> Option<Ifma> {
         available("avx512-ifma", Ifma::detect())
     }
 
     fn fe5(lanes: [[u64; 5]; 8]) -> Fe5 {
-        Fe5(std::array::from_fn(|i| {
-            let v: [u64; 8] = std::array::from_fn(|k| lanes[k][i]);
+        Fe5(from_fn(|i| {
+            let v: [u64; 8] = from_fn(|k| lanes[k][i]);
             // SAFETY: 同じ大きさで、どんなビット列も有効な値
-            unsafe { std::mem::transmute::<[u64; 8], __m512i>(v) }
+            unsafe { transmute::<[u64; 8], __m512i>(v) }
         }))
     }
 
@@ -251,7 +255,7 @@ mod tests {
     fn fe5_upto(max: [u64; 5]) -> impl Strategy<Value = [[u64; 5]; 8]> {
         any::<[[u64; 5]; 8]>().prop_map(move |r| {
             r.map(|l| {
-                std::array::from_fn(|i| match l[i] % 11 {
+                from_fn(|i| match l[i] % 11 {
                     0 => 0,
                     1..=3 => max[i],
                     4 => max[i].min(MASK),
@@ -275,8 +279,9 @@ mod tests {
     #[rstest]
     fn arithmetic_matches_bigint(
         #[values(Arith::Add, Arith::Sub, Arith::Mul, Arith::Neg)] op: Arith,
+        ifma: Option<Ifma>,
     ) {
-        let Some(_) = ifma() else { return };
+        let Some(_) = ifma else { return };
         // (a のリムの上限, b のリムの上限)
         let below52 = [(1 << 52) - 1; 5];
         let (a_max, b_max) = match op {
@@ -322,8 +327,8 @@ mod tests {
 
     /// 2^52 以上のリムは IFMA に黙って切り捨てられる（＝ [`Fe5`] の約束が要る理由）
     #[rstest]
-    fn ifma_ignores_bits_above_52() {
-        let Some(_) = ifma() else { return };
+    fn ifma_ignores_bits_above_52(ifma: Option<Ifma>) {
+        let Some(_) = ifma else { return };
         let a = [[1 << 52, 0, 0, 0, 0]; 8];
         let one = [[1, 0, 0, 0, 0]; 8];
         // SAFETY: ifma() で対応を確かめた

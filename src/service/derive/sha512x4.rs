@@ -215,6 +215,7 @@ fn prefixes_avx2(seeds: &[[u8; 32]; 4]) -> [[u8; 32]; 4] {
 mod tests {
     use super::*;
     use crate::property::check;
+    use crate::simd_support::available;
     use proptest::prelude::*;
     use rstest::rstest;
     use sha2::{Digest, Sha512};
@@ -229,7 +230,7 @@ mod tests {
     #[case::zero(Some([0u8; 32]))]
     #[case::ff(Some([0xffu8; 32]))]
     fn matches_sha2(#[case] fixed: Option<[u8; 32]>) {
-        let Some(avx2) = crate::simd_support::available("avx2", Avx2::detect()) else {
+        let Some(avx2) = available("avx2", Avx2::detect()) else {
             return;
         };
         check(1024, any::<[[u8; 32]; 4]>(), |mut seeds| {

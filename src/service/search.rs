@@ -247,7 +247,12 @@ mod tests {
     use crate::model::pattern::{Find, Pattern};
     use crate::property::check;
     use proptest::prelude::*;
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
+    use similar_asserts::assert_eq;
+    use std::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
+    use std::thread::scope;
+    use std::thread::sleep;
 
     /// 見つからない探索の種類
     #[derive(Debug, Clone, Copy)]
@@ -294,8 +299,8 @@ mod tests {
         let out = run(&cfg, |_| {});
 
         let key = out.key.expect("短い文字列ならすぐ見つかる");
-        assert!(cfg.pattern.unwrap().is_match(&key.public_b64()));
-        assert!(out.stats.tries >= 1);
+        assert_eq!(cfg.pattern.unwrap().is_match(&key.public_b64()), true);
+        assert_eq!(out.stats.tries >= 1, true);
     }
 
     /// 見つからない探索（--bench で当たりを無視する場合も）は、時間制限が来たらすぐ止まる
@@ -314,11 +319,12 @@ mod tests {
         };
         let out = run(&cfg, |_| {});
 
-        assert!(out.key.is_none());
-        assert!(out.stats.tries > 0, "時間内に鍵を作っている");
-        assert!(out.stats.elapsed >= limit);
-        assert!(
+        assert_eq!(out.key.is_none(), true);
+        assert_eq!(out.stats.tries > 0, true, "時間内に鍵を作っている");
+        assert_eq!(out.stats.elapsed >= limit, true);
+        assert_eq!(
             out.stats.elapsed < limit + Duration::from_secs(2),
+            true,
             "止まるのが遅い: {:?}",
             out.stats.elapsed
         );
@@ -341,14 +347,16 @@ mod tests {
         let mut at = Vec::new();
         run(&cfg, |s| at.push(s.elapsed));
 
-        assert!(
+        assert_eq!(
             (expected.saturating_sub(1)..=expected).contains(&at.len()),
+            true,
             "{} 回（期待 {expected} 回前後）: {at:?}",
             at.len()
         );
         for (k, t) in at.iter().enumerate() {
-            assert!(
+            assert_eq!(
                 *t >= interval * (k as u32 + 1),
+                true,
                 "{k} 回目が早すぎる: {at:?}"
             );
         }
@@ -366,9 +374,12 @@ mod tests {
         let mut reported = Vec::new();
         let out = Parallel.run(&cfg, &mut |s: Stats| reported.push(s));
 
-        assert!(out.key.is_none());
-        assert!(!reported.is_empty(), "進捗が届いていない");
-        assert!(reported.iter().all(|s| s.elapsed <= out.stats.elapsed));
+        assert_eq!(out.key.is_none(), true);
+        assert_eq!(reported.is_empty(), false, "進捗が届いていない");
+        assert_eq!(
+            reported.iter().all(|s| s.elapsed <= out.stats.elapsed),
+            true
+        );
     }
 
     /// 1つのスレッドがパニックしたら、ほかのスレッドも呼び出し元もすぐ止まる。
@@ -378,16 +389,16 @@ mod tests {
         let stop = AtomicBool::new(false);
         let started = Instant::now();
         let give_up = Duration::from_millis(50); // パニックしない場合に他のスレッドが待つ時間
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            thread::scope(|s| {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            scope(|s| {
                 s.spawn(|| {
                     let _guard = StopOnPanic(&stop);
-                    assert!(!panics, "わざとパニック");
+                    assert_eq!(panics, false, "わざとパニック");
                 });
                 for _ in 1..threads {
                     s.spawn(|| {
                         while !stop.load(Relaxed) && started.elapsed() < give_up {
-                            thread::sleep(Duration::from_millis(1));
+                            sleep(Duration::from_millis(1));
                         }
                     });
                 }
@@ -399,7 +410,11 @@ mod tests {
             panics,
             "停止フラグはパニックのときだけ立つ"
         );
-        assert!(started.elapsed() < Duration::from_secs(5), "すぐ止まる");
+        assert_eq!(
+            started.elapsed() < Duration::from_secs(5),
+            true,
+            "すぐ止まる"
+        );
     }
 
     /// どの1文字でも、見つかった鍵は ed25519-dalek で計算し直しても一致する
@@ -436,24 +451,26 @@ mod tests {
         };
         let cancel = cfg.cancel.clone();
         let started = Instant::now();
-        let out = thread::scope(|s| {
+        let out = scope(|s| {
             s.spawn(|| {
-                thread::sleep(Duration::from_millis(after_ms));
+                sleep(Duration::from_millis(after_ms));
                 cancel.cancel();
             });
             run(&cfg, |_| {})
         });
 
-        assert!(out.key.is_none());
-        assert!(
+        assert_eq!(out.key.is_none(), true);
+        assert_eq!(
             started.elapsed() < Duration::from_millis(after_ms) + Duration::from_secs(2),
+            true,
             "止まるのが遅い: {:?}",
             started.elapsed()
         );
     }
 
     /// 決まった結果をすぐ返す [`Searcher`]（[`Both`] の片方用）。止める合図を受け取ったかも記録する
-    fn instant(key: bool, tries: u64) -> MockSearcher {
+    #[fixture]
+    fn instant(#[default(false)] key: bool, #[default(0)] tries: u64) -> MockSearcher {
         let mut m = MockSearcher::new();
         m.expect_run().returning(move |_, _| Outcome {
             key: key.then(|| VanityKey::from_seed([7; 32])),
@@ -483,9 +500,10 @@ mod tests {
         };
 
         assert_eq!(out.key.map(|k| *k.seed()), Some([7; 32]));
-        assert!(out.stats.tries >= 5, "{:?}", out.stats);
-        assert!(
+        assert_eq!(out.stats.tries >= 5, true, "{:?}", out.stats);
+        assert_eq!(
             started.elapsed() < Duration::from_secs(2),
+            true,
             "止まるのが遅い: {:?}",
             started.elapsed()
         );
@@ -502,7 +520,7 @@ mod tests {
         let out = Both(Parallel, Parallel).run(&cfg, &mut |_: Stats| {});
 
         let key = out.key.expect("短い文字列ならすぐ見つかる");
-        assert!(cfg.pattern.unwrap().is_match(&key.public_b64()));
+        assert_eq!(cfg.pattern.unwrap().is_match(&key.public_b64()), true);
     }
 
     /// 時間切れまで回すときは両方の試行回数を合計して進捗を渡し、外の合図でも止まる
@@ -519,24 +537,29 @@ mod tests {
         let cancel = cfg.cancel.clone();
         let started = Instant::now();
         let mut reported = Vec::new();
-        let out = thread::scope(|s| {
+        let out = scope(|s| {
             if let Some(ms) = cancel_ms {
                 s.spawn(move || {
-                    thread::sleep(Duration::from_millis(ms));
+                    sleep(Duration::from_millis(ms));
                     cancel.cancel();
                 });
             }
             Both(Parallel, Parallel).run(&cfg, &mut |st: Stats| reported.push(st))
         });
 
-        assert!(out.key.is_none());
-        assert!(started.elapsed() < Duration::from_secs(3), "止まるのが遅い");
-        assert!(!reported.is_empty(), "進捗が届いていない");
-        assert!(
+        assert_eq!(out.key.is_none(), true);
+        assert_eq!(
+            started.elapsed() < Duration::from_secs(3),
+            true,
+            "止まるのが遅い"
+        );
+        assert_eq!(reported.is_empty(), false, "進捗が届いていない");
+        assert_eq!(
             reported.windows(2).all(|w| w[0].tries <= w[1].tries),
+            true,
             "試行回数が減った: {reported:?}"
         );
-        assert!(reported.iter().all(|s| s.tries <= out.stats.tries));
+        assert_eq!(reported.iter().all(|s| s.tries <= out.stats.tries), true);
     }
 
     /// 片方がパニックしたら、もう片方（時間制限の無い探索）も止まり、パニックが呼び出し元に伝わる
@@ -551,12 +574,16 @@ mod tests {
             ..Endless::Impossible.config()
         };
         let started = Instant::now();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = catch_unwind(AssertUnwindSafe(|| {
             Both(Parallel, broken).run(&cfg, &mut |_: Stats| {})
         }));
 
-        assert!(result.is_err());
-        assert!(started.elapsed() < Duration::from_secs(2), "止まるのが遅い");
+        assert_eq!(result.is_err(), true);
+        assert_eq!(
+            started.elapsed() < Duration::from_secs(2),
+            true,
+            "止まるのが遅い"
+        );
     }
 
     /// 状態の行は1つ目、2つ目の順に並ぶ

@@ -88,6 +88,7 @@ mod tests {
     use crate::property::check;
     use proptest::prelude::*;
     use rstest::rstest;
+    use similar_asserts::assert_eq;
 
     fn matcher(s: &str, cs: bool, how: Find) -> Matcher {
         Matcher::new(&Pattern::new(s, cs).unwrap(), how)

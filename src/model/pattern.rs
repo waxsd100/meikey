@@ -146,7 +146,10 @@ fn is_base64_char(c: char) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use proptest::collection::vec;
     use rstest::rstest;
+    use similar_asserts::assert_eq;
+    use std::str::from_utf8;
 
     /// 実際に生成した鍵
     pub(crate) const SAMPLE: &PublicB64 =
@@ -243,11 +246,12 @@ pub(crate) mod tests {
             pat(s, false).expected_tries(),
             pat(s, true).expected_tries(),
         );
-        assert!(
+        assert_eq!(
             (ci / insensitive - 1.0).abs() < 1e-12,
+            true,
             "{ci}（期待 {insensitive}）"
         );
-        assert!((cs / ci - ratio).abs() < 1e-9, "{}", cs / ci);
+        assert_eq!((cs / ci - ratio).abs() < 1e-9, true, "{}", cs / ci);
     }
 
     // ---- proptest ----
@@ -330,7 +334,7 @@ pub(crate) mod tests {
         let strategy = ("[A-Za-z0-9+/]{43}", needles, any::<usize>());
         check(1024, strategy, |(rest, needle, pos)| {
             let b64 = b64_with(&needle, planted.then_some(pos), &rest);
-            let s = std::str::from_utf8(&b64).unwrap();
+            let s = from_utf8(&b64).unwrap();
             let p = pat(&needle, cs);
             let want = naive_find(s, &needle, cs);
             prop_assert_eq!(p.find(&b64), want.clone());
@@ -348,7 +352,7 @@ pub(crate) mod tests {
         let strategy = (
             "[A-Za-z0-9+/]{43}",
             "[A-Za-z0-9+/]{1,6}",
-            prop::collection::vec(any::<bool>(), 6),
+            vec(any::<bool>(), 6),
             any::<usize>(),
         );
         check(2048, strategy, |(rest, needle, flips, pos)| {

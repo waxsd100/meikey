@@ -375,11 +375,14 @@ mod tests {
     use crate::service::search::MockSearcher;
     use mockall::Sequence;
     use mockall::predicate::eq;
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
+    use similar_asserts::assert_eq;
+    use std::iter::once;
     use std::path::Path;
 
     /// 表示用の名前だけ答える探索のモック（run の期待は各テストで書く）
-    fn mock_searcher() -> MockSearcher {
+    #[fixture]
+    fn searcher() -> MockSearcher {
         let mut s = MockSearcher::new();
         s.expect_status()
             .return_const(vec![("テスト", "探索".to_string())]);
@@ -387,17 +390,26 @@ mod tests {
     }
 
     fn parse(args: &[&str]) -> Cli {
-        Cli::try_parse_from(std::iter::once("meikey").chain(args.iter().copied())).unwrap()
+        Cli::try_parse_from(once("meikey").chain(args.iter().copied())).unwrap()
+    }
+
+    /// 保存のモック（期待は各テストで書く）
+    #[fixture]
+    fn repo() -> MockKeyRepository {
+        MockKeyRepository::new()
     }
 
     /// 見つかったことにする鍵と、その公開鍵に含まれる文字列
+    #[fixture]
     fn found() -> (VanityKey, String) {
         let key = VanityKey::from_seed([7; 32]);
         let target = String::from_utf8(key.public_b64()[10..14].to_vec()).unwrap();
         (key, target)
     }
 
-    fn stats(tries: u64, millis: u64) -> Stats {
+    /// 試行回数と経過時間
+    #[fixture]
+    fn stats(#[default(0)] tries: u64, #[default(0)] millis: u64) -> Stats {
         Stats {
             tries,
             elapsed: Duration::from_millis(millis),
@@ -424,22 +436,25 @@ mod tests {
         #[case] want: f64,
     ) {
         let got = remaining_secs(expected, now);
-        assert!((got - want).abs() < 1e-9, "{got}");
+        assert_eq!((got - want).abs() < 1e-9, true, "{got}");
     }
 
     /// 既存ファイルの確認（--force なら省く）→ 探索 → 保存 の順に呼び、見つかった鍵を
     /// 指定どおりのパス・コメント・上書き指定で保存する
     #[rstest]
-    fn generate_saves_found_key(#[values(false, true)] force: bool) {
-        let (key, target) = found();
+    fn generate_saves_found_key(
+        #[values(false, true)] force: bool,
+        mut searcher: MockSearcher,
+        found: (VanityKey, String),
+        mut repo: MockKeyRepository,
+    ) {
+        let (key, target) = found;
         let mut args = vec![target.as_str(), "-o", "out/id_test", "-C", "コメント"];
         if force {
             args.push("--force");
         }
         let cli = parse(&args);
         let mut seq = Sequence::new();
-        let mut repo = MockKeyRepository::new();
-        let mut searcher = mock_searcher();
 
         repo.expect_existing()
             .with(eq(Path::new("out/id_test")))
@@ -483,28 +498,33 @@ mod tests {
     #[rstest]
     fn existing_output_stops_before_search(
         #[values("id_test", "id_test.pub")] already: &'static str,
+        mut searcher: MockSearcher,
+        mut repo: MockKeyRepository,
     ) {
         let cli = parse(&["abc", "-o", "id_test"]);
-        let mut repo = MockKeyRepository::new();
+
         repo.expect_existing()
             .times(1)
             .returning(move |_| Ok(Some(PathBuf::from(already))));
         repo.expect_save().never();
-        let mut searcher = mock_searcher();
+
         searcher.expect_run().never();
 
         let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
-        assert!(e.contains(already) && e.contains("--force"), "{e}");
+        assert_eq!(e.contains(already) && e.contains("--force"), true, "{e}");
     }
 
     /// 既存ファイルを確かめられなければ（権限など）、そのエラーで止まり、探索しない
     #[rstest]
-    fn existing_check_error_stops_before_search() {
+    fn existing_check_error_stops_before_search(
+        mut searcher: MockSearcher,
+        mut repo: MockKeyRepository,
+    ) {
         let cli = parse(&["abc"]);
-        let mut repo = MockKeyRepository::new();
+
         repo.expect_existing()
             .returning(|_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "読めない")));
-        let mut searcher = mock_searcher();
+
         searcher.expect_run().never();
 
         let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
@@ -513,12 +533,12 @@ mod tests {
 
     /// 見つからずに終わった（時間切れ・パニック後の停止など）なら、エラーにして何も保存しない
     #[rstest]
-    fn not_found_saves_nothing() {
+    fn not_found_saves_nothing(mut searcher: MockSearcher, mut repo: MockKeyRepository) {
         let cli = parse(&["abc"]);
-        let mut repo = MockKeyRepository::new();
+
         repo.expect_existing().returning(|_| Ok(None));
         repo.expect_save().never();
-        let mut searcher = mock_searcher();
+
         searcher.expect_run().returning(|_, _| Outcome {
             key: None,
             stats: stats(10, 5),
@@ -532,15 +552,20 @@ mod tests {
     #[rstest]
     #[case::created_meanwhile(io::ErrorKind::AlreadyExists)]
     #[case::permission(io::ErrorKind::PermissionDenied)]
-    fn save_error_is_returned(#[case] kind: io::ErrorKind) {
-        let (key, target) = found();
+    fn save_error_is_returned(
+        #[case] kind: io::ErrorKind,
+        mut searcher: MockSearcher,
+        found: (VanityKey, String),
+        mut repo: MockKeyRepository,
+    ) {
+        let (key, target) = found;
         let cli = parse(&[&target]);
-        let mut repo = MockKeyRepository::new();
+
         repo.expect_existing().returning(|_| Ok(None));
         repo.expect_save()
             .times(1)
             .returning(move |_, _, _, _| Err(io::Error::new(kind, "書けない")));
-        let mut searcher = mock_searcher();
+
         searcher.expect_run().returning(move |_, _| Outcome {
             key: Some(key.clone()),
             stats: stats(10, 5),
@@ -556,10 +581,14 @@ mod tests {
     #[rstest]
     #[case::half_second("0.5", 500)]
     #[case::two_seconds("2", 2_000)]
-    fn bench_measures_without_files(#[case] secs: &str, #[case] millis: u64) {
+    fn bench_measures_without_files(
+        #[case] secs: &str,
+        #[case] millis: u64,
+        mut searcher: MockSearcher,
+        repo: MockKeyRepository,
+    ) {
         let cli = parse(&["--bench", secs, "abc", "--force"]);
-        let repo = MockKeyRepository::new();
-        let mut searcher = mock_searcher();
+
         searcher
             .expect_run()
             .withf(move |c, _| {
@@ -585,8 +614,8 @@ mod tests {
     #[rstest]
     #[case::alone(&["--check"])]
     #[case::with_target(&["--check", "abc", "--bench", "1"])]
-    fn check_only_reports(#[case] args: &[&str]) {
-        run(&parse(args), &mock_searcher(), &MockKeyRepository::new()).unwrap();
+    fn check_only_reports(#[case] args: &[&str], searcher: MockSearcher, repo: MockKeyRepository) {
+        run(&parse(args), &searcher, &repo).unwrap();
     }
 
     /// 文字列・コメントがおかしければ、ファイルを確かめる前・探索する前に止まる
@@ -595,11 +624,14 @@ mod tests {
     #[case::too_long(&["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "長すぎる")]
     #[case::newline_in_comment(&["abc", "-C", "a\nb"], "")]
     #[case::nul_in_comment(&["abc", "-C", "a\0b", "--bench", "1"], "")]
-    fn invalid_input_stops_early(#[case] args: &[&str], #[case] message: &str) {
-        let e = run(&parse(args), &mock_searcher(), &MockKeyRepository::new())
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains(message), "{e}");
+    fn invalid_input_stops_early(
+        #[case] args: &[&str],
+        #[case] message: &str,
+        searcher: MockSearcher,
+        repo: MockKeyRepository,
+    ) {
+        let e = run(&parse(args), &searcher, &repo).unwrap_err().to_string();
+        assert_eq!(e.contains(message), true, "{e}");
     }
 
     /// --simd amx は feature amx が有効なときだけ受け付け、探索の設定に届く
@@ -609,7 +641,7 @@ mod tests {
         #[cfg(feature = "amx")]
         assert_eq!(Simd::from(parsed.unwrap().simd), Simd::Amx);
         #[cfg(not(feature = "amx"))]
-        assert!(parsed.is_err());
+        assert_eq!(parsed.is_err(), true);
     }
 
     /// 既定は CPU、--gpu で GPU、--both で両方。--gpu と --both は一緒に付けられない
@@ -628,7 +660,7 @@ mod tests {
     #[cfg(not(feature = "cuda"))]
     #[rstest]
     fn gpu_flags_need_feature(#[values("--gpu", "--both")] flag: &str) {
-        assert!(Cli::try_parse_from(["meikey", "abc", flag]).is_err());
+        assert_eq!(Cli::try_parse_from(["meikey", "abc", flag]).is_err(), true);
     }
 
     /// CPU のスレッド数: -j が無ければ、CPU だけなら全コア、GPU と両方なら 全コア − 1（最低 1）。-j があればそのまま
@@ -637,12 +669,16 @@ mod tests {
     #[case::cpu_explicit(&["-j", "3"], |_| 3)]
     #[cfg_attr(feature = "cuda", case::both(&["--both"], |all: usize| all.saturating_sub(1).max(1)))]
     #[cfg_attr(feature = "cuda", case::both_explicit(&["--both", "-j", "3"], |_| 3))]
-    fn cpu_threads(#[case] options: &[&str], #[case] want: fn(usize) -> usize) {
+    fn cpu_threads(
+        #[case] options: &[&str],
+        #[case] want: fn(usize) -> usize,
+        mut searcher: MockSearcher,
+        repo: MockKeyRepository,
+    ) {
         let want = want(SearchConfig::new(None).threads);
         let mut args = vec!["abc", "--bench", "1"];
         args.extend(options);
-        let repo = MockKeyRepository::new();
-        let mut searcher = mock_searcher();
+
         searcher
             .expect_run()
             .withf(move |c, _| c.threads == want)
@@ -678,15 +714,17 @@ mod tests {
         #[case] options: &[&str],
         #[case] want: fn(&SearchConfig) -> bool,
         #[values(false, true)] bench: bool,
+        mut searcher: MockSearcher,
+        mut repo: MockKeyRepository,
     ) {
         let mut args = vec!["abc"];
         args.extend(options);
         if bench {
             args.extend(["--bench", "1"]);
         }
-        let mut repo = MockKeyRepository::new();
+
         repo.expect_existing().returning(|_| Ok(None));
-        let mut searcher = mock_searcher();
+
         searcher
             .expect_run()
             .withf(move |c, _| want(c))

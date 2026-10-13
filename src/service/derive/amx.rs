@@ -513,14 +513,19 @@ pub fn mul_base_batch<const N: usize>(amx: Amx, scalars: &[[u8; 32]; N], out: &m
 mod tests {
     use super::*;
     use crate::property::check;
+    use crate::service::derive::comb::compress_with_zinv;
     use crate::simd_support::available;
     use curve25519_dalek::edwards::EdwardsPoint;
     use curve25519_dalek::scalar::clamp_integer;
     use num_bigint::BigUint;
+    use proptest::collection::vec;
     use proptest::prelude::*;
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
+    use similar_asserts::assert_eq;
+    use std::array::from_fn;
 
     /// p = 2^255 - 19
+    #[fixture]
     fn p() -> BigUint {
         (BigUint::from(1u8) << 255u32) - 19u32
     }
@@ -547,15 +552,16 @@ mod tests {
     }
 
     /// AMX が使えなければテストを飛ばす（MEIKEY_REQUIRE_SIMD に amx があれば失敗させる）
+    #[fixture]
     fn amx() -> Option<Amx> {
         available("amx", Amx::detect())
     }
 
     /// 足し算・引き算・符号反転は、p を法として多倍長整数と一致する（結果はいつも 2^256 未満）
     #[rstest]
-    fn add_sub_neg_match_bigint() {
+    fn add_sub_neg_match_bigint(p: BigUint) {
         check(4096, (any_f(), any_f()), |(a, b)| {
-            let (x, y, p) = (big(&a), big(&b), p());
+            let (x, y, p) = (big(&a), big(&b), p.clone());
             prop_assert_eq!(big(&a.add(b)) % &p, (&x + &y) % &p);
             prop_assert_eq!(big(&a.sub(b)) % &p, (&x + &p * 2u32 - &y % &p) % &p);
             prop_assert_eq!(big(&a.neg()) % &p, (&p - &x % &p) % &p);
@@ -565,24 +571,24 @@ mod tests {
 
     /// 512 ビットの畳み込み結果を畳んでも、p を法として同じ値
     #[rstest]
-    fn reduce_wide_matches_bigint() {
+    fn reduce_wide_matches_bigint(p: BigUint) {
         check(4096, any::<[u64; 8]>(), |s| {
             let want = BigUint::from_slice(
                 &s.iter()
                     .flat_map(|w| [*w as u32, (w >> 32) as u32])
                     .collect::<Vec<_>>(),
-            ) % p();
-            prop_assert_eq!(big(&F::reduce_wide(s)) % p(), want);
+            ) % &p;
+            prop_assert_eq!(big(&F::reduce_wide(s)) % &p, want);
             Ok(())
         });
     }
 
     /// Fe との行き来で値が変わらない
     #[rstest]
-    fn fe_round_trip() {
+    fn fe_round_trip(p: BigUint) {
         check(4096, any_f(), |a| {
             let back = F::from_fe(a.to_fe());
-            prop_assert_eq!(big(&back), big(&a) % p());
+            prop_assert_eq!(big(&back), big(&a) % &p);
             Ok(())
         });
     }
@@ -590,62 +596,53 @@ mod tests {
     /// AMX の乗算（入力を書く → タイル演算 → 畳む）は、p を法として多倍長整数の積と一致する。
     /// 2組のタイルを交互に使うので、奇数個・偶数個の両方を流す
     #[rstest]
-    fn mul_matches_bigint(#[values(1, 2, 7)] n: usize) {
-        let Some(amx) = amx() else {
+    fn mul_matches_bigint(#[values(1, 2, 7)] n: usize, amx: Option<Amx>, p: BigUint) {
+        let Some(amx) = amx else {
             return;
         };
-        check(
-            1024,
-            prop::collection::vec((any_f(), any_f()), n),
-            |pairs| {
-                let tiles = Tiles::load(amx);
-                let mut slots: Vec<Slot> = (0..n).map(|_| Slot::ZERO).collect();
-                for (s, (x, y)) in slots.iter_mut().zip(&pairs) {
-                    s.set(x, y);
-                }
-                tiles.run(&mut slots);
-                for (s, (x, y)) in slots.iter().zip(&pairs) {
-                    prop_assert_eq!(big(&s.product()) % p(), big(x) * big(y) % p());
-                }
-                Ok(())
-            },
-        );
+        check(1024, vec((any_f(), any_f()), n), |pairs| {
+            let tiles = Tiles::load(amx);
+            let mut slots: Vec<Slot> = (0..n).map(|_| Slot::ZERO).collect();
+            for (s, (x, y)) in slots.iter_mut().zip(&pairs) {
+                s.set(x, y);
+            }
+            tiles.run(&mut slots);
+            for (s, (x, y)) in slots.iter().zip(&pairs) {
+                prop_assert_eq!(big(&s.product()) % &p, big(x) * big(y) % &p);
+            }
+            Ok(())
+        });
     }
 
     /// 1・8・9・256 鍵（[`GROUP`] ちょうど・端数あり・バッチ全体）の倍算が curve25519-dalek と一致する
     #[rstest]
-    fn mul_base_batch_matches_dalek(#[values(1, 8, 9, 256)] n: usize) {
+    fn mul_base_batch_matches_dalek(#[values(1, 8, 9, 256)] n: usize, amx: Option<Amx>) {
         fn run<const N: usize>(amx: Amx, cases: u32) {
-            check(
-                cases,
-                prop::collection::vec(any::<[u8; 32]>(), N),
-                |random| {
-                    let scalars: [[u8; 32]; N] = std::array::from_fn(|k| match k % 4 {
-                        // 2^254（途中の桁がすべて 0）と、桁が正負に入り混じる値も混ぜる
-                        1 => {
-                            let mut s = [0u8; 32];
-                            s[31] = 0x40;
-                            s
-                        }
-                        2 => [0x88; 32].map(|b| b & 0x7f),
-                        _ => clamp_integer(random[k]),
-                    });
-                    let mut out = [Extended::IDENTITY; N];
-                    mul_base_batch(amx, &scalars, &mut out);
-                    for (k, (p, s)) in out.iter().zip(&scalars).enumerate() {
-                        let want = EdwardsPoint::mul_base(
-                            &curve25519_dalek::Scalar::from_bytes_mod_order(*s),
-                        )
-                        .compress()
-                        .to_bytes();
-                        let got = crate::service::derive::comb::compress_with_zinv(p, p.z.invert());
-                        prop_assert_eq!(got, want, "#{}", k);
+            check(cases, vec(any::<[u8; 32]>(), N), |random| {
+                let scalars: [[u8; 32]; N] = from_fn(|k| match k % 4 {
+                    // 2^254（途中の桁がすべて 0）と、桁が正負に入り混じる値も混ぜる
+                    1 => {
+                        let mut s = [0u8; 32];
+                        s[31] = 0x40;
+                        s
                     }
-                    Ok(())
-                },
-            );
+                    2 => [0x88; 32].map(|b| b & 0x7f),
+                    _ => clamp_integer(random[k]),
+                });
+                let mut out = [Extended::IDENTITY; N];
+                mul_base_batch(amx, &scalars, &mut out);
+                for (k, (p, s)) in out.iter().zip(&scalars).enumerate() {
+                    let want =
+                        EdwardsPoint::mul_base(&curve25519_dalek::Scalar::from_bytes_mod_order(*s))
+                            .compress()
+                            .to_bytes();
+                    let got = compress_with_zinv(p, p.z.invert());
+                    prop_assert_eq!(got, want, "#{}", k);
+                }
+                Ok(())
+            });
         }
-        let Some(amx) = amx() else {
+        let Some(amx) = amx else {
             return;
         };
         match n {
@@ -658,11 +655,11 @@ mod tests {
 
     /// AMX が使えるなら AVX-512 も使える
     #[rstest]
-    fn detection_is_consistent() {
+    fn detection_is_consistent(amx: Option<Amx>) {
         if let Some(a) = Amx::detect() {
             let _ = a.avx512();
-            assert!(Avx512::detect().is_some());
+            assert_eq!(Avx512::detect().is_some(), true);
         }
-        let _ = amx();
+        let _ = amx;
     }
 }

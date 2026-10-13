@@ -408,15 +408,27 @@ mod tests {
     #[cfg(meikey_gpu_host)]
     use crate::property::check;
     #[cfg(meikey_gpu_host)]
+    use crate::service::derive::comb::signed_digits;
+    #[cfg(meikey_gpu_host)]
     use crate::service::derive::field::Fe;
     use crate::service::search::{Both, Parallel};
+    use crate::simd_support::available;
+    use cudarc::driver::sys::is_culib_present as driver_present;
+    use cudarc::nvrtc::sys::is_culib_present as nvrtc_present;
+    #[cfg(meikey_gpu_host)]
+    use curve25519_dalek::scalar::clamp_integer;
     #[cfg(meikey_gpu_host)]
     use proptest::prelude::*;
-    use rstest::rstest;
+    use rand::random;
+    use rstest::{fixture, rstest};
     #[cfg(meikey_gpu_host)]
     use sha2::{Digest, Sha512};
+    use similar_asserts::assert_eq;
+    use std::array::from_fn;
     #[cfg(meikey_gpu_host)]
     use std::sync::LazyLock;
+    use std::thread::scope;
+    use std::thread::sleep;
 
     #[cfg(meikey_gpu_host)]
     unsafe extern "C" {
@@ -447,7 +459,7 @@ mod tests {
     static TABLE: LazyLock<Vec<u32>> = LazyLock::new(table_words);
 
     fn key_words(key: &[u8; 32]) -> [u32; 8] {
-        std::array::from_fn(|i| u32::from_le_bytes(*key[4 * i..].first_chunk().unwrap()))
+        from_fn(|i| u32::from_le_bytes(*key[4 * i..].first_chunk().unwrap()))
     }
 
     #[cfg(meikey_gpu_host)]
@@ -496,7 +508,7 @@ mod tests {
             // SAFETY: どちらも 32 バイト
             unsafe { meikey_test_secret(s.as_ptr(), got.as_mut_ptr()) };
             let h: [u8; 64] = Sha512::digest(s).into();
-            let want = curve25519_dalek::scalar::clamp_integer(*h.first_chunk().unwrap());
+            let want = clamp_integer(*h.first_chunk().unwrap());
             prop_assert_eq!(got, want);
             Ok(())
         });
@@ -511,7 +523,7 @@ mod tests {
             let mut got = [0i16; ROWS];
             // SAFETY: s は 32 バイト、out は ROWS 個
             unsafe { meikey_test_digits(s.as_ptr(), got.as_mut_ptr()) };
-            prop_assert_eq!(got, crate::service::derive::comb::signed_digits(&s));
+            prop_assert_eq!(got, signed_digits(&s));
             Ok(())
         });
     }
@@ -531,7 +543,7 @@ mod tests {
                     prod.as_mut_ptr(),
                 )
             };
-            let back = Fe(std::array::from_fn(|i| {
+            let back = Fe(from_fn(|i| {
                 u64::from(prod[2 * i]) + (u64::from(prod[2 * i + 1]) << 26)
             }));
             prop_assert_eq!(back.to_bytes(), (x * y).to_bytes());
@@ -606,26 +618,32 @@ mod tests {
     #[rstest]
     fn embedded_ptx_matches_kernel_source() {
         let first = PTX.lines().next().unwrap_or_default();
-        assert!(
+        assert_eq!(
             first.contains(&kernel_hash()),
+            true,
             "kernel.ptx が kernel.cu と食い違っている（cargo make ptx で作り直す）: {first}"
         );
-        assert!(PTX.contains(".target sm_75") && PTX.contains(".entry meikey_search"));
+        assert_eq!(
+            PTX.contains(".target sm_75") && PTX.contains(".entry meikey_search"),
+            true
+        );
     }
 
     // ---- NVRTC・GPU があるときだけ（無ければ飛ばす。MEIKEY_REQUIRE_SIMD に nvrtc・cuda があれば失敗させる） ----
 
+    #[fixture]
     fn nvrtc() -> Option<()> {
         // SAFETY: ライブラリを読み込めるか試すだけ
-        let present = unsafe { cudarc::nvrtc::sys::is_culib_present() };
-        crate::simd_support::available("nvrtc", present.then_some(()))
+        let present = unsafe { nvrtc_present() };
+        available("nvrtc", present.then_some(()))
     }
 
+    #[fixture]
     fn gpu() -> Option<Gpu> {
         // SAFETY: ライブラリを読み込めるか試すだけ
-        let present = unsafe { cudarc::driver::sys::is_culib_present() }
-            && CudaContext::device_count().is_ok_and(|n| n > 0);
-        crate::simd_support::available("cuda", present.then_some(()))?;
+        let present =
+            unsafe { driver_present() } && CudaContext::device_count().is_ok_and(|n| n > 0);
+        available("cuda", present.then_some(()))?;
         Some(Gpu::new(0).expect("GPU を使えるようにできる"))
     }
 
@@ -633,25 +651,29 @@ mod tests {
     #[rstest]
     fn kernel_compiles_for_each_generation(
         #[values((7, 5), (8, 0), (8, 6), (8, 9), (9, 0), (12, 0))] compute: (i32, i32),
+        nvrtc: Option<()>,
     ) {
-        if nvrtc().is_none() {
+        if nvrtc.is_none() {
             return;
         }
         let ptx = compile(compute).unwrap_or_else(|e| panic!("{e}"));
         let src = ptx.to_src();
         let want = format!(".target sm_{}{}", compute.0, compute.1);
-        assert!(src.contains(&want), "{want} の PTX になっていない");
-        assert!(src.contains(".entry meikey_search") && src.contains(".entry meikey_derive"));
+        assert_eq!(src.contains(&want), true, "{want} の PTX になっていない");
+        assert_eq!(
+            src.contains(".entry meikey_search") && src.contains(".entry meikey_derive"),
+            true
+        );
     }
 
     /// GPU で計算した公開鍵は、同じシードから ed25519-dalek で作った鍵と一致する
     #[rstest]
-    fn gpu_derive_matches_dalek() {
-        let Some(gpu) = gpu() else {
+    fn gpu_derive_matches_dalek(gpu: Option<Gpu>) {
+        let Some(gpu) = gpu else {
             return;
         };
         let f = gpu.module.load_function("meikey_derive").unwrap();
-        let key: [u8; 32] = rand::random();
+        let key: [u8; 32] = random();
         let first = 1 << 40;
         let (blocks, threads) = (8u32, BLOCK);
         let n = (blocks * threads) as usize * BATCH as usize;
@@ -676,8 +698,8 @@ mod tests {
 
     /// GPU で探すと、文字列を含む鍵が見つかる（大小文字の区別あり・なし）。ベンチマークは時間で止まる
     #[rstest]
-    fn gpu_search_finds_key(#[values(false, true)] case_sensitive: bool) {
-        let Some(gpu) = gpu() else {
+    fn gpu_search_finds_key(#[values(false, true)] case_sensitive: bool, gpu: Option<Gpu>) {
+        let Some(gpu) = gpu else {
             return;
         };
         let p = Pattern::new("Ab1", case_sensitive).unwrap();
@@ -687,7 +709,7 @@ mod tests {
         };
         let out = gpu.run(&config, &mut |_| {});
         let key = out.key.expect("3文字ならすぐ見つかる");
-        assert!(p.is_match(&key.public_b64()));
+        assert_eq!(p.is_match(&key.public_b64()), true);
 
         let bench = SearchConfig {
             bench: true,
@@ -695,13 +717,13 @@ mod tests {
             ..config
         };
         let out = gpu.run(&bench, &mut |_| {});
-        assert!(out.key.is_none() && out.stats.tries > 0);
+        assert_eq!(out.key.is_none() && out.stats.tries > 0, true);
     }
 
     /// GPU の探索は外からの合図で止まる（時間制限が無くても）。CPU と同時に探すと、どちらかが見つける
     #[rstest]
-    fn gpu_with_cpu(#[values(false, true)] cancel_only: bool) {
-        let Some(gpu) = gpu() else {
+    fn gpu_with_cpu(#[values(false, true)] cancel_only: bool, gpu: Option<Gpu>) {
+        let Some(gpu) = gpu else {
             return;
         };
         if cancel_only {
@@ -710,15 +732,19 @@ mod tests {
             ));
             let cancel = config.cancel.clone();
             let started = Instant::now();
-            let out = std::thread::scope(|s| {
+            let out = scope(|s| {
                 s.spawn(|| {
-                    std::thread::sleep(Duration::from_millis(300));
+                    sleep(Duration::from_millis(300));
                     cancel.cancel();
                 });
                 gpu.run(&config, &mut |_| {})
             });
-            assert!(out.key.is_none() && out.stats.tries > 0);
-            assert!(started.elapsed() < Duration::from_secs(5), "止まるのが遅い");
+            assert_eq!(out.key.is_none() && out.stats.tries > 0, true);
+            assert_eq!(
+                started.elapsed() < Duration::from_secs(5),
+                true,
+                "止まるのが遅い"
+            );
         } else {
             let p = Pattern::new("Ab1c", false).unwrap();
             let config = SearchConfig {
@@ -728,7 +754,7 @@ mod tests {
             };
             let out = Both(gpu, Parallel).run(&config, &mut |_| {});
             let key = out.key.expect("4文字ならすぐ見つかる");
-            assert!(p.is_match(&key.public_b64()));
+            assert_eq!(p.is_match(&key.public_b64()), true);
         }
     }
 
@@ -737,7 +763,7 @@ mod tests {
     #[cfg(meikey_gpu_host)]
     #[rstest]
     fn search_finds_first_hit() {
-        let key: [u8; 32] = std::array::from_fn(|i| i as u8 * 7);
+        let key: [u8; 32] = from_fn(|i| i as u8 * 7);
         let p = Pattern::new("ab", false).unwrap();
         let needle = b"ab";
         let mut result = [0u64; 2];
@@ -758,10 +784,14 @@ mod tests {
         }
         assert_eq!(result[0], 1, "512 鍵のうちに「ab」はほぼ確実に出る");
         let hit = result[1];
-        assert!(p.is_match(&VanityKey::from_seed(seed(&key, hit)).public_b64()));
+        assert_eq!(
+            p.is_match(&VanityKey::from_seed(seed(&key, hit)).public_b64()),
+            true
+        );
         for i in 0..hit {
-            assert!(
-                !p.is_match(&VanityKey::from_seed(seed(&key, i)).public_b64()),
+            assert_eq!(
+                p.is_match(&VanityKey::from_seed(seed(&key, i)).public_b64()),
+                false,
                 "{i} が先に当たる"
             );
         }

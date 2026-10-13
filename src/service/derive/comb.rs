@@ -299,9 +299,20 @@ pub(crate) fn signed_digits(s: &[u8; 32]) -> [i16; ROWS] {
 mod tests {
     use super::*;
     use crate::rfc8032;
+    use crate::rfc8032::base_mul_encoded;
+    use crate::rfc8032::from_le;
+    use crate::rfc8032::is_identity;
+    use crate::rfc8032::point_add;
+    use crate::rfc8032::point_compress;
+    use crate::rfc8032::point_mul;
+    use crate::rfc8032::to_affine;
+    use crate::rfc8032::to_le32;
     use curve25519_dalek::edwards::EdwardsPoint;
     use curve25519_dalek::scalar::clamp_integer;
-    use rstest::rstest;
+    use proptest::collection::vec;
+    use rstest::{fixture, rstest};
+    use similar_asserts::assert_eq;
+    use std::array::from_fn;
 
     fn compress(p: &Extended) -> [u8; 32] {
         compress_with_zinv(p, p.z.invert())
@@ -328,11 +339,12 @@ mod tests {
     }
 
     /// 最上位以外の全桁（W ビットずつ）が `v` のスカラー
-    fn repeated_digit(v: u32) -> [u8; 32] {
+    #[fixture]
+    fn repeated_digit(#[default(0)] v: u32) -> [u8; 32] {
         let s = (0..ROWS - 1).fold(num_bigint::BigInt::from(0), |acc, i| {
             acc + (num_bigint::BigInt::from(v) << (W * i))
         });
-        rfc8032::to_le32(&s)
+        to_le32(&s)
     }
 
     #[rstest]
@@ -368,13 +380,13 @@ mod tests {
     #[case::max_below_2_255({ let mut s = [0xffu8; 32]; s[31] = 0x7f; s })] // 全桁で繰り上がる
     fn edge_scalars(#[case] s: [u8; 32]) {
         let d = signed_digits(&s);
-        assert!(digits_in_range(&d), "{d:?}");
-        assert_eq!(reconstruct(&d), rfc8032::from_le(&s), "桁分解");
+        assert_eq!(digits_in_range(&d), true, "{d:?}");
+        assert_eq!(reconstruct(&d), from_le(&s), "桁分解");
 
         let got = compress(&mul_base(&s));
         let dalek = EdwardsPoint::mul_base(&curve25519_dalek::Scalar::from_bytes_mod_order(s));
         assert_eq!(got, dalek.compress().to_bytes(), "curve25519-dalek");
-        assert_eq!(got, rfc8032::base_mul_encoded(&s), "RFC 8032 参照実装");
+        assert_eq!(got, base_mul_encoded(&s), "RFC 8032 参照実装");
     }
 
     #[rstest]
@@ -399,17 +411,17 @@ mod tests {
     use proptest::prelude::*;
 
     fn fe_of(x: &num_bigint::BigInt) -> Fe {
-        Fe::from_bytes(&rfc8032::to_le32(x))
+        Fe::from_bytes(&to_le32(x))
     }
 
     /// 参照実装の点を、このモジュールの拡張座標（Z = 1）に
     fn extended_of(p: &rfc8032::Point) -> Extended {
-        let (x, y) = rfc8032::to_affine(p);
+        let (x, y) = to_affine(p);
         Extended::from_affine(fe_of(&x), fe_of(&y))
     }
 
     fn niels_of(p: &rfc8032::Point) -> Niels {
-        let (x, y) = rfc8032::to_affine(p);
+        let (x, y) = to_affine(p);
         Niels::from_affine(fe_of(&x), fe_of(&y))
     }
 
@@ -422,12 +434,12 @@ mod tests {
         row: usize,
     ) {
         assert_eq!(ROWS, 22, "行を増減したら #[values] も合わせる");
-        let base = rfc8032::point_mul(&(num_bigint::BigInt::from(1) << (W * row)), &rfc8032::G);
+        let base = point_mul(&(num_bigint::BigInt::from(1) << (W * row)), &rfc8032::G);
         let mut acc = [0, 1, 1, 0].map(num_bigint::BigInt::from); // 単位元
         for (k, entry) in Table::get().row(row).iter().enumerate() {
             let got = compress(&Extended::IDENTITY.add_niels(entry));
-            assert_eq!(got, rfc8032::point_compress(&acc), "row {row}, k {k}");
-            acc = rfc8032::point_add(&acc, &base);
+            assert_eq!(got, point_compress(&acc), "row {row}, k {k}");
+            acc = point_add(&acc, &base);
         }
     }
 
@@ -462,7 +474,7 @@ mod tests {
         check(1024, scalars.strategy(), |s| {
             let d = signed_digits(&s);
             prop_assert!(digits_in_range(&d), "{:?}", d);
-            prop_assert_eq!(reconstruct(&d), rfc8032::from_le(&s));
+            prop_assert_eq!(reconstruct(&d), from_le(&s));
             Ok(())
         });
     }
@@ -484,7 +496,7 @@ mod tests {
                         .compress()
                         .to_bytes()
                 }
-                Reference::Rfc8032 => rfc8032::base_mul_encoded(s),
+                Reference::Rfc8032 => base_mul_encoded(s),
             }
         }
     }
@@ -510,15 +522,11 @@ mod tests {
     fn mul_base_batch_keeps_keys_separate(
         #[values(Scalars::Clamped, Scalars::Below2_255)] scalars: Scalars,
     ) {
-        let strategy = (
-            prop::collection::vec(scalars.strategy(), 8),
-            prop::collection::vec(any::<bool>(), 8),
-        );
+        let strategy = (vec(scalars.strategy(), 8), vec(any::<bool>(), 8));
         check(64, strategy, |(random, sparse)| {
             let mut sparse_scalar = [0u8; 32];
             sparse_scalar[31] = 0x40; // 2^254: 途中の桁がすべて 0
-            let s: [[u8; 32]; 8] =
-                std::array::from_fn(|k| if sparse[k] { sparse_scalar } else { random[k] });
+            let s: [[u8; 32]; 8] = from_fn(|k| if sparse[k] { sparse_scalar } else { random[k] });
             let mut out = [Extended::IDENTITY; 8];
             Table::get().mul_base_batch(&s, &mut out);
             for (k, (p, s)) in out.iter().zip(&s).enumerate() {
@@ -555,21 +563,21 @@ mod tests {
         #[values(Variant::WithT, Variant::WithoutT)] variant: Variant,
     ) {
         check(128, (1u64.., 1u64..), |(a, b)| {
-            let p = rfc8032::point_mul(&a.into(), &rfc8032::G);
+            let p = point_mul(&a.into(), &rfc8032::G);
             let q = match relation {
-                Relation::Independent => rfc8032::point_mul(&b.into(), &rfc8032::G),
+                Relation::Independent => point_mul(&b.into(), &rfc8032::G),
                 Relation::Same => p.clone(),
-                Relation::Negated => rfc8032::point_mul(&(&*rfc8032::Q - a), &rfc8032::G),
+                Relation::Negated => point_mul(&(&*rfc8032::Q - a), &rfc8032::G),
             };
             let (p_ext, q_niels) = (extended_of(&p), niels_of(&q));
             let got = match variant {
                 Variant::WithT => p_ext.add_niels(&q_niels),
                 Variant::WithoutT => p_ext.add_niels_last(&q_niels),
             };
-            let want = rfc8032::point_add(&p, &q);
-            prop_assert_eq!(compress(&got), rfc8032::point_compress(&want));
+            let want = point_add(&p, &q);
+            prop_assert_eq!(compress(&got), point_compress(&want));
             if let Relation::Negated = relation {
-                prop_assert!(rfc8032::is_identity(&want));
+                prop_assert!(is_identity(&want));
             }
             Ok(())
         });
@@ -579,9 +587,9 @@ mod tests {
     #[rstest]
     fn compress_follows_section_5_1_2() {
         check(256, 1u64.., |a| {
-            let p = rfc8032::point_mul(&a.into(), &rfc8032::G);
-            let (x, y) = rfc8032::to_affine(&p);
-            let mut want = rfc8032::to_le32(&y);
+            let p = point_mul(&a.into(), &rfc8032::G);
+            let (x, y) = to_affine(&p);
+            let mut want = to_le32(&y);
             want[31] |= u8::from(x.bit(0)) << 7;
             prop_assert_eq!(compress(&extended_of(&p)), want);
             Ok(())

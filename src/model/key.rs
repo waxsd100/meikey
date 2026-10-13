@@ -142,9 +142,16 @@ impl VanityKey {
 mod tests {
     use super::*;
     use crate::property::check;
-    use crate::{rfc8032, ssh_format};
+    use crate::rfc8032::vector;
+    use crate::ssh_format::b64_decode;
+    use crate::ssh_format::b64_encode;
+    use crate::ssh_format::parse_authorized_key;
+    use crate::ssh_format::parse_public_blob;
+    use crate::ssh_format::public_blob;
     use proptest::prelude::*;
     use rstest::rstest;
+    use similar_asserts::assert_eq;
+    use std::str::from_utf8;
 
     // 公開鍵の行・base64 が仕様どおりかは、下の `conformance` の proptest で独立実装と突き合わせている。
     // ここではこのモジュールの細部だけを確かめる。
@@ -160,7 +167,7 @@ mod tests {
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea wakokara"
     )]
     fn public_openssh_line(#[case] comment: &str, #[case] want: &str) {
-        let key = VanityKey::from_seed(rfc8032::vector("1").secret);
+        let key = VanityKey::from_seed(vector("1").secret);
         let line = key.public_openssh(comment);
         assert_eq!(line, want);
         let parsed = ssh_key::PublicKey::from_openssh(&line).unwrap();
@@ -223,8 +230,7 @@ mod tests {
             match check_comment(&comment) {
                 Ok(()) => {
                     prop_assert!(accepted, "{:?} を受け付けた", comment);
-                    let parsed =
-                        ssh_format::parse_authorized_key(&line).map_err(TestCaseError::fail)?;
+                    let parsed = parse_authorized_key(&line).map_err(TestCaseError::fail)?;
                     prop_assert_eq!(parsed.comment.unwrap_or_default(), comment);
                 }
                 Err(InvalidComment(c)) => {
@@ -241,6 +247,7 @@ mod tests {
     /// authorized_keys）。秘密鍵ファイルは [`crate::repository::key_file`] のテスト
     mod conformance {
         use super::*;
+        use similar_asserts::assert_eq;
 
         // ===========================================================================
         // RFC 8709 / RFC 4648 / authorized_keys: 公開鍵の1行
@@ -254,18 +261,14 @@ mod tests {
             check(256, (any::<[u8; 32]>(), comments), |(seed, comment)| {
                 let key = VanityKey::from_seed(seed);
                 let line = key.public_openssh(&comment);
-                let parsed =
-                    ssh_format::parse_authorized_key(&line).map_err(TestCaseError::fail)?;
+                let parsed = parse_authorized_key(&line).map_err(TestCaseError::fail)?;
                 prop_assert_eq!(&parsed.public_key, key.public_bytes());
                 prop_assert_eq!(
                     parsed.comment,
                     (!comment.is_empty()).then(|| comment.clone())
                 );
-                let blob = ssh_format::public_blob(key.public_bytes());
-                prop_assert_eq!(
-                    line.split(' ').nth(1).unwrap(),
-                    ssh_format::b64_encode(&blob)
-                );
+                let blob = public_blob(key.public_bytes());
+                prop_assert_eq!(line.split(' ').nth(1).unwrap(), b64_encode(&blob));
                 Ok(())
             });
         }
@@ -276,10 +279,10 @@ mod tests {
             check(256, any::<[u8; 32]>(), |public| {
                 let mut b64 = [0u8; PUBLIC_B64_LEN];
                 encode_public_b64(&public, &mut b64);
-                let want = ssh_format::b64_encode(&ssh_format::public_blob(&public));
-                prop_assert_eq!(std::str::from_utf8(&b64).unwrap(), want.as_str());
+                let want = b64_encode(&public_blob(&public));
+                prop_assert_eq!(from_utf8(&b64).unwrap(), want.as_str());
                 prop_assert_eq!(
-                    ssh_format::b64_decode(&want).map(|b| ssh_format::parse_public_blob(&b)),
+                    b64_decode(&want).map(|b| parse_public_blob(&b)),
                     Ok(Ok(public))
                 );
                 Ok(())
@@ -295,7 +298,7 @@ mod tests {
         fn char_26_comes_from_high_nibble_of_first_key_byte(#[case] first: u8, #[case] want: char) {
             let mut public = [0x5a; 32];
             public[0] = first;
-            let b64 = ssh_format::b64_encode(&ssh_format::public_blob(&public));
+            let b64 = b64_encode(&public_blob(&public));
             assert_eq!(&b64[..FIXED_PREFIX.len()], FIXED_PREFIX);
             // blob の 18 バイト目（鍵長 0x20 の最下位バイト）の下位2ビット = 0 と、鍵の先頭バイトの上位4ビット
             assert_eq!(b64.as_bytes()[FIXED_PREFIX.len()] as char, want);

@@ -304,12 +304,22 @@ unsafe fn mul_base_batch<F: Field8, const N: usize>(
 mod tests {
     use super::*;
     use crate::property::check;
-    use crate::rfc8032;
+    use crate::rfc8032::secret_expand;
+    use crate::rfc8032::to_le32;
+    use crate::rfc8032::{Vector, vectors};
+    use crate::service::derive::comb::compress_with_zinv;
+    use crate::service::derive::field::Fe;
     use crate::simd_support::available;
     use curve25519_dalek::edwards::EdwardsPoint;
     use curve25519_dalek::scalar::clamp_integer;
+    use proptest::array::uniform8;
+    use proptest::collection::vec;
+    use proptest::option::weighted;
     use proptest::prelude::*;
     use rstest::rstest;
+    use similar_asserts::assert_eq;
+    use std::array::from_fn;
+    use std::mem::transmute;
 
     /// AVX-512 の2通りの経路
     #[derive(Debug, Clone, Copy)]
@@ -333,7 +343,7 @@ mod tests {
     }
 
     fn compress(p: &Extended) -> [u8; 32] {
-        crate::service::derive::comb::compress_with_zinv(p, p.z.invert())
+        compress_with_zinv(p, p.z.invert())
     }
 
     /// curve25519-dalek で `s * B`（s は 2^255 未満の任意の値）
@@ -364,11 +374,11 @@ mod tests {
     /// 確率 1/4 で混ぜる
     fn scalars<const N: usize>(clamp: bool) -> impl Strategy<Value = [[u8; 32]; N]> {
         (
-            prop::collection::vec(any::<[u8; 32]>(), N),
-            prop::collection::vec(prop::option::weighted(0.25, 0..SPECIAL.len()), N),
+            vec(any::<[u8; 32]>(), N),
+            vec(weighted(0.25, 0..SPECIAL.len()), N),
         )
             .prop_map(move |(random, pick)| {
-                std::array::from_fn(|k| match pick[k] {
+                from_fn(|k| match pick[k] {
                     Some(i) => SPECIAL[i],
                     None if clamp => clamp_integer(random[k]),
                     None => {
@@ -386,7 +396,7 @@ mod tests {
     fn detection_is_consistent() {
         if let Some(i) = Ifma::detect() {
             let _ = i.avx512();
-            assert!(Avx512::detect().is_some());
+            assert_eq!(Avx512::detect().is_some(), true);
         }
         let _ = available("avx512", Avx512::detect());
         let _ = available("avx512-ifma", Ifma::detect());
@@ -401,10 +411,10 @@ mod tests {
     ) -> Result<(), TestCaseError> {
         let words = |v: [[u64; 5]; 8]| -> [__m512i; 5] {
             let p = v.map(F::pack);
-            std::array::from_fn(|i| {
-                let lane: [u64; 8] = std::array::from_fn(|l| p[l][i]);
+            from_fn(|i| {
+                let lane: [u64; 8] = from_fn(|l| p[l][i]);
                 // SAFETY: 同じ大きさで、どんなビット列も有効な値
-                unsafe { std::mem::transmute::<[u64; 8], __m512i>(lane) }
+                unsafe { transmute::<[u64; 8], __m512i>(lane) }
             })
         };
         // SAFETY: 呼び出し元が CPU の対応を確かめている
@@ -425,9 +435,9 @@ mod tests {
     fn pack_unpack_blend_keep_values(#[values(Path::F, Path::Ifma)] path: Path) {
         let fe = any::<[u8; 32]>().prop_map(|mut b| {
             b[31] &= 0x7f;
-            crate::service::derive::field::Fe::from_bytes(&b).reduce()
+            Fe::from_bytes(&b).reduce()
         });
-        let lanes = prop::array::uniform8(fe);
+        let lanes = uniform8(fe);
         let ok = match path {
             Path::F => available("avx512", Avx512::detect()).is_some(),
             Path::Ifma => available("avx512-ifma", Ifma::detect()).is_some(),
@@ -474,12 +484,13 @@ mod tests {
     /// RFC 8032 Section 7.1 の5本のテストベクタの秘密スカラーで、参照実装と一致する
     /// （8レーンに5本を並べ、残りの3レーンには先頭から繰り返す）
     #[rstest]
-    fn mul_base_batch_matches_rfc_vectors(#[values(Path::F, Path::Ifma)] path: Path) {
-        let v = rfc8032::vectors();
+    fn mul_base_batch_matches_rfc_vectors(
+        #[values(Path::F, Path::Ifma)] path: Path,
+        vectors: Vec<Vector>,
+    ) {
+        let v = vectors;
         assert_eq!(v.len(), 5);
-        let s: [[u8; 32]; 8] = std::array::from_fn(|k| {
-            rfc8032::to_le32(&rfc8032::secret_expand(&v[k % v.len()].secret).0)
-        });
+        let s: [[u8; 32]; 8] = from_fn(|k| to_le32(&secret_expand(&v[k % v.len()].secret).0));
         let Some(out) = mul_base(path, &s) else {
             return;
         };

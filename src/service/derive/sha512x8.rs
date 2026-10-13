@@ -202,6 +202,9 @@ mod tests {
     use proptest::prelude::*;
     use rstest::rstest;
     use sha2::{Digest, Sha512};
+    use similar_asserts::assert_eq;
+    use std::array::from_fn;
+    use std::mem::transmute;
 
     fn want(seed: &[u8; 32]) -> [u8; 32] {
         *Sha512::digest(seed).first_chunk().unwrap()
@@ -213,7 +216,7 @@ mod tests {
     #[case::random(None)]
     #[case::zero(Some([0u8; 32]))]
     #[case::ff(Some([0xffu8; 32]))]
-    #[case::bytes_0_to_31(Some(std::array::from_fn(|i| i as u8)))]
+    #[case::bytes_0_to_31(Some(from_fn(|i| i as u8)))]
     fn matches_sha2(#[case] fixed: Option<[u8; 32]>, #[values(0, 3, 4, 7)] lane: usize) {
         let Some(avx512) = available("avx512", Avx512::detect()) else {
             return;
@@ -237,14 +240,13 @@ mod tests {
         let Some(_) = available("avx512", Avx512::detect()) else {
             return;
         };
-        let seeds: [[u8; 32]; 8] =
-            std::array::from_fn(|k| std::array::from_fn(|i| (k * 32 + i) as u8));
+        let seeds: [[u8; 32]; 8] = from_fn(|k| from_fn(|i| (k * 32 + i) as u8));
         // SAFETY: available で対応を確かめた
         let (w, back) = unsafe {
             let w = load_words(&seeds);
             let mut back = [[0u8; 32]; 8];
             store_words(w, &mut back);
-            (w.map(|v| std::mem::transmute::<__m512i, [u64; 8]>(v)), back)
+            (w.map(|v| transmute::<__m512i, [u64; 8]>(v)), back)
         };
         for (j, wj) in w.iter().enumerate() {
             for (k, s) in seeds.iter().enumerate() {

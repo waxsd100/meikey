@@ -49,6 +49,7 @@ mod tests {
     use crate::property::check;
     use proptest::prelude::*;
     use rstest::rstest;
+    use similar_asserts::assert_eq;
     use std::ops::Range;
 
     /// ラベルは表示幅 14 桁にそろう（全角は2桁）。長すぎても値との間に空白を1つ入れる

@@ -4,6 +4,7 @@
 
 use crate::common::*;
 use std::collections::BTreeMap;
+use std::fs::{read_dir, read_to_string, write};
 use std::path::Path;
 use std::process::Output;
 
@@ -13,31 +14,38 @@ const PUB: &str = "id_ed25519_meikey.pub";
 /// 先に置いておくファイルの中身
 const OLD: &str = "old content\n";
 
-/// `existing` のファイルを置いた一時ディレクトリで meikey を実行する
-fn run_in_tempdir(args: &[&str], existing: &[&str]) -> (tempfile::TempDir, Output) {
-    let dir = tempfile::tempdir().unwrap();
+/// `dir` に `existing` のファイルを置いてから、そこで meikey を実行する
+fn run_with(dir: &Path, args: &[&str], existing: &[&str]) -> Output {
     for name in existing {
-        std::fs::write(dir.path().join(name), OLD).unwrap();
+        write(dir.join(name), OLD).unwrap();
     }
-    let out = meikey_in(dir.path(), args);
-    (dir, out)
+    meikey_in(dir, args)
 }
 
 /// ディレクトリの中身（ファイル名 → 中身）
 fn files_in(dir: &Path) -> BTreeMap<String, String> {
-    std::fs::read_dir(dir)
+    read_dir(dir)
         .unwrap()
         .map(|e| {
             let e = e.unwrap();
             let name = e.file_name().into_string().unwrap();
-            (name, std::fs::read_to_string(e.path()).unwrap())
+            (name, read_to_string(e.path()).unwrap())
         })
         .collect()
 }
 
 mod tests {
     use super::*;
+    use crate::common::ssh_format::{PEM_BEGIN, PEM_END};
+    use meikey::Simd;
+    use meikey::controller::format::row;
     use rstest::rstest;
+    use similar_asserts::assert_eq;
+    #[cfg(unix)]
+    use std::fs::metadata;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
 
     /// 失敗するときは探索を始める前に止まり、ディレクトリを一切変えない（既存のファイルもそのまま）
     #[rstest]
@@ -71,10 +79,11 @@ mod tests {
         #[case] args: &[&str],
         #[case] existing: &[&str],
         #[case] message: &str,
+        dir: TempDir,
     ) {
-        let (dir, out) = run_in_tempdir(args, existing);
-        assert!(!out.status.success());
-        assert!(stderr(&out).contains(message), "{}", stderr(&out));
+        let out = run_with(dir.path(), args, existing);
+        assert_eq!(out.status.success(), false);
+        assert_eq!(stderr(&out).contains(message), true, "{}", stderr(&out));
 
         let want: BTreeMap<String, String> = existing
             .iter()
@@ -135,20 +144,23 @@ mod tests {
         #[case] args: &[&str],
         #[case] want_stdout: &[&str],
         #[case] want_stderr: &[(&str, &str)],
+        dir: TempDir,
     ) {
-        let (dir, out) = run_in_tempdir(args, &[]);
-        assert!(out.status.success(), "{}", stderr(&out));
+        let out = run_with(dir.path(), args, &[]);
+        assert_eq!(out.status.success(), true, "{}", stderr(&out));
         for want in want_stdout {
-            assert!(
+            assert_eq!(
                 stdout(&out).contains(want),
+                true,
                 "{want:?} が無い: {}",
                 stdout(&out)
             );
         }
         for (label, value) in want_stderr {
-            let want = meikey::controller::format::row(label, value);
-            assert!(
+            let want = row(label, value);
+            assert_eq!(
                 stderr(&out).lines().any(|l| l == want),
+                true,
                 "{want:?} が無い: {}",
                 stderr(&out)
             );
@@ -161,33 +173,35 @@ mod tests {
     #[rstest]
     fn check_reports_simd_in_use(
         #[values(
-            ("avx512-ifma", meikey::Simd::Avx512Ifma),
-            ("avx512", meikey::Simd::Avx512),
-            ("avx2", meikey::Simd::Avx2),
-            ("off", meikey::Simd::Off)
+            ("avx512-ifma", Simd::Avx512Ifma),
+            ("avx512", Simd::Avx512),
+            ("avx2", Simd::Avx2),
+            ("off", Simd::Off)
         )]
-        level: (&str, meikey::Simd),
+        level: (&str, Simd),
+        dir: TempDir,
     ) {
         let (arg, limit) = level;
-        let (dir, out) = run_in_tempdir(&["--check", "--simd", arg], &[]);
-        assert!(out.status.success(), "{}", stderr(&out));
+        let out = run_with(dir.path(), &["--check", "--simd", arg], &[]);
+        assert_eq!(out.status.success(), true, "{}", stderr(&out));
         let err = stderr(&out);
         let used = limit.effective();
-        let row = meikey::controller::format::row;
-        assert!(err.lines().any(|l| l == row("SIMD", used.name())), "{err}");
+        assert_eq!(
+            err.lines().any(|l| l == row("SIMD", used.name())),
+            true,
+            "{err}"
+        );
         // CPU の行には、SIMD ごとに対応していれば ✓、していなければ ✗
         let cpu = err
             .lines()
             .find(|l| l.starts_with("CPU "))
             .unwrap_or_else(|| panic!("CPU の行が無い: {err}"));
-        for simd in meikey::Simd::ALL
-            .into_iter()
-            .filter(|&s| s != meikey::Simd::Off)
-        {
+        for simd in Simd::ALL.into_iter().filter(|&s| s != Simd::Off) {
             let mark = if simd.supported() { "✓" } else { "✗" };
             let want = format!("{} {mark}", simd.name());
-            assert!(
+            assert_eq!(
                 cpu.split("  ").any(|item| item.trim() == want),
+                true,
                 "{want} が無い: {cpu}"
             );
         }
@@ -212,12 +226,13 @@ mod tests {
         #[case] flags: &[&str],
         #[case] existing: &[&str],
         #[values(Mode::Fast, Mode::ConstantTime, Mode::Baseline)] mode: Mode,
+        dir: TempDir,
     ) {
         let mut args = vec![pattern, "-j", "2", "-C", COMMENT];
         args.extend(flags);
         args.extend(mode.args());
-        let (dir, out) = run_in_tempdir(&args, existing);
-        assert!(out.status.success(), "{}", stderr(&out));
+        let out = run_with(dir.path(), &args, existing);
+        assert_eq!(out.status.success(), true, "{}", stderr(&out));
 
         // 書かれるのは秘密鍵と .pub の2つだけ（既存のファイルは置き換わる）
         let files = files_in(dir.path());
@@ -239,29 +254,30 @@ mod tests {
             .to_owned();
         let start = marker.find('^').unwrap();
         assert_eq!(marker.trim(), "^".repeat(pattern.len()));
-        assert!(start >= "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI".len());
+        assert_eq!(
+            start >= "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI".len(),
+            true,
+            "{marker}"
+        );
         let found = &pub_line[start..start + pattern.len()];
         if flags.contains(&"-s") {
             assert_eq!(found, pattern);
         } else {
-            assert!(found.eq_ignore_ascii_case(pattern), "{found} ≠ {pattern}");
+            assert_eq!(found.to_ascii_lowercase(), pattern.to_ascii_lowercase());
         }
 
         // 秘密鍵は OpenSSH 形式の PEM（70 文字で折り返し）で、Unix では所有者だけが読める
         let body = private
-            .strip_circumfix(ssh_format::PEM_BEGIN, ssh_format::PEM_END)
+            .strip_circumfix(PEM_BEGIN, PEM_END)
             .expect("OpenSSH 秘密鍵の PEM");
-        assert!(
+        assert_eq!(
             body.lines().all(|l| (1..=70).contains(&l.len())),
+            true,
             "{private}"
         );
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join(KEY))
-                .unwrap()
-                .permissions()
-                .mode();
+            let mode = metadata(dir.path().join(KEY)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "秘密鍵は所有者だけ読める");
         }
     }

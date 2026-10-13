@@ -169,9 +169,31 @@ impl<'a> SshWriter<'a> {
 mod tests {
     use super::*;
     use crate::property::check;
-    use crate::{rfc8032, ssh_format};
+    use crate::rfc8032::sign;
+    use crate::rfc8032::vector;
+    use crate::ssh_format::parse_authorized_key;
+    use crate::ssh_format::parse_private_key_file;
+    use crate::ssh_format::put_string;
+    use crate::ssh_format::put_uint32;
+    use proptest::collection::vec;
     use proptest::prelude::*;
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
+    use similar_asserts::assert_eq;
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    #[cfg(unix)]
+    use std::fs::metadata;
+    use std::fs::read_to_string;
+    #[cfg(unix)]
+    use std::fs::set_permissions;
+    use std::fs::write;
+    use tempfile::{TempDir, tempdir};
+
+    /// テストごとの一時ディレクトリ（drop で消える）
+    #[fixture]
+    fn dir() -> TempDir {
+        tempdir().unwrap()
+    }
 
     /// RFC 4251 Section 5 に載っている例そのもの
     #[rstest]
@@ -205,20 +227,20 @@ mod tests {
     fn ssh_writer_matches_independent_rfc_4251() {
         let op = prop_oneof![
             any::<u32>().prop_map(Op::U32),
-            prop::collection::vec(any::<u8>(), 0..300).prop_map(Op::Str),
+            vec(any::<u8>(), 0..300).prop_map(Op::Str),
         ];
-        check(1024, prop::collection::vec(op, 0..12), |ops| {
+        check(1024, vec(op, 0..12), |ops| {
             let (mut ours, mut spec) = (Vec::new(), Vec::new());
             let mut w = SshWriter::new(&mut ours);
             for op in &ops {
                 match op {
                     Op::U32(v) => {
                         w.u32(*v);
-                        ssh_format::put_uint32(&mut spec, *v);
+                        put_uint32(&mut spec, *v);
                     }
                     Op::Str(s) => {
                         w.string(s);
-                        ssh_format::put_string(&mut spec, s);
+                        put_string(&mut spec, s);
                     }
                 }
             }
@@ -229,16 +251,16 @@ mod tests {
 
     /// 書いたファイルの中身: 秘密鍵は元の鍵に戻せて、`.pub` は authorized_keys の1行と改行
     fn assert_files_hold(key: &VanityKey, private: &Path) {
-        let pem = std::fs::read_to_string(private).unwrap();
-        let file = ssh_format::parse_private_key_file(&pem).unwrap();
+        let pem = read_to_string(private).unwrap();
+        let file = parse_private_key_file(&pem).unwrap();
         assert_eq!(&file.keys[0].k, key.seed());
         assert_eq!(file.keys[0].comment, b"c");
-        let pub_line = std::fs::read_to_string(pub_path(private)).unwrap();
+        let pub_line = read_to_string(pub_path(private)).unwrap();
         assert_eq!(pub_line, key.public_openssh("c") + "\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(private).unwrap().permissions().mode();
+            let mode = metadata(private).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "秘密鍵は所有者だけ読める");
         }
     }
@@ -251,19 +273,19 @@ mod tests {
         #[values(false, true)] private_exists: bool,
         #[values(false, true)] pub_exists: bool,
         #[values(false, true)] overwrite: bool,
+        dir: TempDir,
     ) {
-        let dir = tempfile::tempdir().unwrap();
         let private = dir.path().join("id_ed25519_test");
         for (exists, p) in [
             (private_exists, private.clone()),
             (pub_exists, pub_path(&private)),
         ] {
             if exists {
-                std::fs::write(&p, "old\n").unwrap();
+                write(&p, "old\n").unwrap();
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+                    set_permissions(&p, Permissions::from_mode(0o644)).unwrap();
                 }
             }
         }
@@ -287,8 +309,8 @@ mod tests {
                 (pub_exists, pub_path(&private)),
             ] {
                 match exists {
-                    true => assert_eq!(std::fs::read_to_string(&p).unwrap(), "old\n"),
-                    false => assert!(!p.exists(), "{} を書いた", p.display()),
+                    true => assert_eq!(read_to_string(&p).unwrap(), "old\n"),
+                    false => assert_eq!(p.exists(), false, "{} を書いた", p.display()),
                 }
             }
         } else {
@@ -301,6 +323,7 @@ mod tests {
     /// agent draft 3.2.3）と、RFC 8032 の鍵の書き出し
     mod conformance {
         use super::*;
+        use similar_asserts::assert_eq;
 
         /// RFC の鍵を OpenSSH 形式で書き出すと、仕様どおりのファイルになり、中身は RFC の値そのもの
         #[rstest]
@@ -308,11 +331,11 @@ mod tests {
             #[values("1", "2", "3", "1024", "SHA(abc)")] name: &str,
             #[values("", "rfc8032", "日本語のコメント")] comment: &str,
         ) {
-            let v = rfc8032::vector(name);
+            let v = vector(name);
             let key = VanityKey::from_seed(v.secret);
 
             // 公開鍵の1行（authorized_keys 形式 → RFC 4648 base64 → RFC 8709 blob）
-            let line = ssh_format::parse_authorized_key(&key.public_openssh(comment)).unwrap();
+            let line = parse_authorized_key(&key.public_openssh(comment)).unwrap();
             assert_eq!(line.public_key, v.public);
             assert_eq!(
                 line.comment.as_deref(),
@@ -321,8 +344,7 @@ mod tests {
 
             // 秘密鍵ファイル（PROTOCOL.key + agent draft 3.2.3）
             let file =
-                ssh_format::parse_private_key_file(&private_openssh(&key, comment, 0x1234_5678))
-                    .unwrap();
+                parse_private_key_file(&private_openssh(&key, comment, 0x1234_5678)).unwrap();
             assert_eq!(file.violations(), Vec::<String>::new());
             let k = &file.keys[0];
             assert_eq!(k.k, v.secret, "k は RFC 8032 の秘密鍵そのもの");
@@ -331,7 +353,7 @@ mod tests {
             assert_eq!((file.checkint1, file.checkint2), (0x1234_5678, 0x1234_5678));
 
             // ファイルから取り出した k で、RFC の署名がそのまま再現できる
-            assert_eq!(rfc8032::sign(&k.k, &v.message), v.signature);
+            assert_eq!(sign(&k.k, &v.message), v.signature);
         }
 
         // ===========================================================================
@@ -355,8 +377,7 @@ mod tests {
                 |(seed, comment, checkint)| {
                     let key = VanityKey::from_seed(seed);
                     let pem = private_openssh(&key, &comment, checkint);
-                    let file =
-                        ssh_format::parse_private_key_file(&pem).map_err(TestCaseError::fail)?;
+                    let file = parse_private_key_file(&pem).map_err(TestCaseError::fail)?;
                     prop_assert_eq!(file.violations(), Vec::<String>::new());
                     prop_assert_eq!(file.padding.len(), padding);
                     let k = &file.keys[0];

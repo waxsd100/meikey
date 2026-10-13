@@ -338,26 +338,28 @@ mod tests {
     use num_bigint::BigInt;
     use num_integer::Integer;
     use proptest::prelude::*;
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
+    use std::array::from_fn;
+    use std::mem::transmute;
 
+    #[fixture]
     fn avx512() -> Option<Avx512> {
         available("avx512", Avx512::detect())
     }
 
     /// 8レーンぶんのリム（lanes[k][i] = k 番目の元の i 番目のリム）から
     fn fe10(lanes: [[u64; 10]; 8]) -> Fe10 {
-        Fe10(std::array::from_fn(|i| {
-            let v: [u64; 8] = std::array::from_fn(|k| lanes[k][i]);
+        Fe10(from_fn(|i| {
+            let v: [u64; 8] = from_fn(|k| lanes[k][i]);
             // SAFETY: 同じ大きさで、どんなビット列も有効な値
-            unsafe { std::mem::transmute::<[u64; 8], __m512i>(v) }
+            unsafe { transmute::<[u64; 8], __m512i>(v) }
         }))
     }
 
     fn raw_lanes(f: &Fe10) -> [[u64; 10]; 8] {
         // SAFETY: 同じ大きさで、どんなビット列も有効な値
-        let l =
-            f.0.map(|v| unsafe { std::mem::transmute::<__m512i, [u64; 8]>(v) });
-        std::array::from_fn(|k| std::array::from_fn(|i| l[i][k]))
+        let l = f.0.map(|v| unsafe { transmute::<__m512i, [u64; 8]>(v) });
+        from_fn(|k| from_fn(|i| l[i][k]))
     }
 
     /// リムが表す整数（mod を取らない）
@@ -383,7 +385,7 @@ mod tests {
     fn fe10_below(num: u64, den: u64) -> impl Strategy<Value = [[u64; 10]; 8]> {
         any::<[[u64; 10]; 8]>().prop_map(move |r| {
             r.map(|l| {
-                std::array::from_fn(|i| {
+                from_fn(|i| {
                     let max = base(i) * num / den - 1;
                     match l[i] % 9 {
                         0 => 0,
@@ -415,8 +417,9 @@ mod tests {
     #[rstest]
     fn arithmetic_matches_bigint(
         #[values(Arith::Add, Arith::Sub, Arith::Mul, Arith::Carry, Arith::Neg)] op: Arith,
+        avx512: Option<Avx512>,
     ) {
-        let Some(_) = avx512() else { return };
+        let Some(_) = avx512 else { return };
         // (a の上限, b の上限) を分数で
         let ((an, ad), (bn, bd)) = match op {
             Arith::Add => ((4, 1), (4, 1)),

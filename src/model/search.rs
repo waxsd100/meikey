@@ -82,6 +82,7 @@ pub struct Outcome {
 mod tests {
     use super::*;
     use rstest::rstest;
+    use similar_asserts::assert_eq;
 
     /// 速度は 試行回数 / 経過秒。経過時間 0 でも 0 除算せず有限
     #[rstest]
@@ -96,9 +97,9 @@ mod tests {
             elapsed: Duration::from_secs_f64(secs),
         }
         .rate();
-        assert!(r.is_finite());
+        assert_eq!(r.is_finite(), true);
         if let Some(want) = want {
-            assert!((r - want).abs() < 1e-9, "{r}");
+            assert_eq!((r - want).abs() < 1e-9, true, "{r}");
         }
     }
 
@@ -108,11 +109,13 @@ mod tests {
         let a = Cancel::default();
         let b = a.clone();
         let other = Cancel::default();
-        assert!(!a.is_cancelled() && !b.is_cancelled());
+        assert_eq!((a.is_cancelled(), b.is_cancelled()), (false, false));
         for _ in 0..times {
             b.cancel();
         }
-        assert!(a.is_cancelled() && b.is_cancelled());
-        assert!(!other.is_cancelled());
+        assert_eq!(
+            (a.is_cancelled(), b.is_cancelled(), other.is_cancelled()),
+            (true, true, false)
+        );
     }
 }

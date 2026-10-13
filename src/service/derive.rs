@@ -299,9 +299,21 @@ fn scalar(seed: &[u8; 32]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::VanityKey;
+    use crate::rfc8032::is_identity;
+    use crate::rfc8032::point_compress;
+    use crate::rfc8032::point_decompress;
+    use crate::rfc8032::point_mul;
+    use crate::rfc8032::secret_expand;
+    use crate::rfc8032::secret_to_public;
+    use crate::rfc8032::to_le32;
+    use crate::rfc8032::vector;
+    use crate::rfc8032::{Vector, vectors};
+    use proptest::collection::vec;
     use rand::rngs::ChaCha20Rng;
     use rand::{Rng, SeedableRng};
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
+    use similar_asserts::assert_eq;
+    use std::array::from_fn;
 
     /// テストで流すバッチ
     #[derive(Debug, Clone, Copy)]
@@ -387,7 +399,11 @@ mod tests {
         #[cfg(feature = "amx")]
         assert_eq!(Simd::Amx.supported(), Amx::detect().is_some());
         #[cfg(not(feature = "amx"))]
-        assert!(!Simd::Amx.supported(), "feature amx が無効なら使わない");
+        assert_eq!(
+            Simd::Amx.supported(),
+            false,
+            "feature amx が無効なら使わない"
+        );
         assert_eq!(Simd::Avx512Ifma.supported(), Ifma::detect().is_some());
         assert_eq!(Simd::Avx512.supported(), Avx512::detect().is_some());
         assert_eq!(Simd::Avx2.supported(), Avx2::detect().is_some());
@@ -399,17 +415,18 @@ mod tests {
         #[values(Simd::Amx, Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] limit: Simd,
     ) {
         let used = limit.effective();
-        assert!(used <= limit && used.supported());
+        assert_eq!(used <= limit && used.supported(), true);
         assert_eq!(limit.supported(), used == limit);
         for s in Simd::ALL {
             if used < s && s <= limit {
-                assert!(
-                    !s.supported(),
+                assert_eq!(
+                    s.supported(),
+                    false,
                     "{s:?} に対応しているのに {used:?} に下がった"
                 );
             }
         }
-        assert!(Simd::Off.supported());
+        assert_eq!(Simd::Off.supported(), true);
         #[cfg(not(target_arch = "x86_64"))]
         assert_eq!(used, Simd::Off);
     }
@@ -424,11 +441,8 @@ mod tests {
     fn scalar_matches_rfc_secret_expand_for_vectors(
         #[values("1", "2", "3", "1024", "SHA(abc)")] name: &str,
     ) {
-        let v = rfc8032::vector(name);
-        assert_eq!(
-            scalar(&v.secret),
-            rfc8032::to_le32(&rfc8032::secret_expand(&v.secret).0)
-        );
+        let v = vector(name);
+        assert_eq!(scalar(&v.secret), to_le32(&secret_expand(&v.secret).0));
     }
 
     /// 任意のシードで、RFC の secret_expand と同じスカラーになる。手順 1・2 を1ビットずつも確かめる
@@ -436,7 +450,7 @@ mod tests {
     fn scalar_is_pruned_sha512_prefix() {
         check(4096, any::<[u8; 32]>(), |seed| {
             let s = scalar(&seed);
-            prop_assert_eq!(s, rfc8032::to_le32(&rfc8032::secret_expand(&seed).0));
+            prop_assert_eq!(s, to_le32(&secret_expand(&seed).0));
 
             // 手順2: 先頭オクテットの下位3ビットを 0、最終オクテットの最上位を 0、2番目を 1
             prop_assert_eq!(s[0] & 0b0000_0111, 0);
@@ -455,6 +469,7 @@ mod tests {
     /// テストベクタどおりで、出力は Section 5.1.2 / 5.1.3 の正規の符号化・位数 L の点
     mod conformance {
         use super::*;
+        use similar_asserts::assert_eq;
 
         fn derive(backend: Backend, seeds: &Seeds) -> PublicKeys {
             let mut out: PublicKeys = [[0u8; 32]; BATCH];
@@ -463,12 +478,13 @@ mod tests {
         }
 
         /// 残りの位置を埋めるシード（何でもよいが、テストごとに同じにする）
+        #[fixture]
         fn filler_seeds() -> Seeds {
-            std::array::from_fn(|i| [i as u8 ^ 0xa5; 32])
+            from_fn(|i| [i as u8 ^ 0xa5; 32])
         }
 
         fn seeds_strategy() -> impl Strategy<Value = Seeds> {
-            prop::collection::vec(any::<[u8; 32]>(), BATCH).prop_map(|v| v.try_into().unwrap())
+            vec(any::<[u8; 32]>(), BATCH).prop_map(|v| v.try_into().unwrap())
         }
 
         // ===========================================================================
@@ -494,9 +510,10 @@ mod tests {
             #[case] position: usize,
             #[values(Simd::Amx, Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
             #[values("1", "2", "3", "1024", "SHA(abc)")] name: &str,
+            filler_seeds: Seeds,
         ) {
-            let v = rfc8032::vector(name);
-            let mut seeds = filler_seeds();
+            let v = vector(name);
+            let mut seeds = filler_seeds;
             seeds[position] = v.secret;
             assert_eq!(
                 derive(
@@ -514,7 +531,7 @@ mod tests {
         /// 書き出しに使う VanityKey（ed25519-dalek）もテストベクタどおり
         #[rstest]
         fn section_7_1_vanity_key(#[values("1", "2", "3", "1024", "SHA(abc)")] name: &str) {
-            let v = rfc8032::vector(name);
+            let v = vector(name);
             assert_eq!(*VanityKey::from_seed(v.secret).public_bytes(), v.public);
         }
 
@@ -524,9 +541,10 @@ mod tests {
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
             #[values(Simd::Amx, Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
+            vectors: Vec<Vector>,
+            filler_seeds: Seeds,
         ) {
-            let vectors = rfc8032::vectors();
-            let mut seeds = filler_seeds();
+            let mut seeds = filler_seeds;
             for (i, v) in vectors.iter().enumerate() {
                 seeds[i * 50] = v.secret;
             }
@@ -574,7 +592,7 @@ mod tests {
                 }
                 prop_assert_eq!(
                     got[pick],
-                    rfc8032::secret_to_public(&seeds[pick]),
+                    secret_to_public(&seeds[pick]),
                     "RFC 8032 参照実装"
                 );
                 Ok(())
@@ -588,9 +606,10 @@ mod tests {
             #[values(Mul::Table, Mul::ConstantTime)] mul: Mul,
             #[values(Compress::Batch, Compress::Each)] compress: Compress,
             #[values(Simd::Amx, Simd::Avx512Ifma, Simd::Avx512, Simd::Avx2, Simd::Off)] simd: Simd,
+            filler_seeds: Seeds,
         ) {
             check(16, (any::<[u8; 32]>(), 0..BATCH), |(seed, position)| {
-                let mut seeds = filler_seeds();
+                let mut seeds = filler_seeds;
                 seeds[position] = seed;
                 let pk = derive(
                     Backend {
@@ -601,14 +620,11 @@ mod tests {
                     &seeds,
                 )[position];
 
-                let point = rfc8032::point_decompress(&pk);
+                let point = point_decompress(&pk);
                 prop_assert!(point.is_some(), "Section 5.1.3 で復号できない: {:02x?}", pk);
                 let point = point.unwrap();
-                prop_assert_eq!(rfc8032::point_compress(&point), pk, "正規の符号化でない");
-                prop_assert!(
-                    rfc8032::is_identity(&rfc8032::point_mul(&rfc8032::Q, &point)),
-                    "[L]A ≠ 0"
-                );
+                prop_assert_eq!(point_compress(&point), pk, "正規の符号化でない");
+                prop_assert!(is_identity(&point_mul(&rfc8032::Q, &point)), "[L]A ≠ 0");
                 Ok(())
             });
         }
