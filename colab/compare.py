@@ -248,6 +248,8 @@ class Row:
     chance: Optional[Callable[[int], float]] = None
     cwd: Optional[str] = None
     needs: Callable[[], bool] = lambda: True
+    # needs を満たさないとき、表に出さない（どちらか一方だけ測る組み合わせ用）
+    hide: bool = False
 
 
 def measure_rate(row: Row, seconds: int) -> tuple[Optional[float], str]:
@@ -317,15 +319,15 @@ MEIKEY = os.path.join(REPO, "target", "release", "meikey")
 ROWS = [
     Row("meikey", "meikey", "Rust", "CPU", "公開鍵", "既定（定数時間の倍算・鍵ごとに ChaCha20 のシード）",
         cmd=lambda s: f"{MEIKEY} {NEVER} --bench {s}", rate=r"Speed\s+([\d.]+)\s*([KMB]?) keys/s", self_timed=True),
-    Row("meikey --low-security", "meikey", "Rust", "CPU", "公開鍵", "低セキュリティモード（表の倍算・通し番号のシード）",
-        cmd=lambda s: f"{MEIKEY} {NEVER} --low-security --bench {s}",
-        rate=r"Speed\s+([\d.]+)\s*([KMB]?) keys/s", self_timed=True),
-    Row("meikey --low-security --gpu", "meikey", "Rust・CUDA", "GPU", "公開鍵", "設定は起動時に測って選ぶ",
-        cmd=lambda s: f"{MEIKEY} {NEVER} --low-security --gpu --bench {s}",
-        rate=r"Speed\s+([\d.]+)\s*([KMB]?) keys/s", self_timed=True, needs=has_gpu),
-    Row("meikey --low-security --both", "meikey", "Rust・CUDA", "GPU + CPU", "公開鍵", "GPU と CPU で同時に探す",
+    # 速さを優先した組み合わせ: GPU があれば GPU と CPU の両方、無ければ CPU だけの低セキュリティモード
+    Row("meikey --low-security --both", "meikey", "Rust・CUDA", "GPU + CPU", "公開鍵",
+        "低セキュリティモードで GPU と CPU を同時に使う（GPU の設定は起動時に測って選ぶ）",
         cmd=lambda s: f"{MEIKEY} {NEVER} --low-security --both --bench {s}",
-        rate=r"Speed\s+([\d.]+)\s*([KMB]?) keys/s", self_timed=True, needs=has_gpu),
+        rate=r"Speed\s+([\d.]+)\s*([KMB]?) keys/s", self_timed=True, needs=has_gpu, hide=True),
+    Row("meikey --low-security", "meikey", "Rust", "CPU", "公開鍵",
+        "低セキュリティモード（GPU が無いときだけ測る）",
+        cmd=lambda s: f"{MEIKEY} {NEVER} --low-security --bench {s}",
+        rate=r"Speed\s+([\d.]+)\s*([KMB]?) keys/s", self_timed=True, needs=lambda: not has_gpu(), hide=True),
     Row("vanityssh-go", "vanityssh-go", "Go", "CPU", "公開鍵（正規表現）", "",
         cmd=lambda s: f"vanityssh-go {NEVER}", rate=r"Rate: ([\d,]+)/s", tty=True),
     Row("vanity-ssh-keygen", "vanity-ssh-keygen", "Go", "CPU", "公開鍵", "",
@@ -400,6 +402,8 @@ def bench_all(seconds: int, built: dict[str, bool], only: Optional[list[str]] = 
         if not built.get(row.build):
             rate, how = None, "ビルドできなかった"
         elif not row.needs():
+            if row.hide:
+                continue
             rate, how = None, "このマシンでは動かない"
         else:
             print(f"---- {row.name}", flush=True)
