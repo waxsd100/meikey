@@ -1,2 +1,2 @@
 # 生成物（cargo make ptx で kernel.cu から作る）。改行を変換せず、差分も出さない
-src/service/gpu/kernel.ptx -text -diff linguist-generated
+src/service/gpu/ptx/*.ptx -text -diff linguist-generated

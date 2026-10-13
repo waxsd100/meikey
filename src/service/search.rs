@@ -1,5 +1,6 @@
 //! 全コアで鍵を生成して、当たりを探す（設定と結果の型は [`crate::model::search`]）
 
+use crate::lang::{t, tf};
 use crate::model::backend::Simd;
 use crate::model::key::{self, PUBLIC_B64_LEN, VanityKey};
 use crate::model::search::{Cancel, Outcome, SearchConfig, Stats};
@@ -57,10 +58,13 @@ impl Searcher for Parallel {
         vec![
             ("CPU", marks.join("  ")),
             ("SIMD", b.simd.effective().name().into()),
-            ("倍算", b.mul.name().into()),
-            ("逆元", b.compress.name()),
-            ("検索", config.find.name().into()),
-            ("並列", format!("{} スレッド", config.threads)),
+            (t!("倍算", "Multiply"), b.mul.name().into()),
+            (t!("逆元", "Inverse"), b.compress.name()),
+            (t!("検索", "Search"), config.find.name().into()),
+            (
+                t!("並列", "Threads"),
+                tf!("{} スレッド", "{}", config.threads),
+            ),
         ]
     }
 }
@@ -225,9 +229,13 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
                 // 間違っている（バグ）ので止める
                 assert!(
                     pattern.is_match(&VanityKey::from_seed(*seed).public_b64()),
-                    "内部エラー: {}・{} の結果が ed25519-dalek・総当たりと不一致",
-                    config.backend,
-                    config.find
+                    "{}",
+                    tf!(
+                        "内部エラー: {}・{} の結果が ed25519-dalek・総当たりと不一致",
+                        "internal error: the result of {}, {} differs from ed25519-dalek with a naive search",
+                        config.backend,
+                        config.find
+                    )
                 );
                 let _ = found.set(*seed); // 同時に当たったら先着を採用
                 stop.store(true, Relaxed);

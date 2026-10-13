@@ -1,29 +1,55 @@
 //! 鍵を OpenSSH 形式のファイルに保存する
 //!
 //! 秘密鍵は暗号化なしの openssh-key-v1（PROTOCOL.key）、公開鍵は authorized_keys の1行（`.pub`）。
+//! 秘密鍵は本人だけが読めるようにする（Unix は 0600、Windows は本人だけのアクセス権）。
 
+use crate::lang::tf;
 use crate::model::key::{KEY_TYPE, VanityKey};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use std::fs::{File, OpenOptions, remove_file, symlink_metadata};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+/// 鍵のファイルを調べる・書くときのエラー
+#[derive(Debug, thiserror::Error)]
+pub enum KeyFileError {
+    /// 保存先にファイル名が無い（`dir/` など）
+    #[error("{}", tf!("{}: ファイル名が無い", "{}: no file name", .0.display()))]
+    NoFileName(PathBuf),
+    /// 上書きしないのに、鍵のファイル（秘密鍵か `.pub`）が既にある
+    #[error("{}", tf!("既に存在: {}", "already exists: {}", .0.display()))]
+    AlreadyExists(PathBuf),
+    /// ファイルかディレクトリの読み書きに失敗した（`path` はどのファイル・ディレクトリで失敗したか）
+    #[error("{}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
 
 /// 鍵の保存先。controller はこの trait 越しに保存するので、テストでは mockall の
 /// `MockKeyRepository` に差し替えて、ファイルに触れずに呼ばれ方を確かめられる
 #[cfg_attr(test, mockall::automock)]
 pub trait KeyRepository {
-    /// 秘密鍵と公開鍵のうち、既にあるほうのパス（両方なければ None）
-    fn existing(&self, private: &Path) -> io::Result<Option<PathBuf>>;
+    /// 秘密鍵と公開鍵のうち、既にあるほうのパス（両方なければ None）。リンク先の無いシンボリックリンクも
+    /// 「ある」とする（その名前では新しく作れないため）
+    fn existing(&self, private: &Path) -> Result<Option<PathBuf>, KeyFileError>;
+
+    /// `private` を置くディレクトリに、実際にファイルを作って消せるか確かめる（探す前に、保存できないことに
+    /// 気づくため）
+    fn check_writable(&self, private: &Path) -> Result<(), KeyFileError>;
 
     /// 秘密鍵を `private`、公開鍵を `<private>.pub` に書く。
-    /// `overwrite` でなければ、どちらかが既にあると書かずに失敗する（[`io::ErrorKind::AlreadyExists`]）
+    /// `overwrite` でなければ、どちらかが既にあると書かずに失敗する（[`KeyFileError::AlreadyExists`]）
     fn save(
         &self,
         key: &VanityKey,
         comment: &str,
         private: &Path,
         overwrite: bool,
-    ) -> io::Result<()>;
+    ) -> Result<(), KeyFileError>;
 }
 
 /// ファイルシステムに OpenSSH 形式で保存する [`KeyRepository`]（本番で使うもの）
@@ -31,8 +57,12 @@ pub trait KeyRepository {
 pub struct KeyFiles;
 
 impl KeyRepository for KeyFiles {
-    fn existing(&self, private: &Path) -> io::Result<Option<PathBuf>> {
+    fn existing(&self, private: &Path) -> Result<Option<PathBuf>, KeyFileError> {
         existing(private)
+    }
+
+    fn check_writable(&self, private: &Path) -> Result<(), KeyFileError> {
+        check_writable(private)
     }
 
     fn save(
@@ -41,7 +71,7 @@ impl KeyRepository for KeyFiles {
         comment: &str,
         private: &Path,
         overwrite: bool,
-    ) -> io::Result<()> {
+    ) -> Result<(), KeyFileError> {
         save(key, comment, private, overwrite)
     }
 }
@@ -51,24 +81,54 @@ pub fn pub_path(private: &Path) -> PathBuf {
     private.with_added_extension("pub")
 }
 
-/// 秘密鍵と公開鍵のうち、既にあるほうのパス（両方なければ None）
-pub fn existing(private: &Path) -> io::Result<Option<PathBuf>> {
+/// どのファイルで失敗したか分かるように、`e` にそのパスを付ける
+fn with_path(path: &Path, e: io::Error) -> KeyFileError {
+    KeyFileError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    }
+}
+
+/// 秘密鍵と公開鍵のうち、既にあるほうのパス（両方なければ None）。リンクはたどらずに調べるので、
+/// リンク先の無いシンボリックリンクも「ある」になる
+pub fn existing(private: &Path) -> Result<Option<PathBuf>, KeyFileError> {
     for p in [private.to_path_buf(), pub_path(private)] {
-        if p.try_exists()? {
-            return Ok(Some(p));
+        match symlink_metadata(&p) {
+            Ok(_) => return Ok(Some(p)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(with_path(&p, e)),
         }
     }
     Ok(None)
 }
 
-/// 秘密鍵を `private`（Unix では 0600）、公開鍵を `<private>.pub` に書く。
-/// `overwrite` でなければ、どちらかが既にあると書かずに失敗する（[`io::ErrorKind::AlreadyExists`]）
-pub fn save(key: &VanityKey, comment: &str, private: &Path, overwrite: bool) -> io::Result<()> {
+/// `private` を置くディレクトリに、試しのファイルを作って消せるか確かめる
+pub fn check_writable(private: &Path) -> Result<(), KeyFileError> {
+    let dir = match private.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let name = private
+        .file_name()
+        .ok_or_else(|| KeyFileError::NoFileName(private.to_path_buf()))?
+        .to_string_lossy();
+    let probe = dir.join(format!(".{name}.meikey-{:016x}.tmp", rand::random::<u64>()));
+    create_new(&probe, 0o600).map_err(|e| with_path(dir, e))?;
+    remove_file(&probe).map_err(|e| with_path(&probe, e))
+}
+
+/// 秘密鍵を `private`（本人だけが読める）、公開鍵を `<private>.pub` に書く。
+/// `overwrite` でなければ、どちらかが既にあると書かずに失敗する（[`KeyFileError::AlreadyExists`]）
+pub fn save(
+    key: &VanityKey,
+    comment: &str,
+    private: &Path,
+    overwrite: bool,
+) -> Result<(), KeyFileError> {
     // 片方だけ書いて止まらないよう、先に両方を確かめる（書くときも create_new なので、
     // 確かめた後に作られたファイルも上書きしない）
     if !overwrite && let Some(p) = existing(private)? {
-        let message = format!("既に存在: {}", p.display());
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists, message));
+        return Err(KeyFileError::AlreadyExists(p));
     }
     write_file(
         private,
@@ -84,24 +144,119 @@ pub fn save(key: &VanityKey, comment: &str, private: &Path, overwrite: bool) -> 
     )
 }
 
-/// ファイルを新しく作って書く。`overwrite` なら既存のファイルを先に消し、そうでなければ
-/// 既存のファイルがあると失敗する（どちらも create_new）。
-/// `mode` は Unix のパーミッション（秘密鍵は 0600 で所有者だけ読める）。既存のファイルに上書きすると
-/// そのファイルのパーミッション（0644 など）が残ってしまうので、必ず新しいファイルとして作る
-fn write_file(path: &Path, content: &str, mode: u32, overwrite: bool) -> io::Result<()> {
-    if overwrite
-        && let Err(e) = std::fs::remove_file(path)
-        && e.kind() != io::ErrorKind::NotFound
-    {
-        return Err(e);
-    }
-    let mut opts = std::fs::OpenOptions::new();
+/// ファイルを新しく作る（既にあれば失敗する）。`mode` は Unix のパーミッションで、0600 なら
+/// Windows でも本人だけのアクセス権にする（中身を書く前なので、ほかの人に読める瞬間はない）
+fn create_new(path: &Path, mode: u32) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, mode);
-    #[cfg(not(unix))]
+    let file = opts.open(path)?;
+    #[cfg(windows)]
+    if mode & 0o077 == 0 {
+        restrict_to_owner(path)?;
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = mode;
-    opts.open(path)?.write_all(content.as_bytes())
+    Ok(file)
+}
+
+/// ファイルを新しく作って書き、ディスクに書き終わるまで待つ。`overwrite` なら既存のファイルを先に消し、
+/// そうでなければ既存のファイルがあると失敗する（どちらも create_new）。
+/// 既存のファイルに上書きすると、そのファイルのパーミッション（0644 など）が残ってしまうので、
+/// 必ず新しいファイルとして作る
+fn write_file(path: &Path, content: &str, mode: u32, overwrite: bool) -> Result<(), KeyFileError> {
+    if overwrite
+        && let Err(e) = remove_file(path)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(with_path(path, e));
+    }
+    let write = || {
+        let mut file = create_new(path, mode)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()
+    };
+    write().map_err(|e| with_path(path, e))
+}
+
+/// ファイルのアクセス権を、このプロセスのユーザーのフルコントロールだけにする（親フォルダから継承した
+/// アクセス権は外す）。Unix の 0600 に当たり、Windows の OpenSSH はほかのユーザーが読める秘密鍵を使わない
+#[cfg(windows)]
+fn restrict_to_owner(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetTokenInformation, NO_INHERITANCE,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // このプロセスのユーザーの SID（TOKEN_USER の後ろに続く）。u64 で取って境界をそろえる
+    let mut token: HANDLE = null_mut();
+    // SAFETY: GetCurrentProcess は自分のプロセスの擬似ハンドルを返す。token は書き込み先
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut len = 0u32;
+    // SAFETY: 大きさを問い合わせるだけ（バッファなし）
+    unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut len) };
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: buf は len バイト以上あり、8 バイト境界（TOKEN_USER の境界）にそろっている
+    let ok =
+        unsafe { GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len) };
+    // SAFETY: OpenProcessToken で開いたハンドル
+    unsafe { CloseHandle(token) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: GetTokenInformation(TokenUser) が buf の先頭に TOKEN_USER を書いた
+    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+
+    let access = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: NO_INHERITANCE,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: sid.cast(),
+        },
+    };
+    let mut acl: *mut ACL = null_mut();
+    // SAFETY: access は1件、sid は buf が生きている間有効。acl は書き込み先（LocalFree で解放する）
+    let e = unsafe { SetEntriesInAclW(1, &access, null(), &mut acl) };
+    if e != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(e as i32));
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: wide は NUL で終わるパス、acl は SetEntriesInAclW が作ったもの。継承を止めて（PROTECTED）
+    // この ACL だけにする
+    let e = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
+    };
+    // SAFETY: SetEntriesInAclW が LocalAlloc で作ったもの
+    unsafe { LocalFree(acl as HLOCAL) };
+    if e != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(e as i32));
+    }
+    Ok(())
 }
 
 /// 暗号化なしの OpenSSH 秘密鍵（openssh-key-v1）
@@ -265,6 +420,87 @@ mod tests {
         }
     }
 
+    /// リンク先の無いシンボリックリンクも「既にある」（その名前では作れないので、探す前に止める）
+    #[cfg(unix)]
+    #[rstest]
+    #[case::private("id_test")]
+    #[case::public("id_test.pub")]
+    fn dangling_symlink_counts_as_existing(#[case] link: &str, dir: TempDir) {
+        let private = dir.path().join("id_test");
+        std::os::unix::fs::symlink(dir.path().join("nowhere/target"), dir.path().join(link))
+            .unwrap();
+        assert_eq!(existing(&private).unwrap(), Some(dir.path().join(link)));
+    }
+
+    /// 書けるディレクトリなら通り、試しのファイルは残さない。親のディレクトリが無い・ファイルなら、
+    /// そのパスを付けたエラー（[`KeyFileError::Io`]）になる
+    #[rstest]
+    #[case::writable("id_test", None)]
+    #[case::no_parent("nodir/id_test", Some("nodir"))]
+    #[case::parent_is_file("file/id_test", Some("file"))]
+    fn check_writable_cases(#[case] rel: &str, #[case] error_path: Option<&str>, dir: TempDir) {
+        write(dir.path().join("file"), "x").unwrap();
+        let before: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        let result = check_writable(&dir.path().join(rel));
+        match error_path {
+            None => assert_eq!(result.is_ok(), true, "{result:?}"),
+            Some(p) => {
+                let e = result.unwrap_err();
+                let message = e.to_string();
+                assert_eq!(
+                    matches!(&e, KeyFileError::Io { path, .. } if *path == dir.path().join(p)),
+                    true,
+                    "{e:?}"
+                );
+                assert_eq!(
+                    message.starts_with(&dir.path().join(p).display().to_string()),
+                    true,
+                    "{message}"
+                );
+            }
+        }
+        let after: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(after.len(), before.len(), "試しのファイルが残っている");
+    }
+
+    /// ファイル名の無い保存先（`..` など）は、ディレクトリに触れずにエラーにする
+    #[rstest]
+    fn check_writable_needs_a_file_name() {
+        let e = check_writable(Path::new("..")).unwrap_err();
+        assert_eq!(
+            matches!(&e, KeyFileError::NoFileName(p) if p == Path::new("..")),
+            true
+        );
+        assert_eq!(e.to_string(), "..: ファイル名が無い");
+    }
+
+    /// 相対パスのファイル名だけ（親が空）なら、今のディレクトリを確かめる
+    #[rstest]
+    fn check_writable_bare_name_uses_current_dir() {
+        assert_eq!(
+            check_writable(Path::new("id_meikey_check_test")).is_ok(),
+            true
+        );
+    }
+
+    /// 保存に失敗したら、どのファイルで失敗したかがエラーに出る
+    #[rstest]
+    fn save_error_names_the_path(dir: TempDir) {
+        let private = dir.path().join("nodir/id_test");
+        let e = save(&VanityKey::from_seed([3; 32]), "c", &private, false).unwrap_err();
+        assert_eq!(
+            matches!(&e, KeyFileError::Io { path, source }
+                if *path == private && source.kind() == io::ErrorKind::NotFound),
+            true,
+            "{e:?}"
+        );
+        assert_eq!(
+            e.to_string().contains(&private.display().to_string()),
+            true,
+            "{e}"
+        );
+    }
+
     /// 既にあるファイル（秘密鍵・`.pub`）と `overwrite` の組み合わせ。上書きしないなら、どちらかが
     /// あれば何も書かずに失敗して元のファイルはそのまま。上書きするなら、古いファイルを消して作り直す
     /// （0644 の古いファイルを置き換えても、秘密鍵は 0600 になる）
@@ -302,7 +538,10 @@ mod tests {
         let key = VanityKey::from_seed([7; 32]);
         let result = KeyFiles.save(&key, "c", &private, overwrite);
         if first.is_some() && !overwrite {
-            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(
+                matches!(result.unwrap_err(), KeyFileError::AlreadyExists(p) if first.as_ref() == Some(&p)),
+                true
+            );
             // 片方だけ書かれることはなく、元のファイルもそのまま
             for (exists, p) in [
                 (private_exists, private.clone()),

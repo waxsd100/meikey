@@ -37,6 +37,7 @@ cfg_select! {
     _ => {}
 }
 
+use crate::lang::tf;
 use crate::model::backend::{Backend, Compress, Mul, Simd};
 use comb::{Extended, Table};
 use curve25519_dalek::edwards::EdwardsPoint;
@@ -156,20 +157,22 @@ impl Compress {
             Compress::Batch => BATCH,
             Compress::Each => 1,
         };
-        format!("{keys} 鍵ごとに 1 回")
+        tf!("{keys} 鍵ごとに 1 回", "once per {keys} keys")
     }
 }
 
 /// 計算方法（SIMD は実際に使うもの）
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "倍算={}・逆元={}・SIMD={}",
+        let (mul, compress, simd) = (
             self.mul.name(),
             self.compress.name(),
-            self.simd.effective().name()
-        )
+            self.simd.effective().name(),
+        );
+        f.write_str(&tf!(
+            "倍算={mul}・逆元={compress}・SIMD={simd}",
+            "mul={mul}, inverse={compress}, SIMD={simd}"
+        ))
     }
 }
 

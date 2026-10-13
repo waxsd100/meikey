@@ -4,9 +4,21 @@
 //! 動くよう、古い NVRTC（CUDA 12.0）で作る。例: `pip install --target /tmp/nvrtc "nvidia-cuda-nvrtc-cu12==12.0.*"`
 //! として、`LD_LIBRARY_PATH=/tmp/nvrtc/nvidia/cuda_nvrtc/lib cargo make ptx`
 
-use meikey::service::gpu::{EMBEDDED, portable_ptx};
+use meikey::service::gpu::{EMBEDDED, GpuError, portable_ptx};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// PTX を作れない・書けないときのエラー
+#[derive(Debug, thiserror::Error)]
+enum GenError {
+    #[error(transparent)]
+    Gpu(#[from] GpuError),
+    #[error("{path}: {source}")]
+    Write {
+        path: String,
+        source: std::io::Error,
+    },
+}
+
+fn main() -> Result<(), GenError> {
     for options in EMBEDDED {
         let ptx = portable_ptx(options)?;
         let path = format!(
@@ -14,7 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             env!("CARGO_MANIFEST_DIR"),
             options.ptx_file()
         );
-        std::fs::write(&path, ptx)?;
+        std::fs::write(&path, ptx).map_err(|source| GenError::Write {
+            path: path.clone(),
+            source,
+        })?;
         println!("{path}");
     }
     Ok(())

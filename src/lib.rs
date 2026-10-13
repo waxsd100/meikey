@@ -4,16 +4,19 @@
 //! - [`controller`] — CLI（引数を読んで service と repository を呼ぶ）と、件数・時間の表示
 //! - [`service`] — 並列探索・文字列の判定・シードから公開鍵の計算（AVX2・AVX-512 を含む）
 //! - [`repository`] — 鍵を OpenSSH 形式のファイルに保存する
+//! - [`lang`] — 表示する言語（OS のロケールが日本語なら日本語、それ以外は英語）
 
 pub mod controller;
+pub mod lang;
 pub mod model;
 pub mod repository;
 pub mod service;
 
 pub use model::backend::{Backend, Compress, Mul, Simd};
-pub use model::key::VanityKey;
+pub use model::key::{InvalidComment, VanityKey};
 pub use model::pattern::{Find, Pattern, PatternError};
 pub use model::search::{Outcome, SearchConfig, Stats};
+pub use repository::key_file::KeyFileError;
 pub use service::matcher::Matcher;
 
 // ---- テスト専用（tests/support/ の補助と独立実装を IT と共有する。テストは各ファイルの `mod tests`） ----

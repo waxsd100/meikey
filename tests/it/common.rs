@@ -42,14 +42,25 @@ pub fn dir() -> TempDir {
     tempdir().unwrap()
 }
 
-/// meikey を `dir` で実行する（`-o` を付けなければ `dir` に書き出す）
+/// meikey を `dir` で、日本語のロケールで実行する（`-o` を付けなければ `dir` に書き出す）
 pub fn meikey_in(dir: &Path, args: &[&str]) -> Output {
-    Command::new(BIN)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("meikey を起動できる")
+    meikey_with_locale(dir, args, &[("LC_ALL", "ja_JP.UTF-8")])
 }
+
+/// meikey を `dir` で、ロケールの環境変数を `locale` だけにして実行する
+/// （Unix では表示の言語がこれで決まる。Windows は OS の表示言語で決まり、環境変数は見ない）
+pub fn meikey_with_locale(dir: &Path, args: &[&str], locale: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args).current_dir(dir);
+    for name in LOCALE_VARS {
+        cmd.env_remove(name);
+    }
+    cmd.envs(locale.iter().copied());
+    cmd.output().expect("meikey を起動できる")
+}
+
+/// 表示の言語を決めるのに見る環境変数（この順に見る）
+pub const LOCALE_VARS: [&str; 4] = ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"];
 
 /// 公開鍵の計算方法（meikey の引数で切り替える）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

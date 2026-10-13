@@ -1,5 +1,6 @@
 //! 探す文字列と、公開鍵に含まれるかの判定（探索ループで速く判定するものは [`crate::service::matcher`]）
 
+use crate::lang::{t, tf};
 use crate::model::key::{FIXED_PREFIX, PUBLIC_B64_LEN, PublicB64};
 use std::fmt;
 use std::ops::Range;
@@ -10,28 +11,23 @@ pub(crate) const SEARCH_START: usize = FIXED_PREFIX.len();
 /// 固定部分の直後の1文字は A〜P しか出ないので、自由に変わるのはその次から
 const FREE_LEN: usize = PUBLIC_B64_LEN - SEARCH_START - 1;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 探す文字列が使えない理由
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PatternError {
+    #[error("{}", t!("文字列が空", "the text is empty"))]
     Empty,
+    #[error("{}", tf!(
+        "使えない文字: '{}'（使える文字: A-Z a-z 0-9 + /）",
+        "invalid character: '{}' (allowed: A-Z a-z 0-9 + /)",
+        .0
+    ))]
     InvalidChar(char),
+    #[error("{}", tf!(
+        "文字列が長すぎる: {len} 文字（最大 {max} 文字）",
+        "the text is too long: {len} characters (at most {max})"
+    ))]
     TooLong { len: usize, max: usize },
 }
-
-impl fmt::Display for PatternError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => write!(f, "文字列が空"),
-            Self::InvalidChar(c) => {
-                write!(f, "使えない文字: '{c}'（使える文字: A-Z a-z 0-9 + /）")
-            }
-            Self::TooLong { len, max } => {
-                write!(f, "文字列が長すぎる: {len} 文字（最大 {max} 文字）")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PatternError {}
 
 /// 公開鍵に含めたい文字列
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,20 +88,32 @@ impl Pattern {
         }
     }
 
-    /// 1回の試行で当たる確率
+    /// 1回の試行で当たる確率（正確には、1つの鍵に含まれる個数の期待値。当たりにくい文字列ではほぼ同じ）
     pub fn probability(&self) -> f64 {
-        let n = self.needle.len() as i32;
-        // 大小文字を区別しないなら、英字1文字につき当たりが2通りになる
-        let variants = if self.case_sensitive {
-            0
-        } else {
-            self.needle
-                .iter()
-                .filter(|c| c.is_ascii_alphabetic())
-                .count() as i32
+        // 自由に変わる位置の1文字が一致する確率。大小文字を区別しないなら、英字は当たりが2通り
+        let per_char = |c: u8| {
+            if !self.case_sensitive && c.is_ascii_alphabetic() {
+                2.0 / 64.0
+            } else {
+                1.0 / 64.0
+            }
         };
+        let (first, rest) = self.needle.split_first().expect("空でない");
+        let rest: f64 = rest.iter().map(|&c| per_char(c)).product();
+        // 固定部分の直後の次（26 文字目）から始まる位置
         let positions = (FREE_LEN + 1 - self.needle.len()) as f64;
-        positions * 2f64.powi(variants) / 64f64.powi(n)
+        let free = positions * per_char(*first) * rest;
+        // 固定部分の直後（25 文字目）は A〜P の 16 通りが同じ確率で出るので、先頭がそのどれかなら 1/16
+        let head = match self.case_sensitive {
+            true => *first,
+            false => first.to_ascii_uppercase(),
+        };
+        let at_start = if (b'A'..=b'P').contains(&head) {
+            rest / 16.0
+        } else {
+            0.0
+        };
+        free + at_start
     }
 
     /// 当たりが出るまでの期待試行回数
@@ -128,14 +136,14 @@ impl Find {
     pub fn name(self) -> &'static str {
         match self {
             Find::Memmem => "memmem",
-            Find::Naive => "総当たり",
+            Find::Naive => t!("総当たり", "naive"),
         }
     }
 }
 
 impl fmt::Display for Find {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "検索={}", self.name())
+        write!(f, "{}={}", t!("検索", "search"), self.name())
     }
 }
 
@@ -232,26 +240,61 @@ pub(crate) mod tests {
         assert_eq!(Find::default(), Find::Memmem);
     }
 
-    /// 大小文字を区別しないときの期待試行回数と、区別したときに何倍になるか（英字1文字につき2倍）
+    /// 期待試行回数（大小文字の区別なし・あり）。26 文字目からの 43 - n か所に、先頭が A〜P（区別しないなら
+    /// a〜p も）なら 25 文字目（A〜P の 16 通り）からの 1 か所を足す
     #[rstest]
-    // 7文字なら入る位置は 42-7+1 = 36 か所
-    #[case::seven_letters("abcdefg", 64f64.powi(7) / (2f64.powi(7) * 36.0), 128.0)]
-    #[case::letters_and_digits("gack951", 64f64.powi(7) / (2f64.powi(4) * 36.0), 16.0)]
-    #[case::eight_letters("wakokara", 64f64.powi(8) / (2f64.powi(8) * 35.0), 256.0)]
-    #[case::one_letter("W", 64.0 / (2.0 * 42.0), 2.0)]
-    #[case::digits_only("2026", 64f64.powi(4) / 39.0, 1.0)]
-    #[case::symbols_only("+/+/", 64f64.powi(4) / 39.0, 1.0)]
-    fn expected_tries(#[case] s: &str, #[case] insensitive: f64, #[case] ratio: f64) {
-        let (ci, cs) = (
-            pat(s, false).expected_tries(),
-            pat(s, true).expected_tries(),
-        );
+    // 7文字なら 26 文字目からの位置は 42-7+1 = 36 か所
+    #[case::seven_letters("abcdefg", 1.0 / (36.0 * (2.0f64 / 64.0).powi(7) + (2.0f64 / 64.0).powi(6) / 16.0), 64f64.powi(7) / 36.0)]
+    #[case::letters_and_digits("gack951", 1.0 / (36.0 * 16.0 / 64f64.powi(7) + 8.0 / 64f64.powi(6) / 16.0), 64f64.powi(7) / 36.0)]
+    #[case::eight_letters("wakokara", 64f64.powi(8) / (2f64.powi(8) * 35.0), 64f64.powi(8) / 35.0)]
+    #[case::one_letter_after_p("W", 64.0 / (2.0 * 42.0), 64.0 / 42.0)]
+    #[case::one_letter_a("A", 1.0 / (2.0 * 42.0 / 64.0 + 1.0 / 16.0), 1.0 / (42.0 / 64.0 + 1.0 / 16.0))]
+    #[case::lowercase_p("pZ", 1.0 / (41.0 * 4.0 / 4096.0 + 2.0 / 64.0 / 16.0), 4096.0 / 41.0)]
+    #[case::uppercase_p("Pz", 1.0 / (41.0 * 4.0 / 4096.0 + 2.0 / 64.0 / 16.0), 1.0 / (41.0 / 4096.0 + 1.0 / 64.0 / 16.0))]
+    #[case::q_is_not_at_start("Qz", 4096.0 / (41.0 * 4.0), 4096.0 / 41.0)]
+    #[case::digits_only("2026", 64f64.powi(4) / 39.0, 64f64.powi(4) / 39.0)]
+    #[case::symbols_only("+/+/", 64f64.powi(4) / 39.0, 64f64.powi(4) / 39.0)]
+    fn expected_tries(#[case] s: &str, #[case] insensitive: f64, #[case] sensitive: f64) {
+        for (got, want) in [
+            (pat(s, false).expected_tries(), insensitive),
+            (pat(s, true).expected_tries(), sensitive),
+        ] {
+            assert_eq!(
+                (got / want - 1.0).abs() < 1e-12,
+                true,
+                "{s}: {got}（期待 {want}）"
+            );
+        }
+    }
+
+    /// 実際の鍵の公開鍵で、1文字が含まれる個数の平均は [`Pattern::probability`] と同じ
+    /// （25 文字目が A〜P だけなので、A は Z より多く含まれる）。4000 鍵の平均なので ±0.05 で比べる
+    #[rstest]
+    #[case::a("A")]
+    #[case::z("Z")]
+    #[case::digit("7")]
+    fn probability_matches_real_keys(#[case] s: &str) {
+        use crate::model::key::VanityKey;
+        let p = pat(s, true);
+        let n = 4000;
+        let total: usize = (0..n as u32)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[..4].copy_from_slice(&i.to_le_bytes());
+                let b64 = VanityKey::from_seed(seed).public_b64();
+                b64[SEARCH_START..]
+                    .iter()
+                    .filter(|&&c| c == s.as_bytes()[0])
+                    .count()
+            })
+            .sum();
+        let mean = total as f64 / f64::from(n);
         assert_eq!(
-            (ci / insensitive - 1.0).abs() < 1e-12,
+            (mean - p.probability()).abs() < 0.05,
             true,
-            "{ci}（期待 {insensitive}）"
+            "{mean}（期待 {}）",
+            p.probability()
         );
-        assert_eq!((cs / ci - ratio).abs() < 1e-9, true, "{}", cs / ci);
     }
 
     // ---- proptest ----

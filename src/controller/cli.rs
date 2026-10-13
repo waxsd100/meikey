@@ -4,103 +4,348 @@
 //! 鍵を計算せず・ファイルに触れずに、呼ぶ順番・渡す設定・エラーの扱いを確かめられる
 
 use crate::controller::format;
+use crate::lang::{Lang, current, t, tf};
 use crate::model::backend::{Compress, Mul, Simd};
 use crate::model::key::check_comment;
 use crate::model::pattern::{Find, Pattern};
 use crate::model::search::{SearchConfig, Stats};
-use crate::repository::key_file::{self, KeyFiles, KeyRepository};
+use crate::repository::key_file::{KeyFiles, KeyRepository, pub_path};
 use crate::service::search::{Parallel, Searcher};
 use clap::Parser;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// 公開鍵に好きな文字列を刻む ed25519 SSH 鍵ジェネレーター
-// 非公開の型なので、--document-private-items のときだけ検査される。expect だとそれ以外で未達になるので allow
-#[allow(
-    rustdoc::invalid_html_tags,
-    reason = "ヘルプの文面（`<OUTPUT>` など）は clap がそのまま表示するので、HTML として書かない"
-)]
+/// 公開鍵に好きな文字列を刻む ed25519 SSH 鍵ジェネレーター。
+///
+/// ヘルプの文は言語ごとに [`HELP`] にあり、[`command`] で付ける（ここのフィールドには書かない）
 #[derive(Parser)]
 #[command(name = "meikey", version)]
+// --gpu-width・--gpu-batch は GPU で探すとき（--gpu か --both）だけ付けられる
+#[cfg_attr(
+    feature = "cuda",
+    command(group(clap::ArgGroup::new("gpu_device").args(["gpu", "both"])))
+)]
 struct Cli {
-    /// 探索せずに、AVX2などの高速化機能が使えるか事前チェックして表示する
     #[arg(long)]
     check: bool,
 
-    /// 公開鍵に入れたい文字列（A-Z a-z 0-9 + /、最大42文字）
     #[arg(required_unless_present = "check")]
     target: Option<String>,
 
-    /// 大文字小文字を区別する（英字8文字なら256倍遅くなる）
     #[arg(short = 's', long)]
     case_sensitive: bool,
 
-    /// スレッド数 [既定: 全コア]
-    #[arg(short = 'j', long, value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(short = 'j', long, value_parser = |s: &str| int_in(s, 1, u16::MAX.into()).map(|n| n as u16))]
     threads: Option<u16>,
 
-    /// 秘密鍵の出力先（公開鍵は <OUTPUT>.pub）
     #[arg(short, long, default_value = "id_ed25519_meikey")]
     output: PathBuf,
 
-    /// 鍵のコメント
-    #[arg(short = 'C', long, default_value = "")]
+    #[arg(short = 'C', long, default_value = "", hide_default_value = true)]
     comment: String,
 
-    /// 既存のファイルを上書きする
     #[arg(short, long)]
     force: bool,
 
-    /// 探索せず、指定秒数だけ速度を測る（0.5 のような小数も可）
     #[arg(long, value_name = "SECS", value_parser = parse_secs, allow_negative_numbers = true)]
     bench: Option<Duration>,
 
-    /// 基点倍算に定数時間の実装（curve25519-dalek）を使う（高速化前の倍算）。数倍遅いが、
-    /// 同じマシン上の他プロセスからキャッシュのタイミングで秘密鍵を推測される余地をなくす
     #[arg(long)]
     constant_time: bool,
 
-    /// 逆元を 256 鍵ごとに 1 回ではなく、1 鍵ごとに計算する（高速化前の圧縮。比較用）。
-    /// --constant-time・--simd off・--no-memmem と全部付けると、ed25519-dalek で1鍵ずつ計算する高速化前と同じになる
     #[arg(long)]
     no_batch: bool,
 
-    /// 使う SIMD の上限（比較用）。CPU が対応していなければ、対応している中で一番上のものに下がる。
-    /// avx512-ifma・avx512 は8鍵ずつ、avx2 は4鍵ずつ同時に計算し、off は1鍵ずつ（高速化前の SHA-512 と倍算）。
-    /// amx は体の乗算を AMX のタイル演算でする実験的な経路（IFMA より遅い。Linux のみ。feature amx を
-    /// 有効にしてビルドしたときだけ指定できる）
     #[arg(long, value_enum, value_name = "LEVEL", default_value_t = SimdArg::Avx512Ifma)]
     simd: SimdArg,
 
-    /// 公開鍵の中を memmem（SIMD の部分文字列検索）で探さず、1文字ずつずらして比べる
-    /// （高速化前の検索。比較用）
     #[arg(long)]
     no_memmem: bool,
 
-    /// CPU ではなく GPU（CUDA）で探す。--threads・--constant-time・--no-batch・--simd・--no-memmem は
-    /// CPU 用なので使わない
     #[cfg(feature = "cuda")]
-    #[arg(long, conflicts_with = "both")]
+    #[arg(long, conflicts_with_all = ["both", "constant_time"])]
     gpu: bool,
 
-    /// GPU と CPU の両方で同時に探す（CPU のスレッド数の既定は 全コア − 1。1 本は GPU の操作に使う）
     #[cfg(feature = "cuda")]
-    #[arg(long)]
+    #[arg(long, conflicts_with = "constant_time")]
     both: bool,
 
-    /// GPU の表の幅 W（2〜16）。大きいほど点の足し算が減り、表は大きくなる（12 で約 5.8 MB、16 で約 67 MB）。
-    /// --gpu-width・--gpu-batch を付けなければ、探す前にこの GPU で測って一番速い組み合わせを使う。
-    /// 幅 12・14・16 と 16・32 鍵の組み合わせ以外は、起動時に NVRTC でカーネルをコンパイルする
     #[cfg(feature = "cuda")]
-    #[arg(long, value_name = "W", value_parser = clap::value_parser!(u32).range(2..=16))]
+    #[arg(
+        long,
+        value_name = "W",
+        value_parser = |s: &str| int_in(s, 2, 16),
+        requires = "gpu_device"
+    )]
     gpu_width: Option<u32>,
 
-    /// GPU の1スレッドが、逆元を1回にまとめて計算する鍵の数（1〜64）
     #[cfg(feature = "cuda")]
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=64))]
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = |s: &str| int_in(s, 1, 64),
+        requires = "gpu_device"
+    )]
     gpu_batch: Option<u32>,
+}
+
+/// コマンドの説明（日本語・英語）
+const ABOUT: (&str, &str) = (
+    "公開鍵に好きな文字列を刻む ed25519 SSH 鍵ジェネレーター",
+    "An ed25519 SSH key generator that puts the text you choose into the public key",
+);
+
+/// 引数ごとのヘルプの文（[`Cli`] のフィールド名、日本語、英語）。
+/// 日本語のヘルプの見出しは、この順に付け直した引数の順に並ぶので、「引数」（target）を先に置く
+const HELP: &[(&str, &str, &str)] = &[
+    (
+        "target",
+        "公開鍵に入れたい文字列（A-Z a-z 0-9 + /、最大42文字）",
+        "Text to put in the public key (A-Z a-z 0-9 + /, up to 42 characters)",
+    ),
+    (
+        "check",
+        "探索せずに、AVX2などの高速化機能が使えるか事前チェックして表示する",
+        "Show which speedups (AVX2 and so on) can be used, without searching",
+    ),
+    (
+        "case_sensitive",
+        "大文字小文字を区別する（英字8文字なら256倍遅くなる）",
+        "Match upper and lower case exactly (8 letters make it 256 times slower)",
+    ),
+    (
+        "threads",
+        "スレッド数 [既定: 全コア]",
+        "Number of threads [default: all cores]",
+    ),
+    (
+        "output",
+        "秘密鍵の出力先（公開鍵は <OUTPUT>.pub）",
+        "Where to write the private key (the public key goes to <OUTPUT>.pub)",
+    ),
+    ("comment", "鍵のコメント", "Comment for the key"),
+    (
+        "force",
+        "既存のファイルを上書きする",
+        "Overwrite existing files",
+    ),
+    (
+        "bench",
+        "探索せず、指定秒数だけ速度を測る（0.5 のような小数も可）",
+        "Measure the speed for this many seconds instead of searching (fractions such as 0.5 are allowed)",
+    ),
+    (
+        "constant_time",
+        "基点倍算に定数時間の実装（curve25519-dalek）を使う（高速化前の倍算）。数倍遅いが、\
+         同じマシン上の他プロセスからキャッシュのタイミングで秘密鍵を推測される余地をなくす。\
+         CPU だけで使える（GPU の計算は定数時間ではないので、--gpu・--both とは一緒に付けられない）",
+        "Use a constant-time implementation (curve25519-dalek) for base-point multiplication \
+         (the multiplication before the speedups). Several times slower, but leaves no room for other \
+         processes on the same machine to infer the private key from cache timing. CPU only \
+         (the GPU computation is not constant-time, so it cannot be combined with --gpu or --both)",
+    ),
+    (
+        "no_batch",
+        "逆元を 256 鍵ごとに 1 回ではなく、1 鍵ごとに計算する（高速化前の圧縮。比較用）。\
+         --constant-time・--simd off・--no-memmem と全部付けると、ed25519-dalek で1鍵ずつ計算する高速化前と同じになる",
+        "Compute the inverse for every key instead of once per 256 keys (the compression before \
+         the speedups; for comparison). With --constant-time, --simd off and --no-memmem as well, \
+         keys are computed one at a time with ed25519-dalek, the same as before the speedups",
+    ),
+    (
+        "simd",
+        "使う SIMD の上限（比較用）。CPU が対応していなければ、対応している中で一番上のものに下がる。\
+         avx512-ifma・avx512 は8鍵ずつ、avx2 は4鍵ずつ同時に計算し、off は1鍵ずつ（高速化前の SHA-512 と倍算）。\
+         amx は体の乗算を AMX のタイル演算でする実験的な経路（IFMA より遅い。Linux のみ。feature amx を\
+         有効にしてビルドしたときだけ指定できる）",
+        "Highest SIMD level to use (for comparison). If the CPU does not support it, the highest \
+         supported level below it is used. avx512-ifma and avx512 compute 8 keys at a time, avx2 4, \
+         and off 1 (the SHA-512 and multiplication before the speedups). amx is an experimental path \
+         that multiplies field elements with AMX tile operations (slower than IFMA; Linux only; \
+         available only when built with the amx feature)",
+    ),
+    (
+        "no_memmem",
+        "公開鍵の中を memmem（SIMD の部分文字列検索）で探さず、1文字ずつずらして比べる（高速化前の検索。比較用）",
+        "Compare at each position in turn instead of searching the public key with memmem \
+         (SIMD substring search) (the search before the speedups; for comparison)",
+    ),
+    (
+        "gpu",
+        "CPU ではなく GPU（CUDA）で探す。--threads・--constant-time・--no-batch・--simd・--no-memmem は \
+         CPU 用なので使わない",
+        "Search on the GPU (CUDA) instead of the CPU. --threads, --constant-time, --no-batch, \
+         --simd and --no-memmem are for the CPU and are not used",
+    ),
+    (
+        "both",
+        "GPU と CPU の両方で同時に探す（CPU のスレッド数の既定は 全コア − 1。1 本は GPU の操作に使う）",
+        "Search on the GPU and the CPU at the same time (the default number of CPU threads is \
+         all cores − 1; one drives the GPU)",
+    ),
+    (
+        "gpu_width",
+        "GPU の表の幅 W（2〜16）。大きいほど点の足し算が減り、表は大きくなる（12 で約 5.8 MB、16 で約 67 MB）。\
+         --gpu-width・--gpu-batch を付けなければ、探す前にこの GPU で測って一番速い組み合わせを使う。\
+         幅 12・14・16 と 16・32 鍵の組み合わせ以外は、起動時に NVRTC でカーネルをコンパイルする",
+        "Width W of the GPU table (2-16). Larger widths need fewer point additions and a bigger \
+         table (about 5.8 MB at 12, about 67 MB at 16). Without --gpu-width and --gpu-batch, the \
+         fastest combination is measured on this GPU before searching. Combinations other than \
+         widths 12, 14, 16 with 16 or 32 keys are compiled with NVRTC at startup",
+    ),
+    (
+        "gpu_batch",
+        "GPU の1スレッドが、逆元を1回にまとめて計算する鍵の数（1〜64）",
+        "Number of keys per GPU thread whose inverses are computed together (1-64)",
+    ),
+];
+
+/// 今の言語のヘルプ・見出しを付けた、引数の読み方。日本語では clap が英語で付ける
+/// 「Usage:」「Options:」「[default: …]」「[possible values: …]」と -h・-V の説明も日本語にする
+fn command() -> clap::Command {
+    use clap::{Arg, ArgAction, CommandFactory};
+    let lang = current();
+    let pick = |ja: &'static str, en: &'static str| if lang == Lang::Ja { ja } else { en };
+    let mut cmd = Cli::command()
+        .about(pick(ABOUT.0, ABOUT.1))
+        .long_about(None);
+    for &(id, ja, en) in HELP {
+        // feature で無くなる引数（--gpu など）は飛ばす
+        if cmd.get_arguments().any(|a| a.get_id() == id) {
+            cmd = cmd.mut_arg(id, |a| a.help(pick(ja, en)));
+        }
+    }
+    if lang == Lang::En {
+        return cmd;
+    }
+    cmd = cmd
+        .help_template("{about-with-newline}\n使い方: {usage}\n\n{all-args}{after-help}")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .arg(
+            Arg::new("help")
+                .short('h')
+                .long("help")
+                .action(ArgAction::Help)
+                .help("ヘルプを表示する"),
+        )
+        .arg(
+            Arg::new("version")
+                .short('V')
+                .long("version")
+                .action(ArgAction::Version)
+                .help("版を表示する"),
+        );
+    cmd.mut_args(|a| {
+        let mut help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+        let heading = if a.is_positional() {
+            "引数"
+        } else {
+            "オプション"
+        };
+        // 値を取らない引数（--force など）には既定値・値の一覧を付けない（clap も付けない）
+        if !a.get_action().takes_values() {
+            return a.help(help).help_heading(heading);
+        }
+        let defaults: Vec<String> = a
+            .get_default_values()
+            .iter()
+            .map(|v| v.to_string_lossy().into_owned())
+            .filter(|v| !v.is_empty())
+            .collect();
+        if !defaults.is_empty() {
+            help += &format!(" [既定: {}]", defaults.join(", "));
+        }
+        let values: Vec<String> = a
+            .get_possible_values()
+            .iter()
+            .filter(|v| !v.is_hide_set())
+            .map(|v| v.get_name().to_string())
+            .collect();
+        if !values.is_empty() {
+            help += &format!(" [使える値: {}]", values.join(", "));
+        }
+        a.help(help)
+            .help_heading(heading)
+            .hide_default_value(true)
+            .hide_possible_values(true)
+    })
+}
+
+/// 引数を読む。誤りがあれば、今の言語で説明して終わる（終了コード 2）
+fn parse_from<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    use clap::FromArgMatches;
+    Cli::from_arg_matches(&command().try_get_matches_from(args)?)
+}
+
+/// 引数の誤りを説明して終わる。日本語のときは clap の英語の説明を日本語にする
+/// （日本語にしていない種類の誤りと、ヘルプ・版の表示は clap のまま）
+fn exit_with(e: clap::Error) -> ! {
+    if current() == Lang::Ja
+        && let Some(message) = japanese_error(&e)
+    {
+        // その誤りに合わせた使い方（無ければ全体の使い方）
+        let usage = e
+            .get(clap::error::ContextKind::Usage)
+            .map_or_else(|| command().render_usage().to_string(), |u| u.to_string());
+        let usage = usage.strip_prefix("Usage: ").unwrap_or(&usage);
+        eprintln!("エラー: {message}\n\n使い方: {usage}\n\n詳しくは --help");
+        std::process::exit(2);
+    }
+    e.exit()
+}
+
+/// clap の誤りの日本語の説明（日本語にしていない種類なら None）
+fn japanese_error(e: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ErrorKind};
+    let get = |k| e.get(k).map(|v| v.to_string()).unwrap_or_default();
+    let (arg, value) = (get(ContextKind::InvalidArg), get(ContextKind::InvalidValue));
+    let message = match e.kind() {
+        ErrorKind::MissingRequiredArgument => format!("必要な引数が無い: {arg}"),
+        ErrorKind::UnknownArgument => {
+            let mut m = format!("知らない引数: '{arg}'");
+            if let Some(s) = e.get(ContextKind::SuggestedArg) {
+                m += &format!("（もしかして '{s}'）");
+            }
+            m
+        }
+        ErrorKind::InvalidValue if value.is_empty() => format!("'{arg}' に値が要る"),
+        ErrorKind::InvalidValue => {
+            let mut m = format!("'{arg}' に使えない値: '{value}'");
+            if let Some(v) = e.get(ContextKind::ValidValue) {
+                m += &format!("（使える値: {v}）");
+            }
+            m
+        }
+        ErrorKind::ValueValidation => {
+            let source = std::error::Error::source(e)
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            format!("'{arg}' の値 '{value}' が正しくない: {source}")
+        }
+        ErrorKind::ArgumentConflict => {
+            format!(
+                "'{arg}' と '{}' は一緒に付けられない",
+                get(ContextKind::PriorArg)
+            )
+        }
+        _ => return None,
+    };
+    Some(message)
+}
+
+/// `lo` 以上 `hi` 以下の整数
+fn int_in(s: &str, lo: u32, hi: u32) -> Result<u32, ValueError> {
+    s.parse()
+        .ok()
+        .filter(|n| (lo..=hi).contains(n))
+        .ok_or(ValueError::NotInRange { lo, hi })
 }
 
 /// 探すのに使うもの（既定は CPU、--gpu で GPU、--both で両方）
@@ -138,20 +383,34 @@ impl From<SimdArg> for Simd {
     }
 }
 
-/// 引数を読んで実行し、終了コードを返す
+mod error;
+mod interactive;
+
+pub use error::{CliError, ValueError};
+pub use interactive::AskError;
+
+/// 引数を読んで実行し、終了コードを返す。引数なしで端末から起動したら、質問に答えてもらって実行する
 pub fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match execute(&cli) {
+    let interactive = interactive::wanted();
+    let result = match interactive {
+        true => interactive::run(),
+        false => execute(&parse_from(std::env::args_os()).unwrap_or_else(|e| exit_with(e))),
+    };
+    let code = match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("エラー: {e}");
+            eprintln!("{}", tf!("エラー: {e}", "error: {e}"));
             ExitCode::FAILURE
         }
+    };
+    if interactive {
+        interactive::finish();
     }
+    code
 }
 
 /// 探すのに使うもの（CPU・GPU・両方）を決めて実行する
-fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn execute(cli: &Cli) -> Result<(), CliError> {
     match device(cli) {
         Device::Cpu => run(cli, &Parallel, &KeyFiles),
         #[cfg(feature = "cuda")]
@@ -167,8 +426,8 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 /// GPU を使えるようにする。設定を測ると数秒かかるので、引数の誤りや既にある出力先は先に確かめる
 #[cfg(feature = "cuda")]
-fn gpu(cli: &Cli) -> Result<crate::service::gpu::Gpu, Box<dyn std::error::Error>> {
-    use crate::service::gpu::{EMBEDDED, Gpu, GpuSetting};
+fn gpu(cli: &Cli) -> Result<crate::service::gpu::Gpu, CliError> {
+    use crate::service::gpu::{EMBEDDED, Gpu};
     if !cli.check {
         Pattern::new(cli.target.as_ref().unwrap(), cli.case_sensitive)?;
         check_comment(&cli.comment)?;
@@ -177,10 +436,18 @@ fn gpu(cli: &Cli) -> Result<crate::service::gpu::Gpu, Box<dyn std::error::Error>
         }
     }
     let setting = gpu_options(cli);
-    if setting == GpuSetting::Fastest {
-        eprintln!("GPU の設定を測っています（{} 通り）", EMBEDDED.len());
-    }
-    Ok(Gpu::new(0, setting)?)
+    // GPU が使えるとわかって、測り始めるときに知らせる（測ると数秒かかるので）
+    let notify = || {
+        eprintln!(
+            "{}",
+            tf!(
+                "GPU の設定を測っています（{} 通り）",
+                "Measuring GPU settings ({} combinations)",
+                EMBEDDED.len()
+            )
+        )
+    };
+    Ok(Gpu::new(0, setting, notify)?)
 }
 
 /// GPU の設定の決め方: --gpu-width・--gpu-batch のどちらかがあればそれ（無いほうは既定）、
@@ -210,11 +477,7 @@ fn device(cli: &Cli) -> Device {
     Device::Cpu
 }
 
-fn run(
-    cli: &Cli,
-    searcher: &impl Searcher,
-    repo: &impl KeyRepository,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run(cli: &Cli, searcher: &impl Searcher, repo: &impl KeyRepository) -> Result<(), CliError> {
     let mut config = SearchConfig::new(None);
     if let Some(n) = cli.threads {
         config.threads = n.into();
@@ -247,20 +510,23 @@ fn run(
     let mut rows = searcher.status(&config);
     rows.extend([
         (
-            "文字列",
-            format!(
-                "{}（大小文字の区別{}）",
-                pattern.as_str(),
-                if pattern.case_sensitive() {
-                    "あり"
-                } else {
-                    "なし"
-                }
-            ),
+            t!("文字列", "Text"),
+            match pattern.case_sensitive() {
+                true => tf!(
+                    "{}（大小文字の区別あり）",
+                    "{} (case-sensitive)",
+                    pattern.as_str()
+                ),
+                false => tf!(
+                    "{}（大小文字の区別なし）",
+                    "{} (case-insensitive)",
+                    pattern.as_str()
+                ),
+            },
         ),
         (
-            "期待試行",
-            format!("約 {}", format::count(pattern.expected_tries())),
+            t!("期待試行", "Est. tries"),
+            about(&format::count(pattern.expected_tries())),
         ),
     ]);
     print_rows(&rows);
@@ -272,12 +538,22 @@ fn run(
 }
 
 /// 0 より大きい秒数（小数可）
-fn parse_secs(s: &str) -> Result<Duration, String> {
-    let secs: f64 = s.parse().map_err(|_| format!("秒数ではない: {s:?}"))?;
+fn parse_secs(s: &str) -> Result<Duration, ValueError> {
+    let secs: f64 = s.parse().map_err(|_| ValueError::NotSeconds)?;
     Duration::try_from_secs_f64(secs)
         .ok()
         .filter(|d| !d.is_zero())
-        .ok_or_else(|| format!("0 より大きい秒数が必要: {s:?}"))
+        .ok_or(ValueError::NotPositive)
+}
+
+/// 「約 …」（期待試行・期待時間・残り時間）
+fn about(value: &str) -> String {
+    tf!("約 {value}", "about {value}")
+}
+
+/// 「… 鍵/秒」
+fn per_sec(rate: f64) -> String {
+    tf!("{} 鍵/秒", "{} keys/s", format::count(rate))
 }
 
 fn bench(
@@ -285,13 +561,16 @@ fn bench(
     mut config: SearchConfig,
     pattern: &Pattern,
     limit: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), CliError> {
     // 文字列の判定まで含めて測る（当たっても止まらない）
     config.bench = true;
     config.time_limit = Some(limit);
     config.progress_interval = Duration::from_secs(1);
 
-    print_rows(&[("計測", format!("{} 秒", limit.as_secs_f64()))]);
+    print_rows(&[(
+        t!("計測", "Measure"),
+        tf!("{} 秒", "{} s", limit.as_secs_f64()),
+    )]);
     let mut last = Stats {
         tries: 0,
         elapsed: Duration::ZERO,
@@ -299,39 +578,47 @@ fn bench(
     let out = searcher.run(&config, &mut |now: Stats| {
         let delta = since(now, last);
         eprintln!(
-            "{:>5.1}s  {} 鍵/秒",
+            "{:>5.1}s  {}",
             now.elapsed.as_secs_f64(),
-            format::count(delta.rate())
+            per_sec(delta.rate())
         );
         last = now;
     });
 
     let rate = out.stats.rate();
-    println!(
-        "{}",
-        format::row("速度", &format!("{} 鍵/秒", format::count(rate)))
-    );
+    println!("{}", format::row(t!("速度", "Speed"), &per_sec(rate)));
     println!(
         "{}",
         format::row(
-            "期待時間",
-            &format!(
-                "約 {}",
-                format::duration_secs(pattern.expected_tries() / rate)
-            )
+            t!("期待時間", "Est. time"),
+            &about(&format::duration_secs(pattern.expected_tries() / rate))
         )
     );
     Ok(())
 }
 
-/// 出力先に鍵のファイルが既にあれば（--force でなければ）エラー
-fn check_output(cli: &Cli, repo: &impl KeyRepository) -> Result<(), Box<dyn std::error::Error>> {
+/// 出力先に鍵のファイルが既にある（--force でなければ）か、そのディレクトリに書けなければエラー
+fn check_output(cli: &Cli, repo: &impl KeyRepository) -> Result<(), CliError> {
     if !cli.force
         && let Some(p) = repo.existing(&cli.output)?
     {
-        return Err(format!("既に存在: {}（--force で上書き）", p.display()).into());
+        return Err(CliError::OutputExists(p));
     }
-    Ok(())
+    repo.check_writable(&cli.output)
+        .map_err(CliError::NotWritable)
+}
+
+/// 出力先に保存できなかったときに、代わりに保存する先（今のディレクトリ、一時ディレクトリの順）。
+/// 名前は出力先の名前と、保存した時刻（Unix 時間の秒）
+fn fallback_paths(output: &Path) -> Vec<PathBuf> {
+    let name = output
+        .file_name()
+        .map_or_else(|| "id_ed25519_meikey".into(), |n| n.to_string_lossy());
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = format!("{name}-{secs}");
+    vec![PathBuf::from(&name), std::env::temp_dir().join(&name)]
 }
 
 fn generate(
@@ -340,7 +627,7 @@ fn generate(
     repo: &impl KeyRepository,
     config: SearchConfig,
     pattern: &Pattern,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), CliError> {
     // 何時間も回したあとで書き込めない、を防ぐため先に確認する
     // （書き込み時も確かめ、間に作られたファイルは上書きしない）
     check_output(cli, repo)?;
@@ -351,12 +638,18 @@ fn generate(
     let out = searcher.run(&config, &mut |s: Stats| {
         shown = true;
         let remaining = remaining_secs(expected, s);
-        eprint!(
-            "\r経過 {}  試行 {}  {} 鍵/秒  残り約 {}    ",
+        let (elapsed, tries, rate, remaining) = (
             format::duration(s.elapsed),
             format::count(s.tries as f64),
-            format::count(s.rate()),
+            per_sec(s.rate()),
             format::duration_secs(remaining),
+        );
+        eprint!(
+            "\r{}    ",
+            tf!(
+                "経過 {elapsed}  試行 {tries}  {rate}  残り約 {remaining}",
+                "Elapsed {elapsed}  Tries {tries}  {rate}  About {remaining} left"
+            )
         );
         let _ = io::stderr().flush();
     });
@@ -365,15 +658,26 @@ fn generate(
         eprintln!();
     }
 
-    let key = out.key.ok_or("鍵が見つからなかった")?;
-    repo.save(&key, &cli.comment, &cli.output, cli.force)?;
+    let key = out.key.ok_or(CliError::NotFound)?;
+    if let Err(e) = repo.save(&key, &cli.comment, &cli.output, cli.force) {
+        // 探す前に確かめても、探している間に書けなくなることはある。見つけた鍵を失わないよう、
+        // 代わりの場所に保存してからエラーにする
+        println!("{}", key.public_openssh(&cli.comment));
+        let saved = fallback_paths(&cli.output)
+            .into_iter()
+            .find(|p| repo.save(&key, &cli.comment, p, false).is_ok());
+        return Err(match saved {
+            Some(private) => CliError::SavedElsewhere { source: e, private },
+            None => CliError::NotSaved(e),
+        });
+    }
 
     print_rows(&[
         (
-            "試行",
-            format!("{} 鍵", format::count(out.stats.tries as f64)),
+            t!("試行", "Tries"),
+            tf!("{} 鍵", "{} keys", format::count(out.stats.tries as f64)),
         ),
-        ("経過", format::duration(out.stats.elapsed)),
+        (t!("経過", "Elapsed"), format::duration(out.stats.elapsed)),
     ]);
     let line = key.public_openssh(&cli.comment);
     println!("{line}");
@@ -383,14 +687,21 @@ fn generate(
         eprintln!("{}{}", " ".repeat(offset + r.start), "^".repeat(r.len()));
     }
     print_rows(&[
-        ("秘密鍵", cli.output.display().to_string()),
         (
-            "公開鍵",
-            key_file::pub_path(&cli.output).display().to_string(),
+            t!("秘密鍵", "Private key"),
+            cli.output.display().to_string(),
         ),
         (
-            "パスフレーズ",
-            format!("なし（設定: ssh-keygen -p -f {}）", cli.output.display()),
+            t!("公開鍵", "Public key"),
+            pub_path(&cli.output).display().to_string(),
+        ),
+        (
+            t!("パスフレーズ", "Passphrase"),
+            tf!(
+                "なし（設定: ssh-keygen -p -f {}）",
+                "none (to set one: ssh-keygen -p -f {})",
+                cli.output.display()
+            ),
         ),
     ]);
     Ok(())
@@ -434,6 +745,14 @@ mod tests {
     use similar_asserts::assert_eq;
     use std::iter::once;
     use std::path::Path;
+
+    /// 鍵のファイルの読み書きのエラー（モックが返すもの）
+    fn io_error(path: &str, message: &str) -> crate::repository::key_file::KeyFileError {
+        crate::repository::key_file::KeyFileError::Io {
+            path: path.into(),
+            source: io::Error::other(message.to_string()),
+        }
+    }
 
     /// 表示用の名前だけ答える探索のモック（run の期待は各テストで書く）
     #[fixture]
@@ -494,7 +813,7 @@ mod tests {
         assert_eq!((got - want).abs() < 1e-9, true, "{got}");
     }
 
-    /// 既存ファイルの確認（--force なら省く）→ 探索 → 保存 の順に呼び、見つかった鍵を
+    /// 既存ファイルの確認（--force なら省く）→ 書けるかの確認 → 探索 → 保存 の順に呼び、見つかった鍵を
     /// 指定どおりのパス・コメント・上書き指定で保存する
     #[rstest]
     fn generate_saves_found_key(
@@ -516,6 +835,11 @@ mod tests {
             .times(usize::from(!force))
             .in_sequence(&mut seq)
             .returning(|_| Ok(None));
+        repo.expect_check_writable()
+            .with(eq(Path::new("out/id_test")))
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(()));
         let (want, t) = (key.clone(), target.clone());
         searcher
             .expect_run()
@@ -561,11 +885,18 @@ mod tests {
         repo.expect_existing()
             .times(1)
             .returning(move |_| Ok(Some(PathBuf::from(already))));
+        repo.expect_check_writable().never();
         repo.expect_save().never();
 
         searcher.expect_run().never();
 
-        let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
+        let e = run(&cli, &searcher, &repo).unwrap_err();
+        assert_eq!(
+            matches!(&e, CliError::OutputExists(p) if p == Path::new(already)),
+            true,
+            "{e:?}"
+        );
+        let e = e.to_string();
         assert_eq!(e.contains(already) && e.contains("--force"), true, "{e}");
     }
 
@@ -578,12 +909,34 @@ mod tests {
         let cli = parse(&["abc"]);
 
         repo.expect_existing()
-            .returning(|_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "読めない")));
+            .returning(|_| Err(io_error("id_ed25519_meikey", "読めない")));
 
         searcher.expect_run().never();
 
-        let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
-        assert_eq!(e, "読めない");
+        let e = run(&cli, &searcher, &repo).unwrap_err();
+        assert_eq!(matches!(e, CliError::KeyFile(_)), true, "{e:?}");
+        assert_eq!(e.to_string(), "id_ed25519_meikey: 読めない");
+    }
+
+    /// 出力先のディレクトリに書けなければ（無い・権限など）、探す前にそのエラーで止まる
+    #[rstest]
+    fn unwritable_output_stops_before_search(
+        mut searcher: MockSearcher,
+        mut repo: MockKeyRepository,
+    ) {
+        let cli = parse(&["abc", "-o", "nodir/id_test"]);
+
+        repo.expect_existing().returning(|_| Ok(None));
+        repo.expect_check_writable()
+            .with(eq(Path::new("nodir/id_test")))
+            .times(1)
+            .returning(|_| Err(io_error("nodir", "無い")));
+        repo.expect_save().never();
+        searcher.expect_run().never();
+
+        let e = run(&cli, &searcher, &repo).unwrap_err();
+        assert_eq!(matches!(e, CliError::NotWritable(_)), true, "{e:?}");
+        assert_eq!(e.to_string(), "保存できない: nodir: 無い");
     }
 
     /// 見つからずに終わった（時間切れ・パニック後の停止など）なら、エラーにして何も保存しない
@@ -592,6 +945,7 @@ mod tests {
         let cli = parse(&["abc"]);
 
         repo.expect_existing().returning(|_| Ok(None));
+        repo.expect_check_writable().returning(|_| Ok(()));
         repo.expect_save().never();
 
         searcher.expect_run().returning(|_, _| Outcome {
@@ -599,36 +953,85 @@ mod tests {
             stats: stats(10, 5),
         });
 
-        let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
-        assert_eq!(e, "鍵が見つからなかった");
+        let e = run(&cli, &searcher, &repo).unwrap_err();
+        assert_eq!(matches!(e, CliError::NotFound), true, "{e:?}");
+        assert_eq!(e.to_string(), "鍵が見つからなかった");
     }
 
-    /// 保存に失敗したら（探索中に作られたファイル・書き込み権限など）、そのエラーを返す
+    /// 保存に失敗したら（探索中に作られたファイル・書き込み権限など）、見つけた鍵を代わりの場所
+    /// （今のディレクトリ、だめなら一時ディレクトリ）に上書きせずに保存し、元のエラーと保存先を返す
     #[rstest]
-    #[case::created_meanwhile(io::ErrorKind::AlreadyExists)]
-    #[case::permission(io::ErrorKind::PermissionDenied)]
-    fn save_error_is_returned(
-        #[case] kind: io::ErrorKind,
+    #[case::cwd(&[true], Some(0))]
+    #[case::temp_dir(&[false, true], Some(1))]
+    #[case::nowhere(&[false, false], None)]
+    fn save_error_falls_back(
+        #[case] fallback_ok: &'static [bool],
+        #[case] saved_at: Option<usize>,
         mut searcher: MockSearcher,
         found: (VanityKey, String),
         mut repo: MockKeyRepository,
     ) {
         let (key, target) = found;
-        let cli = parse(&[&target]);
+        let cli = parse(&[&target, "-o", "out/id_test"]);
+        let fallbacks = fallback_paths(Path::new("out/id_test"));
+        assert_eq!(
+            fallbacks[0].parent(),
+            Some(Path::new("")),
+            "1つ目は今のディレクトリ"
+        );
+        assert_eq!(fallbacks[1].parent(), Some(std::env::temp_dir().as_path()));
 
         repo.expect_existing().returning(|_| Ok(None));
+        repo.expect_check_writable().returning(|_| Ok(()));
+        let mut seq = Sequence::new();
         repo.expect_save()
+            .withf(|_, _, p, _| p == Path::new("out/id_test"))
             .times(1)
-            .returning(move |_, _, _, _| Err(io::Error::new(kind, "書けない")));
-
+            .in_sequence(&mut seq)
+            .returning(|_, _, _, _| Err(io_error("out/id_test", "書けない")));
+        for &ok in fallback_ok {
+            repo.expect_save()
+                .withf(|_, comment, p, overwrite| {
+                    comment.is_empty() && p.to_string_lossy().contains("id_test-") && !*overwrite
+                })
+                .times(1)
+                .in_sequence(&mut seq)
+                .returning(move |_, _, _, _| match ok {
+                    true => Ok(()),
+                    false => Err(io_error("x", "x")),
+                });
+        }
         searcher.expect_run().returning(move |_, _| Outcome {
             key: Some(key.clone()),
             stats: stats(10, 5),
         });
 
         let e = run(&cli, &searcher, &repo).unwrap_err();
-        let e = e.downcast_ref::<io::Error>().expect("io::Error のまま返す");
-        assert_eq!(e.kind(), kind);
+        let message = e.to_string();
+        assert_eq!(
+            message.starts_with("out/id_test: 書けない。"),
+            true,
+            "{message}"
+        );
+        match (saved_at, e) {
+            (Some(i), CliError::SavedElsewhere { source, private }) => {
+                assert_eq!(source.to_string(), "out/id_test: 書けない");
+                // 名前の最後（保存した時刻）は、呼んだ時刻で変わる
+                let name = fallbacks[i].to_string_lossy().into_owned();
+                let prefix = &name[..name.rfind('-').unwrap() + 1];
+                assert_eq!(
+                    private.to_string_lossy().starts_with(prefix),
+                    true,
+                    "{private:?}"
+                );
+                assert_eq!(message.contains("代わりに"), true, "{message}");
+            }
+            (None, CliError::NotSaved(source)) => {
+                assert_eq!(source.to_string(), "out/id_test: 書けない");
+                assert_eq!(message.contains("にも保存できなかった"), true, "{message}");
+            }
+            (want, e) => panic!("{want:?} 番目に保存したはずが {e:?}"),
+        }
     }
 
     /// --bench は「当たっても止まらない・時間で止まる・1秒ごとに進捗」の設定で探索し、
@@ -731,6 +1134,23 @@ mod tests {
         assert_eq!(parsed.ok().map(|c| gpu_options(&c)), want);
     }
 
+    /// --constant-time は GPU では使えない（GPU の計算は定数時間でない）。--gpu-width・--gpu-batch は
+    /// GPU で探すときだけ付けられる
+    #[cfg(feature = "cuda")]
+    #[rstest]
+    #[case::constant_time_gpu(&["--constant-time", "--gpu"], false)]
+    #[case::constant_time_both(&["--constant-time", "--both"], false)]
+    #[case::constant_time_cpu(&["--constant-time"], true)]
+    #[case::width_without_gpu(&["--gpu-width", "16"], false)]
+    #[case::batch_without_gpu(&["--gpu-batch", "32"], false)]
+    #[case::width_with_gpu(&["--gpu", "--gpu-width", "16"], true)]
+    #[case::batch_with_both(&["--both", "--gpu-batch", "32"], true)]
+    #[case::check_width_without_gpu(&["--check", "--gpu-width", "16"], false)]
+    fn gpu_flag_combinations(#[case] options: &[&str], #[case] accepted: bool) {
+        let parsed = Cli::try_parse_from(["meikey", "abc"].iter().chain(options));
+        assert_eq!(parsed.is_ok(), accepted, "{:?}", parsed.err());
+    }
+
     /// --gpu・--both は feature cuda が無ければ受け付けない
     #[cfg(not(feature = "cuda"))]
     #[rstest]
@@ -803,6 +1223,7 @@ mod tests {
         }
 
         repo.expect_existing().returning(|_| Ok(None));
+        repo.expect_check_writable().returning(|_| Ok(()));
 
         searcher
             .expect_run()
@@ -816,5 +1237,149 @@ mod tests {
         let result = run(&parse(&args), &searcher, &repo);
         // 見つからない結果を返しているので、生成ならエラー・計測なら成功
         assert_eq!(result.is_ok(), bench);
+    }
+
+    /// --simd に使える値の一覧（amx は feature amx が有効なときだけ）
+    const SIMD_VALUES: &str = if cfg!(feature = "amx") {
+        "amx, avx512-ifma, avx512, avx2, off"
+    } else {
+        "avx512-ifma, avx512, avx2, off"
+    };
+
+    /// どの言語でも、引数の読み方は clap の検査に通り、どの引数にもその言語のヘルプが付く
+    /// （引数を足して HELP に書き忘れると、ここで落ちる）
+    #[rstest]
+    fn every_argument_has_help(#[values(Lang::Ja, Lang::En)] lang: Lang) {
+        crate::lang::set(lang);
+        let cmd = command();
+        cmd.clone().debug_assert();
+        for a in cmd.get_arguments() {
+            let id = a.get_id().as_str();
+            let help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+            assert_eq!(help.is_empty(), false, "{id} にヘルプが無い");
+            let japanese = help.chars().any(|c| !c.is_ascii() && c != '−');
+            assert_eq!(japanese, lang == Lang::Ja, "{id}: {help}");
+        }
+        for &(id, _, _) in HELP {
+            let known = cmd.get_arguments().any(|a| a.get_id() == id);
+            let gpu_only = matches!(id, "gpu" | "both" | "gpu_width" | "gpu_batch");
+            assert_eq!(
+                known || (gpu_only && !cfg!(feature = "cuda")),
+                true,
+                "{id} は無い引数"
+            );
+        }
+    }
+
+    /// 日本語では、clap の英語の見出し・既定値・値の一覧・-h と -V の説明を日本語にする
+    #[rstest]
+    #[case::ja(Lang::Ja, &["使い方: meikey", "引数:", "オプション:", "[既定: id_ed25519_meikey]", "[使える値: {SIMD}]", "ヘルプを表示する", "版を表示する"], &["Usage:", "Options:", "[default:", "[possible values:", "Print help"])]
+    #[case::en(Lang::En, &["Usage: meikey", "Arguments:", "Options:", "[default: id_ed25519_meikey]", "[possible values: {SIMD}]", "Print help", "Print version"], &["使い方", "既定", "[default: \"\"]"])]
+    fn help_in_language(#[case] lang: Lang, #[case] has: &[&str], #[case] lacks: &[&str]) {
+        crate::lang::set(lang);
+        let help = command().render_long_help().to_string();
+        for want in has {
+            let want = &want.replace("{SIMD}", SIMD_VALUES);
+            assert_eq!(help.contains(want), true, "{want:?} が無い:\n{help}");
+        }
+        for not in lacks {
+            assert_eq!(help.contains(not), false, "{not:?} がある:\n{help}");
+        }
+        // 引数（TARGET）の見出しがオプションより先
+        let (args, options) = match lang {
+            Lang::Ja => ("引数:", "オプション:"),
+            Lang::En => ("Arguments:", "Options:"),
+        };
+        assert_eq!(help.find(args) < help.find(options), true, "{help}");
+    }
+
+    /// 日本語では clap の引数の誤りを日本語で説明する（英語なら clap のまま = None）
+    #[rstest]
+    #[case::missing(&[], "必要な引数が無い: <TARGET>")]
+    #[case::unknown(&["abc", "--nope"], "知らない引数: '--nope'")]
+    #[case::suggestion(&["abc", "--forc"], "知らない引数: '--forc'（もしかして '--force'）")]
+    #[case::extra(&["abc", "def"], "知らない引数: 'def'")]
+    #[case::no_value(&["abc", "--output"], "'--output <OUTPUT>' に値が要る")]
+    #[case::not_in_list(&["abc", "--simd", "avx1024"], "'--simd <LEVEL>' に使えない値: 'avx1024'（使える値: {SIMD}）")]
+    #[case::threads_zero(&["abc", "-j", "0"], "'--threads <THREADS>' の値 '0' が正しくない: 1〜65535 の整数が必要")]
+    #[case::threads_not_number(&["abc", "-j", "x"], "'--threads <THREADS>' の値 'x' が正しくない: 1〜65535 の整数が必要")]
+    #[case::bench_zero(&["abc", "--bench", "0"], "'--bench <SECS>' の値 '0' が正しくない: 0 より大きい秒数が必要")]
+    #[case::bench_not_number(&["abc", "--bench", "x"], "'--bench <SECS>' の値 'x' が正しくない: 秒数ではない")]
+    #[cfg_attr(feature = "cuda", case::conflict(&["abc", "--constant-time", "--gpu"], "'--constant-time' と '--gpu' は一緒に付けられない"))]
+    #[cfg_attr(feature = "cuda", case::gpu_width_alone(&["abc", "--gpu-width", "16"], "必要な引数が無い: <--gpu|--both>"))]
+    #[cfg_attr(feature = "cuda", case::gpu_width_range(&["abc", "--gpu", "--gpu-width", "17"], "'--gpu-width <W>' の値 '17' が正しくない: 2〜16 の整数が必要"))]
+    fn clap_errors_in_japanese(#[case] args: &[&str], #[case] want: &str) {
+        let parse = || {
+            parse_from(once("meikey").chain(args.iter().copied()))
+                .err()
+                .unwrap()
+        };
+        let want = want.replace("{SIMD}", SIMD_VALUES);
+        assert_eq!(japanese_error(&parse()), Some(want));
+        // 英語では clap の説明のまま
+        crate::lang::set(Lang::En);
+        assert_eq!(parse().to_string().is_ascii(), true, "{}", parse());
+    }
+
+    /// ヘルプと版の表示は誤りではないので、日本語にせず clap に任せる
+    #[rstest]
+    #[case::help("--help")]
+    #[case::version("--version")]
+    fn help_and_version_are_not_errors(#[case] flag: &str) {
+        let e = parse_from(["meikey", flag]).err().unwrap();
+        assert_eq!(japanese_error(&e), None);
+    }
+
+    /// 範囲の整数: 範囲内の整数だけ受け付け、それ以外は範囲を付けた ValueError::NotInRange
+    #[rstest]
+    #[case::low("1", Some(1))]
+    #[case::high("64", Some(64))]
+    #[case::below("0", None)]
+    #[case::above("65", None)]
+    #[case::negative("-1", None)]
+    #[case::not_a_number("x", None)]
+    #[case::fraction("1.5", None)]
+    fn int_in_range(#[case] s: &str, #[case] want: Option<u32>) {
+        let want = want.ok_or(ValueError::NotInRange { lo: 1, hi: 64 });
+        assert_eq!(int_in(s, 1, 64), want);
+    }
+
+    /// 秒数: 0 より大きい数だけ受け付ける。数でなければ NotSeconds、0 以下や大きすぎれば NotPositive
+    #[rstest]
+    #[case::integer("10", Ok(Duration::from_secs(10)))]
+    #[case::fraction("0.5", Ok(Duration::from_millis(500)))]
+    #[case::zero("0", Err(ValueError::NotPositive))]
+    #[case::negative("-1", Err(ValueError::NotPositive))]
+    #[case::too_large("1e30", Err(ValueError::NotPositive))]
+    #[case::not_a_number("x", Err(ValueError::NotSeconds))]
+    #[case::empty("", Err(ValueError::NotSeconds))]
+    fn parse_secs_cases(#[case] s: &str, #[case] want: Result<Duration, ValueError>) {
+        assert_eq!(parse_secs(s), want);
+    }
+
+    /// 英語では、表示も誤りも英語になる
+    #[rstest]
+    fn messages_in_english(mut searcher: MockSearcher, mut repo: MockKeyRepository) {
+        crate::lang::set(Lang::En);
+        let cli = parse(&["abc"]);
+        repo.expect_existing()
+            .returning(|_| Ok(Some(PathBuf::from("id_ed25519_meikey"))));
+        searcher.expect_run().never();
+        let e = run(&cli, &searcher, &repo).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "already exists: id_ed25519_meikey (--force to overwrite)"
+        );
+
+        let e = run(&parse(&["ab-c"]), &searcher, &repo)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "invalid character: '-' (allowed: A-Z a-z 0-9 + /)");
+        assert_eq!(
+            parse_secs("0").unwrap_err().to_string(),
+            "must be greater than 0 seconds"
+        );
+        assert_eq!(per_sec(62_501_000.0), "62.5M keys/s");
+        assert_eq!(about("3d 18h"), "about 3d 18h");
     }
 }

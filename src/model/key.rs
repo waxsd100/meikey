@@ -1,6 +1,7 @@
 //! ed25519 鍵と、公開鍵の base64・authorized_keys の1行（秘密鍵のファイルへの書き出しは
 //! [`crate::repository::key_file`]）
 
+use crate::lang::tf;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::SigningKey;
@@ -51,20 +52,13 @@ pub fn encode_public_b64(public: &[u8; 32], out: &mut PublicB64) {
 }
 
 /// コメントに使えない文字が入っている
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}", tf!(
+    "コメントに使えない文字: {:?}（改行・NUL は不可）",
+    "invalid character in the comment: {:?} (no line breaks or NUL)",
+    .0
+))]
 pub struct InvalidComment(pub char);
-
-impl std::fmt::Display for InvalidComment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "コメントに使えない文字: {:?}（改行・NUL は不可）",
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for InvalidComment {}
 
 /// 鍵のコメントとして使えるか確かめる。
 ///

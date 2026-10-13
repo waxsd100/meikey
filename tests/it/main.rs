@@ -11,6 +11,7 @@
 //! - [`encrypted`] — パスフレーズを付けた鍵が仕様どおりに暗号化され、そのパスフレーズでだけ開けるか
 //! - [`agent`] — ssh-agent に入れて使えるか（Unix だけ）
 //! - [`sshd`] — 実際に sshd にログインできるか（Unix で Docker が使えるときだけ）
+//! - [`interactive`] — 引数なしで端末から起動したときの対話（Unix だけ）
 //! - [`authorized_keys`] — オプション付き・ほかの行と並べた authorized_keys で使えるか
 //! - [`rfc8032`] — 参照実装そのものが RFC 8032 どおりか
 //! - [`ssh_format`] — SSH の形式の独立実装そのものが仕様どおりか
@@ -22,6 +23,8 @@ mod authorized_keys;
 mod cli;
 mod common;
 mod encrypted;
+#[cfg(unix)]
+mod interactive;
 mod keys_work;
 mod rfc8032;
 mod ssh_format;

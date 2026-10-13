@@ -1,7 +1,7 @@
 # meikey
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/waxsd100/meikey/blob/master/colab/meikey.ipynb)
-[![Benchmark: 5.4億 鍵/秒](https://img.shields.io/badge/benchmark-5.4%E5%84%84%20%E9%8D%B5%2F%E7%A7%92-brightgreen.svg)](docs/benchmark.md)
+[![Benchmark: 7.0億 鍵/秒](https://img.shields.io/badge/benchmark-7.0%E5%84%84%20%E9%8D%B5%2F%E7%A7%92-brightgreen.svg)](docs/benchmark.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#ライセンス)
 [![Rust 1.99+](https://img.shields.io/badge/rust-1.99%2B-orange.svg?logo=rust)](https://www.rust-lang.org)
 [![CUDA sm_75+](https://img.shields.io/badge/CUDA-sm__75%2B-76B900.svg?logo=nvidia)](#gpu)
@@ -10,7 +10,7 @@
 
 公開鍵に好きな文字列が入った ed25519 の SSH 鍵（vanity key）を探す CLI。名前は 銘（めい）＋ key。
 
-GPU にも対応していて、Google Colab の RTX PRO 6000 の環境なら **毎秒 5.4億 鍵** を探索できる（[ベンチマーク](docs/benchmark.md)）。
+GPU にも対応していて、Google Colab の RTX PRO 6000 の環境なら GPU だけで **毎秒 7.0億 鍵** を探索できる（[ベンチマーク](docs/benchmark.md)）。
 
 ```
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAiytFbrDh3MEGkK6xS5oe22CBkwAkOiHqOUBG+RECKz wakokara
@@ -33,6 +33,10 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAiytFbrDh3MEGkK6xS5oe22CBkwAkOiHqOUBG+RECKz
 cargo make run wakokara --bench 10                                  # 速度と期待時間を測る
 cargo make run wakokara -C wakokara -o ~/.ssh/id_ed25519_wakokara   # 鍵を探して書き出す
 ```
+
+引数を付けずに起動すると、することと文字列・保存先・コメントなどを順に聞かれ、選んだり入力したりして始められる。始める前に、同じことをする引数を表示する。
+
+表示は、OS のロケールが日本語なら日本語、それ以外は英語になる。
 
 秘密鍵にはパスフレーズが付いていないので、使う前に付ける。
 
@@ -62,9 +66,9 @@ cargo make run wakokara --both -C wakokara -o ~/.ssh/id_ed25519_wakokara
 | `--check` | 使う CPU・GPU と計算方法を表示して終わる |
 | `--gpu` | CPU ではなく GPU で探す |
 | `--both` | GPU と CPU の両方で探す |
-| `--gpu-width W` | GPU の表の幅（2〜16）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
-| `--gpu-batch N` | GPU で逆元をまとめる鍵の数（1〜64）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
-| `--constant-time` | 倍算に定数時間の実装を使う（約 5 倍遅い） |
+| `--gpu-width W` | GPU の表の幅（2〜16。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
+| `--gpu-batch N` | GPU で逆元をまとめる鍵の数（1〜64。`--gpu`・`--both` のとき）。付けなければ、探す前に GPU で測って速い設定を選ぶ |
+| `--constant-time` | 倍算に定数時間の実装を使う（約 5 倍遅い。CPU のみ） |
 | `--simd LEVEL` | 使う SIMD の上限（`avx512-ifma`・`avx512`・`avx2`・`off`） |
 
 ### 入れられる文字列
@@ -81,7 +85,7 @@ cargo make run wakokara --both -C wakokara -o ~/.ssh/id_ed25519_wakokara
 
 ## 安全性
 
-既定の倍算は定数時間ではない。共有サーバーなど信用できない環境では `--constant-time` を付ける。
+既定の倍算は定数時間ではない。共有サーバーなど信用できない環境では、CPU で `--constant-time` を付けて探す。GPU の計算は定数時間ではないので、`--constant-time` は `--gpu`・`--both` と一緒に付けられない。
 
 ## ライセンス
 

@@ -3,6 +3,8 @@
 //! CPU が対応しているかで決まる部分（[`Simd::effective`] など）と、表を作る
 //! [`Backend::prepare`] は、計算そのものと一緒に [`crate::service::derive`] にある。
 
+use crate::lang::t;
+
 /// 公開鍵の計算方法。高速化を別々に切り替えられる（既定は全部あり）。
 /// 全部なしにすると、ed25519-dalek で1鍵ずつ計算する高速化前と同じ計算になる
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -58,8 +60,8 @@ pub enum Simd {
 impl Mul {
     pub fn name(self) -> &'static str {
         match self {
-            Mul::Table => "テーブル",
-            Mul::ConstantTime => "定数時間",
+            Mul::Table => t!("テーブル", "table"),
+            Mul::ConstantTime => t!("定数時間", "constant time"),
         }
     }
 }
@@ -84,7 +86,7 @@ impl Simd {
             Simd::Avx512Ifma => "AVX-512 IFMA",
             Simd::Avx512 => "AVX-512",
             Simd::Avx2 => "AVX2",
-            Simd::Off => "なし",
+            Simd::Off => t!("なし", "none"),
         }
     }
 }

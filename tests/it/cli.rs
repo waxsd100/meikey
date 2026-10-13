@@ -75,6 +75,7 @@ mod tests {
     #[case::exists_both(&[PATTERN], &[KEY, PUB], "既に存在")]
     #[case::exists_private(&[PATTERN], &[KEY], "既に存在")]
     #[case::exists_pub(&[PATTERN], &[PUB], "既に存在")]
+    #[case::no_output_dir(&[PATTERN, "-o", "nodir/k"], &[], "保存できない")]
     fn fails_without_writing(
         #[case] args: &[&str],
         #[case] existing: &[&str],
@@ -96,8 +97,8 @@ mod tests {
     #[rstest]
     #[case::version(&["--version"], &["meikey 0."], &[])]
     #[case::short_version(&["-V"], &["meikey 0."], &[])]
-    #[case::help(&["--help"], &["Usage: meikey", "--constant-time", "--no-batch", "--simd <LEVEL>", "--no-memmem", "--bench <SECS>"], &[])]
-    #[case::short_help(&["-h"], &["Usage: meikey"], &[])]
+    #[case::help(&["--help"], &["使い方: meikey", "引数:", "オプション:", "ヘルプを表示する", "[既定: id_ed25519_meikey]", "--constant-time", "--no-batch", "--simd <LEVEL>", "--no-memmem", "--bench <SECS>"], &[])]
+    #[case::short_help(&["-h"], &["使い方: meikey"], &[])]
     // --bench は、どの組み合わせで測ったかを表示する
     #[case::bench_fast(
         &["wakokara", "--bench", "0.1", "-j", "1"],
@@ -186,11 +187,12 @@ mod tests {
         assert_eq!(out.status.success(), true, "{}", stderr(&out));
         let err = stderr(&out);
         let used = limit.effective();
-        assert_eq!(
-            err.lines().any(|l| l == row("SIMD", used.name())),
-            true,
-            "{err}"
-        );
+        // meikey は日本語で起動している（このテストのプロセスのロケールで決まる Simd::name とは違うことがある）
+        let name = match used {
+            Simd::Off => "なし",
+            s => s.name(),
+        };
+        assert_eq!(err.lines().any(|l| l == row("SIMD", name)), true, "{err}");
         // CPU の行には、SIMD ごとに対応していれば ✓、していなければ ✗
         let cpu = err
             .lines()
@@ -280,5 +282,94 @@ mod tests {
             let mode = metadata(dir.path().join(KEY)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "秘密鍵は所有者だけ読める");
         }
+    }
+
+    /// 表示の言語は OS のロケールで決まる: 日本語なら日本語、それ以外（英語・C・ほかの言語・未設定）は英語。
+    /// ヘルプ・引数の誤り・文字列の誤り・状態の表示・鍵の書き出しのどれも、その言語になる
+    /// （ロケールを環境変数で決める Unix だけ）
+    #[cfg(unix)]
+    #[rstest]
+    #[case::lc_all_ja(&[("LC_ALL", "ja_JP.UTF-8")], true)]
+    #[case::lang_ja(&[("LANG", "ja_JP.UTF-8")], true)]
+    #[case::lc_messages_ja(&[("LC_MESSAGES", "ja_JP.UTF-8")], true)]
+    #[case::language_ja(&[("LANGUAGE", "ja:en")], true)]
+    #[case::language_first(&[("LANGUAGE", "en_US"), ("LANG", "ja_JP.UTF-8")], false)]
+    #[case::lc_all_first(&[("LC_ALL", "en_US.UTF-8"), ("LANG", "ja_JP.UTF-8")], false)]
+    #[case::english(&[("LANG", "en_US.UTF-8")], false)]
+    #[case::c(&[("LC_ALL", "C")], false)]
+    #[case::other_language(&[("LANG", "fr_FR.UTF-8")], false)]
+    #[case::unset(&[], false)]
+    fn language_follows_locale(
+        #[case] locale: &[(&str, &str)],
+        #[case] japanese: bool,
+        dir: TempDir,
+    ) {
+        // 引数、日本語・英語での表示の一部、標準出力（でなければ標準エラー）に出るか
+        let probes: &[(&[&str], &str, &str, bool)] = &[
+            (&["--help"], "使い方: meikey", "Usage: meikey", true),
+            (&["--help"], "ヘルプを表示する", "Print help", true),
+            (
+                &["wa-ko"],
+                "エラー: 使えない文字",
+                "error: invalid character",
+                false,
+            ),
+            (
+                &["wako", "--nope"],
+                "エラー: 知らない引数",
+                "error: unexpected argument",
+                false,
+            ),
+            (
+                &["wako", "-j", "0"],
+                "1〜65535 の整数が必要",
+                "must be an integer from 1 to 65535",
+                false,
+            ),
+            (
+                &["wako", "--bench", "0.1", "-j", "1"],
+                "鍵/秒",
+                "keys/s",
+                true,
+            ),
+            (
+                &["wako", "--bench", "0.1", "-j", "1"],
+                "（大小文字の区別なし）",
+                "(case-insensitive)",
+                false,
+            ),
+            (
+                &["Me", "-j", "1", "-o", "k"],
+                "パスフレーズ  なし",
+                "Passphrase    none",
+                false,
+            ),
+            (
+                &["Me", "-o", "k"],
+                "既に存在: k",
+                "already exists: k",
+                false,
+            ),
+        ];
+        for &(args, ja, en, on_stdout) in probes {
+            let out = meikey_with_locale(dir.path(), args, locale);
+            let text = if on_stdout {
+                stdout(&out)
+            } else {
+                stderr(&out)
+            };
+            let (want, other) = if japanese { (ja, en) } else { (en, ja) };
+            assert_eq!(
+                text.contains(want),
+                true,
+                "{args:?} に {want:?} が無い: {text}"
+            );
+            assert_eq!(
+                text.contains(other),
+                false,
+                "{args:?} に {other:?} がある: {text}"
+            );
+        }
+        assert_eq!(dir.path().join("k.pub").exists(), true);
     }
 }

@@ -17,6 +17,7 @@
 //! - 1回の起動（カーネル）が `TARGET_LAUNCH`（0.2 秒）前後で終わるように、1スレッドの繰り返し回数を測りながら調整する。
 //!   画面をつないだ GPU（Windows のタイムアウト検出の対象）では、画面が固まらないよう `DISPLAY_LAUNCH`（0.05 秒）にする
 
+use crate::lang::{t, tf};
 use crate::model::key::VanityKey;
 use crate::model::search::{Outcome, SearchConfig, Stats};
 use crate::service::derive::comb::{entries_with_width, rows_cols};
@@ -89,7 +90,12 @@ impl GpuOptions {
 
 impl fmt::Display for GpuOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "W = {}・{} 鍵", self.width, self.batch)
+        f.write_str(&tf!(
+            "W = {}・{} 鍵",
+            "W = {}, {} keys",
+            self.width,
+            self.batch
+        ))
     }
 }
 
@@ -160,21 +166,51 @@ const MEASURE_NEEDLE: &[u8] = b"meikey";
 const ENTRY_WORDS: usize = 32;
 
 /// GPU を使えないときのエラー
-#[derive(Debug)]
-pub struct GpuError(String);
-
-impl fmt::Display for GpuError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for GpuError {}
-
-impl From<DriverError> for GpuError {
-    fn from(e: DriverError) -> Self {
-        GpuError(format!("CUDA: {e}"))
-    }
+#[derive(Debug, thiserror::Error)]
+pub enum GpuError {
+    /// CUDA のドライバ（libcuda・nvcuda.dll）が無い
+    #[error("{}", t!(
+        "CUDA のドライバが見つからない（NVIDIA の GPU とドライバが必要。libcuda / nvcuda.dll）",
+        "CUDA driver not found (an NVIDIA GPU and its driver are needed; libcuda / nvcuda.dll)"
+    ))]
+    DriverNotFound,
+    /// NVRTC（libnvrtc）が無い（埋め込む PTX を作るとき）
+    #[error("{}", t!("libnvrtc が見つからない", "libnvrtc not found"))]
+    NvrtcNotFound,
+    /// 表の幅・まとめる鍵の数が範囲の外
+    #[error("{}", tf!(
+        "表の幅は {}〜{}、まとめる鍵の数は {}〜{}（{}）",
+        "the table width must be {}-{} and the keys per batch {}-{} ({})",
+        WIDTHS.start(),
+        WIDTHS.end(),
+        BATCHES.start(),
+        BATCHES.end(),
+        .0
+    ))]
+    OutOfRange(GpuOptions),
+    /// 埋め込んだ PTX をドライバが読めず（ドライバが古い）、代わりにコンパイルする NVRTC も無い
+    #[error("{}", tf!(
+        "PTX を読めない（{}。ドライバを更新するか、NVRTC を入れて LD_LIBRARY_PATH / PATH に追加）",
+        "cannot load the PTX ({}; update the driver, or install NVRTC and add it to LD_LIBRARY_PATH / PATH)",
+        .0
+    ))]
+    PtxNotLoadable(#[source] DriverError),
+    /// 埋め込んでいない設定なのに、コンパイルする NVRTC が無い
+    #[error("{}", tf!(
+        "{} は埋め込んでいない設定なので NVRTC（libnvrtc）が要る（LD_LIBRARY_PATH / PATH に追加）",
+        "{} is not built in, so NVRTC (libnvrtc) is needed (add it to LD_LIBRARY_PATH / PATH)",
+        .0
+    ))]
+    NotEmbedded(GpuOptions),
+    /// 測る設定が1つも無い
+    #[error("{}", t!("測る設定が無い", "no settings to measure"))]
+    NoSettings,
+    /// カーネルをコンパイルできない（世代ごとの NVRTC のログ）
+    #[error("{}", tf!("カーネルのコンパイルに失敗:\n{}", "failed to compile the kernel:\n{}", .0))]
+    Compile(String),
+    /// CUDA の操作に失敗した
+    #[error("CUDA: {0}")]
+    Driver(#[from] DriverError),
 }
 
 /// GPU の情報
@@ -191,15 +227,15 @@ pub struct GpuInfo {
 
 impl fmt::Display for GpuInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
+        f.write_str(&tf!(
             "{}（sm_{}{}・SM {}・{:.0} GB）",
+            "{} (sm_{}{}, {} SMs, {:.0} GB)",
             self.name,
             self.compute.0,
             self.compute.1,
             self.sms,
             self.memory as f64 / 1e9
-        )
+        ))
     }
 }
 
@@ -236,13 +272,7 @@ impl Kernel {
         options: GpuOptions,
     ) -> Result<Kernel, GpuError> {
         if !WIDTHS.contains(&options.width) || !BATCHES.contains(&options.batch) {
-            return Err(GpuError(format!(
-                "表の幅は {}〜{}、まとめる鍵の数は {}〜{}（{options}）",
-                WIDTHS.start(),
-                WIDTHS.end(),
-                BATCHES.start(),
-                BATCHES.end()
-            )));
+            return Err(GpuError::OutOfRange(options));
         }
         let embedded =
             embedded_ptx(options).map(|ptx| ctx.load_module(cudarc::nvrtc::Ptx::from_src(ptx)));
@@ -252,14 +282,10 @@ impl Kernel {
             other => {
                 // SAFETY: ライブラリを読み込めるか試すだけ
                 if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
-                    return Err(GpuError(match other {
-                        Some(Err(e)) => format!(
-                            "PTX を読めない（{e}。ドライバを更新するか、NVRTC を入れて LD_LIBRARY_PATH / PATH に追加）"
-                        ),
-                        _ => format!(
-                            "{options} は埋め込んでいない設定なので NVRTC（libnvrtc）が要る（LD_LIBRARY_PATH / PATH に追加）"
-                        ),
-                    }));
+                    return Err(match other {
+                        Some(Err(e)) => GpuError::PtxNotLoadable(e),
+                        _ => GpuError::NotEmbedded(options),
+                    });
                 }
                 ctx.load_module(compile(info.compute, options)?)?
             }
@@ -363,31 +389,71 @@ impl Kernel {
     }
 }
 
-/// 設定 `candidates` を順に `measure` で読み込んで測り、一番速いものを返す。ほかのものは測ったらすぐ捨てる
-/// （GPU のメモリを空けるため）。読み込めない設定は飛ばし、全部だめなら最初のエラーを返す
+/// 設定ごとに測る周の数（前から1周、後ろから1周）。測っている間に GPU のクロックが上がっていっても、
+/// 前の周で先に測ったものが後の周では後になるので、順番による有利・不利が打ち消し合う
+const MEASURE_ROUNDS: usize = 2;
+
+/// 設定 `candidates` を全部 `load` で読み込んでから `measure` で測り、一番速いものを返す（ほかは捨てる）。
+/// 測る前に最初の設定を1回測って捨て（GPU を温める）、[`MEASURE_ROUNDS`] 周の平均で比べる。
+/// 読み込めない・測れない設定は飛ばし、全部だめなら最初のエラーを返す
 fn fastest<K>(
     candidates: &[GpuOptions],
-    mut measure: impl FnMut(GpuOptions) -> Result<(K, f64), GpuError>,
+    mut load: impl FnMut(GpuOptions) -> Result<K, GpuError>,
+    mut measure: impl FnMut(&K) -> Result<f64, GpuError>,
 ) -> Result<(K, Vec<(GpuOptions, f64)>), GpuError> {
-    let mut best: Option<(K, f64)> = None;
-    let mut results = Vec::new();
     let mut first_error = None;
+    // (設定, 読み込んだもの, 測った速度の合計。測れなければ None)
+    let mut loaded = Vec::new();
     for &options in candidates {
-        match measure(options) {
-            Ok((k, speed)) => {
-                results.push((options, speed));
-                if best.as_ref().is_none_or(|(_, s)| speed > *s) {
-                    best = Some((k, speed));
-                }
-            }
+        match load(options) {
+            Ok(k) => loaded.push((options, k, Some(0.0))),
             Err(e) => {
                 first_error.get_or_insert(e);
             }
         }
     }
+    if let Some((_, k, _)) = loaded.first() {
+        let _ = measure(k);
+    }
+    let n = loaded.len();
+    for round in 0..MEASURE_ROUNDS {
+        for step in 0..n {
+            let i = if round % 2 == 0 { step } else { n - 1 - step };
+            let (_, k, total) = &mut loaded[i];
+            if total.is_none() {
+                continue;
+            }
+            match measure(k) {
+                Ok(speed) => *total = total.map(|t| t + speed),
+                Err(e) => {
+                    *total = None;
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+    }
+    let results: Vec<(GpuOptions, f64)> = loaded
+        .iter()
+        .filter_map(|(o, _, t)| t.map(|t| (*o, t / MEASURE_ROUNDS as f64)))
+        .collect();
+    let best = results
+        .iter()
+        .enumerate()
+        .fold(None::<(usize, f64)>, |best, (i, &(_, speed))| match best {
+            Some((_, s)) if s >= speed => best,
+            _ => Some((i, speed)),
+        });
     match best {
-        Some((k, _)) => Ok((k, results)),
-        None => Err(first_error.unwrap_or_else(|| GpuError("測る設定が無い".into()))),
+        Some((i, _)) => {
+            let options = results[i].0;
+            let k = loaded
+                .into_iter()
+                .find(|(o, _, _)| *o == options)
+                .map(|(_, k, _)| k)
+                .expect("測れた設定は読み込んである");
+            Ok((k, results))
+        }
+        None => Err(first_error.unwrap_or(GpuError::NoSettings)),
     }
 }
 
@@ -403,14 +469,16 @@ pub struct Gpu {
 
 impl Gpu {
     /// `ordinal` 番目の GPU を使えるようにする（カーネルの読み込みと表の転送をする。
-    /// [`GpuSetting::Fastest`] なら、埋め込んだ設定を全部測ってから一番速いものを使う）
-    pub fn new(ordinal: usize, setting: GpuSetting) -> Result<Gpu, GpuError> {
+    /// [`GpuSetting::Fastest`] なら、埋め込んだ設定を全部測ってから一番速いものを使い、
+    /// 測り始める前に `on_measure` を呼ぶ）
+    pub fn new(
+        ordinal: usize,
+        setting: GpuSetting,
+        on_measure: impl FnOnce(),
+    ) -> Result<Gpu, GpuError> {
         // SAFETY: ライブラリを読み込めるか試すだけ
         if !unsafe { cudarc::driver::sys::is_culib_present() } {
-            return Err(GpuError(
-                "CUDA のドライバが見つからない（NVIDIA の GPU とドライバが必要。libcuda / nvcuda.dll）"
-                    .into(),
-            ));
+            return Err(GpuError::DriverNotFound);
         }
         let ctx = CudaContext::new(ordinal)?;
         let info = GpuInfo {
@@ -436,11 +504,12 @@ impl Gpu {
                 Chosen::Default,
             ),
             GpuSetting::Fastest => {
-                let (kernel, results) = fastest(&EMBEDDED, |options| {
-                    let k = Kernel::load(&ctx, &stream, &info, options)?;
-                    let speed = k.measure(&stream)?;
-                    Ok((k, speed))
-                })?;
+                on_measure();
+                let (kernel, results) = fastest(
+                    &EMBEDDED,
+                    |options| Kernel::load(&ctx, &stream, &info, options),
+                    |k| k.measure(&stream),
+                )?;
                 (kernel, Chosen::Fastest(results))
             }
         };
@@ -527,8 +596,12 @@ impl Gpu {
             // 一致しなければ GPU の計算か判定が間違っている（バグ）ので止める
             assert!(
                 p.is_match(&found.public_b64()),
-                "内部エラー: GPU（{}）の結果が ed25519-dalek・総当たりと不一致",
-                self.info.name
+                "{}",
+                tf!(
+                    "内部エラー: GPU（{}）の結果が ed25519-dalek・総当たりと不一致",
+                    "internal error: the result of the GPU ({}) differs from ed25519-dalek with a naive search",
+                    self.info.name
+                )
             );
         }
         found
@@ -537,35 +610,60 @@ impl Gpu {
 
 impl Searcher for Gpu {
     fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome {
-        self.search(config, on_progress)
-            .unwrap_or_else(|e| panic!("GPU での探索に失敗: {e}"))
+        self.search(config, on_progress).unwrap_or_else(|e| {
+            panic!(
+                "{}",
+                tf!("GPU での探索に失敗: {e}", "GPU search failed: {e}")
+            )
+        })
     }
 
     fn status(&self, _config: &SearchConfig) -> Vec<(&'static str, String)> {
         let (i, k) = (&self.info, &self.kernel);
         let how = match &self.chosen {
-            Chosen::Fastest(results) => format!("{} 通りを測って一番速いもの", results.len()),
-            Chosen::Fixed => "指定".into(),
-            Chosen::Default => "既定。--check では測らない".into(),
+            Chosen::Fastest(results) => tf!(
+                "{} 通りを測って一番速いもの",
+                "the fastest of {} measured",
+                results.len()
+            ),
+            Chosen::Fixed => t!("指定", "given").into(),
+            Chosen::Default => t!(
+                "既定。--check では測らない",
+                "default; not measured with --check"
+            )
+            .into(),
         };
         vec![
             ("GPU", i.name.clone()),
-            ("世代", format!("sm_{}{}", i.compute.0, i.compute.1)),
+            (
+                t!("世代", "Compute"),
+                format!("sm_{}{}", i.compute.0, i.compute.1),
+            ),
             ("SM", i.sms.to_string()),
-            ("メモリ", format!("{:.0} GB", i.memory as f64 / 1e9)),
-            ("設定", format!("{}（{how}）", k.options)),
+            (
+                t!("メモリ", "Memory"),
+                format!("{:.0} GB", i.memory as f64 / 1e9),
+            ),
+            (
+                t!("設定", "Setting"),
+                tf!("{}（{how}）", "{} ({how})", k.options),
+            ),
             // CPU と同時に探すとき、CPU の「並列」と並ぶので別の名前にする
             (
-                "グリッド",
-                format!(
+                t!("グリッド", "Grid"),
+                tf!(
                     "{} ブロック × {} スレッド × {} 鍵",
-                    k.grid, BLOCK, k.options.batch
+                    "{} blocks × {} threads × {} keys",
+                    k.grid,
+                    BLOCK,
+                    k.options.batch
                 ),
             ),
             (
-                "表",
-                format!(
+                t!("表", "Table"),
+                tf!(
                     "W = {}（{:.1} MB）",
+                    "W = {} ({:.1} MB)",
                     k.options.width,
                     k.options.table_bytes() as f64 / 1e6
                 ),
@@ -594,10 +692,7 @@ fn compile(compute: (i32, i32), options: GpuOptions) -> Result<cudarc::nvrtc::Pt
             Err(e) => errors.push(format!("{arch}: {}", compile_error(&e))),
         }
     }
-    Err(GpuError(format!(
-        "カーネルのコンパイルに失敗:\n{}",
-        errors.join("\n")
-    )))
+    Err(GpuError::Compile(errors.join("\n")))
 }
 
 /// NVRTC でカーネルを `arch`（sm_86・compute_75 など）向けの PTX にする
@@ -631,9 +726,10 @@ pub fn kernel_hash(options: GpuOptions) -> String {
 pub fn portable_ptx(options: GpuOptions) -> Result<String, GpuError> {
     // SAFETY: ライブラリを読み込めるか試すだけ
     if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
-        return Err(GpuError("libnvrtc が見つからない".into()));
+        return Err(GpuError::NvrtcNotFound);
     }
-    let ptx = compile_for(PTX_ARCH, options).map_err(|e| GpuError(compile_error(&e)))?;
+    let ptx = compile_for(PTX_ARCH, options)
+        .map_err(|e| GpuError::Compile(format!("{PTX_ARCH}: {}", compile_error(&e))))?;
     Ok(format!(
         // PTX は ASCII だけ（ptxas は ASCII 以外の文字を受け付けない）
         "// meikey: sha256(kernel.cu, W={}, BATCH={}) = {} (regenerate: cargo make ptx)\n{}",
@@ -696,8 +792,6 @@ mod tests {
     use sha2::{Digest, Sha512};
     use similar_asserts::assert_eq;
     use std::array::from_fn;
-    #[cfg(meikey_gpu_host)]
-    use std::sync::LazyLock;
     use std::thread::scope;
     use std::thread::sleep;
 
@@ -726,14 +820,18 @@ mod tests {
         );
         fn meikey_test_batch() -> u32;
         fn meikey_test_width() -> u32;
-        // host_wide.cpp（表の幅 16、まとめる鍵の数 32）
-        fn meikey_wide_test_derive_batch(
+    }
+
+    // build.rs が埋め込む設定ごとにコンパイルした版（接頭辞 meikey_w<幅>_b<数>_test_。既定の設定は meikey_test_）
+    #[cfg(meikey_gpu_host)]
+    unsafe extern "C" {
+        fn meikey_w12_b32_test_derive_batch(
             table: *const u32,
             key: *const u32,
             first: u64,
             out: *mut u8,
         );
-        fn meikey_wide_test_search(
+        fn meikey_w12_b32_test_search(
             nthreads: u64,
             table: *const u32,
             key: *const u32,
@@ -745,22 +843,170 @@ mod tests {
             stop_on_hit: u32,
             result: *mut u64,
         );
-        fn meikey_wide_test_batch() -> u32;
-        fn meikey_wide_test_width() -> u32;
+        fn meikey_w12_b32_test_batch() -> u32;
+        fn meikey_w12_b32_test_width() -> u32;
+        fn meikey_w14_b16_test_derive_batch(
+            table: *const u32,
+            key: *const u32,
+            first: u64,
+            out: *mut u8,
+        );
+        fn meikey_w14_b16_test_search(
+            nthreads: u64,
+            table: *const u32,
+            key: *const u32,
+            needle: *const u8,
+            needle_len: u32,
+            fold: u32,
+            base: u64,
+            iters: u32,
+            stop_on_hit: u32,
+            result: *mut u64,
+        );
+        fn meikey_w14_b16_test_batch() -> u32;
+        fn meikey_w14_b16_test_width() -> u32;
+        fn meikey_w14_b32_test_derive_batch(
+            table: *const u32,
+            key: *const u32,
+            first: u64,
+            out: *mut u8,
+        );
+        fn meikey_w14_b32_test_search(
+            nthreads: u64,
+            table: *const u32,
+            key: *const u32,
+            needle: *const u8,
+            needle_len: u32,
+            fold: u32,
+            base: u64,
+            iters: u32,
+            stop_on_hit: u32,
+            result: *mut u64,
+        );
+        fn meikey_w14_b32_test_batch() -> u32;
+        fn meikey_w14_b32_test_width() -> u32;
+        fn meikey_w16_b16_test_derive_batch(
+            table: *const u32,
+            key: *const u32,
+            first: u64,
+            out: *mut u8,
+        );
+        fn meikey_w16_b16_test_search(
+            nthreads: u64,
+            table: *const u32,
+            key: *const u32,
+            needle: *const u8,
+            needle_len: u32,
+            fold: u32,
+            base: u64,
+            iters: u32,
+            stop_on_hit: u32,
+            result: *mut u64,
+        );
+        fn meikey_w16_b16_test_batch() -> u32;
+        fn meikey_w16_b16_test_width() -> u32;
+        fn meikey_w16_b32_test_derive_batch(
+            table: *const u32,
+            key: *const u32,
+            first: u64,
+            out: *mut u8,
+        );
+        fn meikey_w16_b32_test_search(
+            nthreads: u64,
+            table: *const u32,
+            key: *const u32,
+            needle: *const u8,
+            needle_len: u32,
+            fold: u32,
+            base: u64,
+            iters: u32,
+            stop_on_hit: u32,
+            result: *mut u64,
+        );
+        fn meikey_w16_b32_test_batch() -> u32;
+        fn meikey_w16_b32_test_width() -> u32;
     }
 
-    /// host_wide.cpp の設定
     #[cfg(meikey_gpu_host)]
-    const WIDE: GpuOptions = GpuOptions {
-        width: 16,
-        batch: 32,
-    };
+    type DeriveFn = unsafe extern "C" fn(*const u32, *const u32, u64, *mut u8);
+    #[cfg(meikey_gpu_host)]
+    type SearchFn = unsafe extern "C" fn(
+        u64,
+        *const u32,
+        *const u32,
+        *const u8,
+        u32,
+        u32,
+        u64,
+        u32,
+        u32,
+        *mut u64,
+    );
 
+    /// 1つの設定で CPU 向けにコンパイルしたカーネル
     #[cfg(meikey_gpu_host)]
-    static TABLE: LazyLock<Vec<u32>> = LazyLock::new(|| table_words(DEFAULT_WIDTH));
+    struct HostKernel {
+        options: GpuOptions,
+        derive: DeriveFn,
+        search: SearchFn,
+        batch: unsafe extern "C" fn() -> u32,
+        width: unsafe extern "C" fn() -> u32,
+    }
 
+    /// [`EMBEDDED`] と同じ並び（options_match_kernel で確かめる）
     #[cfg(meikey_gpu_host)]
-    static WIDE_TABLE: LazyLock<Vec<u32>> = LazyLock::new(|| table_words(WIDE.width));
+    static HOSTS: [HostKernel; 6] = [
+        HostKernel {
+            options: GpuOptions::new(12, 16),
+            derive: meikey_test_derive_batch,
+            search: meikey_test_search,
+            batch: meikey_test_batch,
+            width: meikey_test_width,
+        },
+        HostKernel {
+            options: GpuOptions::new(12, 32),
+            derive: meikey_w12_b32_test_derive_batch,
+            search: meikey_w12_b32_test_search,
+            batch: meikey_w12_b32_test_batch,
+            width: meikey_w12_b32_test_width,
+        },
+        HostKernel {
+            options: GpuOptions::new(14, 16),
+            derive: meikey_w14_b16_test_derive_batch,
+            search: meikey_w14_b16_test_search,
+            batch: meikey_w14_b16_test_batch,
+            width: meikey_w14_b16_test_width,
+        },
+        HostKernel {
+            options: GpuOptions::new(14, 32),
+            derive: meikey_w14_b32_test_derive_batch,
+            search: meikey_w14_b32_test_search,
+            batch: meikey_w14_b32_test_batch,
+            width: meikey_w14_b32_test_width,
+        },
+        HostKernel {
+            options: GpuOptions::new(16, 16),
+            derive: meikey_w16_b16_test_derive_batch,
+            search: meikey_w16_b16_test_search,
+            batch: meikey_w16_b16_test_batch,
+            width: meikey_w16_b16_test_width,
+        },
+        HostKernel {
+            options: GpuOptions::new(16, 32),
+            derive: meikey_w16_b32_test_derive_batch,
+            search: meikey_w16_b32_test_search,
+            batch: meikey_w16_b32_test_batch,
+            width: meikey_w16_b32_test_width,
+        },
+    ];
+
+    /// 幅 `width` の表（幅ごとに1回だけ作る）
+    #[cfg(meikey_gpu_host)]
+    fn table(width: u32) -> &'static [u32] {
+        static TABLES: [std::sync::OnceLock<Vec<u32>>; 17] =
+            [const { std::sync::OnceLock::new() }; 17];
+        TABLES[width as usize].get_or_init(|| table_words(width))
+    }
 
     fn key_words(key: &[u8; 32]) -> [u32; 8] {
         from_fn(|i| u32::from_le_bytes(*key[4 * i..].first_chunk().unwrap()))
@@ -786,27 +1032,19 @@ mod tests {
     #[cfg(meikey_gpu_host)]
     #[rstest]
     fn options_match_kernel() {
+        assert_eq!(
+            HOSTS.iter().map(|h| h.options).collect::<Vec<_>>(),
+            EMBEDDED.to_vec()
+        );
+        for h in &HOSTS {
+            // SAFETY: 引数なしの関数
+            let (width, batch) = unsafe { ((h.width)(), (h.batch)()) };
+            assert_eq!(GpuOptions { width, batch }, h.options);
+        }
+        // meikey_test_* は既定の設定
         // SAFETY: 引数なしの関数
-        let (batch, width, wide_batch, wide_width) = unsafe {
-            (
-                meikey_test_batch(),
-                meikey_test_width(),
-                meikey_wide_test_batch(),
-                meikey_wide_test_width(),
-            )
-        };
-        assert_eq!(
-            GpuOptions { width, batch },
-            GpuOptions::default(),
-            "host.cpp は既定の設定"
-        );
-        assert_eq!(
-            GpuOptions {
-                width: wide_width,
-                batch: wide_batch
-            },
-            WIDE
-        );
+        let default = unsafe { GpuOptions::new(meikey_test_width(), meikey_test_batch()) };
+        assert_eq!(default, GpuOptions::default());
         // 既定の幅は CPU の表（comb::W）と同じ（下の digits_match_comb で comb の桁と比べるため）
         assert_eq!(DEFAULT_WIDTH as usize, crate::service::derive::comb::W);
     }
@@ -921,20 +1159,12 @@ mod tests {
         });
     }
 
-    /// まとめて計算した公開鍵は、同じシードから ed25519-dalek で作った鍵と一致する
-    /// （既定の設定と、host_wide.cpp の表の幅 16・まとめる鍵の数 32）
+    /// まとめて計算した公開鍵は、同じシードから ed25519-dalek で作った鍵と一致する（埋め込む設定すべて）
     #[cfg(meikey_gpu_host)]
     #[rstest]
-    fn derive_batch_matches_dalek(#[values(false, true)] wide: bool) {
-        let (table, batch, derive): (
-            &[u32],
-            u32,
-            unsafe extern "C" fn(*const u32, *const u32, u64, *mut u8),
-        ) = if wide {
-            (&WIDE_TABLE, WIDE.batch, meikey_wide_test_derive_batch)
-        } else {
-            (&TABLE, DEFAULT_BATCH, meikey_test_derive_batch)
-        };
+    fn derive_batch_matches_dalek(#[values(0, 1, 2, 3, 4, 5)] variant: usize) {
+        let h = &HOSTS[variant];
+        let (table, batch, derive) = (table(h.options.width), h.options.batch, h.derive);
         check(16, (any::<[u8; 32]>(), any::<u64>()), |(key, first)| {
             let first = first >> 8; // 足しても桁あふれしないように
             let mut got = vec![0u8; 32 * batch as usize];
@@ -1080,40 +1310,125 @@ mod tests {
         assert_eq!(embedded_ptx(GpuOptions::new(13, 16)), None);
     }
 
-    /// 測った中で一番速い設定を選び、ほかは捨てる。読み込めない設定は飛ばし、全部だめなら最初のエラー
+    /// 測った中で一番速い設定を選ぶ。読み込めない・測れない設定は飛ばし、全部だめなら最初のエラー。
+    /// `speeds[i]` は i 番目の設定の速さ（Err なら読み込めない）、`broken` は測ると失敗する設定
+    /// GpuError の日本語・英語の表示
     #[rstest]
-    #[case::picks_fastest(&[Ok(5.7), Ok(6.1), Ok(7.0), Ok(6.8)], Ok(2))]
-    #[case::first_of_ties(&[Ok(3.0), Ok(3.0)], Ok(0))]
-    #[case::skips_errors(&[Err("a"), Ok(1.0), Err("b"), Ok(2.0)], Ok(3))]
-    #[case::all_errors(&[Err("a"), Err("b")], Err("a"))]
-    #[case::nothing(&[], Err("測る設定が無い"))]
+    #[case::driver(
+        GpuError::DriverNotFound,
+        "CUDA のドライバが見つからない（NVIDIA の GPU とドライバが必要。libcuda / nvcuda.dll）",
+        "CUDA driver not found (an NVIDIA GPU and its driver are needed; libcuda / nvcuda.dll)"
+    )]
+    #[case::nvrtc(
+        GpuError::NvrtcNotFound,
+        "libnvrtc が見つからない",
+        "libnvrtc not found"
+    )]
+    #[case::range(
+        GpuError::OutOfRange(GpuOptions::new(17, 32)),
+        "表の幅は 2〜16、まとめる鍵の数は 1〜64（W = 17・32 鍵）",
+        "the table width must be 2-16 and the keys per batch 1-64 (W = 17, 32 keys)"
+    )]
+    #[case::not_embedded(
+        GpuError::NotEmbedded(GpuOptions::new(13, 8)),
+        "W = 13・8 鍵 は埋め込んでいない設定なので NVRTC（libnvrtc）が要る（LD_LIBRARY_PATH / PATH に追加）",
+        "W = 13, 8 keys is not built in, so NVRTC (libnvrtc) is needed (add it to LD_LIBRARY_PATH / PATH)"
+    )]
+    #[case::no_settings(GpuError::NoSettings, "測る設定が無い", "no settings to measure")]
+    #[case::compile(GpuError::Compile("sm_90: log".into()), "カーネルのコンパイルに失敗:\nsm_90: log", "failed to compile the kernel:\nsm_90: log")]
+    fn gpu_error_display(#[case] e: GpuError, #[case] ja: &str, #[case] en: &str) {
+        assert_eq!(e.to_string(), ja);
+        crate::lang::set(crate::lang::Lang::En);
+        assert_eq!(e.to_string(), en);
+    }
+
+    #[rstest]
+    #[case::picks_fastest(&[Ok(5.7), Ok(6.1), Ok(7.0), Ok(6.8)], &[], Ok(2))]
+    #[case::first_of_ties(&[Ok(3.0), Ok(3.0)], &[], Ok(0))]
+    #[case::skips_load_errors(&[Err("a"), Ok(1.0), Err("b"), Ok(2.0)], &[], Ok(3))]
+    #[case::skips_measure_errors(&[Ok(1.0), Ok(9.0), Ok(2.0)], &[1], Ok(2))]
+    #[case::all_load_errors(&[Err("a"), Err("b")], &[], Err(Some("a")))]
+    #[case::all_measure_errors(&[Ok(1.0)], &[0], Err(Some("測れない")))]
+    #[case::nothing(&[], &[], Err(None))]
     fn fastest_picks_the_fastest(
         #[case] speeds: &[Result<f64, &str>],
-        #[case] want: Result<usize, &str>,
+        #[case] broken: &[usize],
+        // Err(Some(ログ)) は最初のエラー（Compile）、Err(None) は測る設定が無い
+        #[case] want: Result<usize, Option<&str>>,
     ) {
         let candidates: Vec<GpuOptions> = (0..speeds.len() as u32)
             .map(|i| GpuOptions::new(i + 2, 1))
             .collect();
-        let mut measured = Vec::new();
-        let got = fastest(&candidates, |o| {
-            let i = (o.width - 2) as usize;
-            measured.push(i);
-            speeds[i].map(|s| (i, s)).map_err(|e| GpuError(e.into()))
-        });
-        assert_eq!(
-            measured,
-            (0..speeds.len()).collect::<Vec<_>>(),
-            "全部を順に測る"
+        let got = fastest(
+            &candidates,
+            |o| {
+                let i = (o.width - 2) as usize;
+                speeds[i]
+                    .map(|_| i)
+                    .map_err(|e| GpuError::Compile(e.into()))
+            },
+            |&i| match broken.contains(&i) {
+                true => Err(GpuError::Compile("測れない".into())),
+                false => Ok(speeds[i].unwrap()),
+            },
         );
         match (got, want) {
             (Ok((k, results)), Ok(w)) => {
                 assert_eq!(k, w);
-                let ok: Vec<f64> = speeds.iter().filter_map(|s| s.ok()).collect();
-                assert_eq!(results.iter().map(|r| r.1).collect::<Vec<_>>(), ok);
+                let ok: Vec<(GpuOptions, f64)> = (0..speeds.len())
+                    .filter(|i| speeds[*i].is_ok() && !broken.contains(i))
+                    .map(|i| (candidates[i], speeds[i].unwrap()))
+                    .collect();
+                assert_eq!(results, ok, "平均は同じ速さのまま");
             }
-            (Err(e), Err(w)) => assert_eq!(e.to_string(), w),
+            (Err(e), Err(Some(w))) => {
+                assert_eq!(
+                    matches!(&e, GpuError::Compile(log) if log == w),
+                    true,
+                    "{e:?}"
+                )
+            }
+            (Err(e), Err(None)) => {
+                assert_eq!(matches!(e, GpuError::NoSettings), true, "{e:?}")
+            }
             (got, want) => panic!("{:?} ではなく {want:?}", got.map(|(k, _)| k)),
         }
+    }
+
+    /// 測るたびに GPU が速くなっていっても（クロックが上がっていく途中）、前から・後ろからの2周の平均で
+    /// 比べるので、本当に速い設定を選ぶ（前からの1周だけなら、後で測った遅い設定を選んでしまう）。
+    /// 最初の設定を1回測って捨ててから、2周測る
+    #[rstest]
+    fn fastest_is_not_fooled_by_warming_up() {
+        let base = [1.0, 0.97, 0.95];
+        let candidates: Vec<GpuOptions> = (0..3).map(|i| GpuOptions::new(i + 2, 1)).collect();
+        let mut calls = Vec::new();
+        let (k, results) = fastest(
+            &candidates,
+            |o| Ok((o.width - 2) as usize),
+            |&i| {
+                calls.push(i);
+                // 測るたびに 5% ずつ速くなる
+                Ok(base[i] * (1.0 + 0.05 * calls.len() as f64))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls,
+            vec![0, 0, 1, 2, 2, 1, 0],
+            "温めてから、前から1周・後ろから1周"
+        );
+        assert_eq!(k, 0);
+        let forward_only = (0..3).max_by(|&a, &b| {
+            let s = |i: usize| base[i] * (1.0 + 0.05 * (i + 2) as f64);
+            s(a).total_cmp(&s(b))
+        });
+        assert_eq!(
+            forward_only,
+            Some(2),
+            "前からの1周だけなら遅い設定を選んでしまう例"
+        );
+        assert_eq!(results.len(), 3);
     }
 
     // ---- NVRTC・GPU があるときだけ（無ければ飛ばす。MEIKEY_REQUIRE_SIMD に nvrtc・cuda があれば失敗させる） ----
@@ -1132,7 +1447,7 @@ mod tests {
             unsafe { driver_present() } && CudaContext::device_count().is_ok_and(|n| n > 0);
         available("cuda", present.then_some(()))?;
         Some(
-            Gpu::new(0, GpuSetting::Fixed(GpuOptions::default()))
+            Gpu::new(0, GpuSetting::Fixed(GpuOptions::default()), || {})
                 .expect("GPU を使えるようにできる"),
         )
     }
@@ -1202,7 +1517,10 @@ mod tests {
         if gpu.is_none() {
             return;
         }
-        let gpu = Gpu::new(0, GpuSetting::Fastest).expect("GPU を使えるようにできる");
+        let mut notified = false;
+        let gpu =
+            Gpu::new(0, GpuSetting::Fastest, || notified = true).expect("GPU を使えるようにできる");
+        assert_eq!(notified, true, "測る前に知らせる");
         let Chosen::Fastest(results) = &gpu.chosen else {
             panic!("測っていない");
         };
@@ -1288,27 +1606,12 @@ mod tests {
 
     /// カーネル全体（CPU で真似たもの）: 見つけた通し番号のシードの鍵は文字列を含み、
     /// それより前の番号の鍵は含まない（1スレッドなら最初の当たりを返す）。stop_on_hit なら途中で止まる
-    /// （既定の設定と、host_wide.cpp の表の幅 16・まとめる鍵の数 32）
+    /// （埋め込む設定すべて）
     #[cfg(meikey_gpu_host)]
     #[rstest]
-    fn search_finds_first_hit(#[values(false, true)] wide: bool) {
-        type Search = unsafe extern "C" fn(
-            u64,
-            *const u32,
-            *const u32,
-            *const u8,
-            u32,
-            u32,
-            u64,
-            u32,
-            u32,
-            *mut u64,
-        );
-        let (table, search): (&[u32], Search) = if wide {
-            (&WIDE_TABLE, meikey_wide_test_search)
-        } else {
-            (&TABLE, meikey_test_search)
-        };
+    fn search_finds_first_hit(#[values(0, 1, 2, 3, 4, 5)] variant: usize) {
+        let h = &HOSTS[variant];
+        let (table, search) = (table(h.options.width), h.search);
         let key: [u8; 32] = from_fn(|i| i as u8 * 7);
         let p = Pattern::new("ab", false).unwrap();
         let needle = b"ab";

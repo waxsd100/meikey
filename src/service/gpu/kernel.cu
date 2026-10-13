@@ -661,10 +661,14 @@ extern "C" __global__ void meikey_derive(const u32* __restrict__ table, const u3
 #else
 
 // ---- テスト用（CPU でコンパイルしたときだけ。service/gpu.rs のテストから呼ぶ） ----
-// 名前は meikey_test_*。W・MEIKEY_BATCH を変えた版も並べてコンパイルできるよう、host_wide.cpp では名前を変える
-#ifndef TEST_FN
-#define TEST_FN(name) meikey_test_##name
+// 名前は MEIKEY_TEST_PREFIX（既定 meikey_test_）+ 関数名。build.rs は埋め込む設定ごとに、W・MEIKEY_BATCH と
+// 接頭辞を変えて並べてコンパイルする
+#ifndef MEIKEY_TEST_PREFIX
+#define MEIKEY_TEST_PREFIX meikey_test_
 #endif
+#define MEIKEY_CAT2(a, b) a##b
+#define MEIKEY_CAT(a, b) MEIKEY_CAT2(a, b)
+#define TEST_FN(name) MEIKEY_CAT(MEIKEY_TEST_PREFIX, name)
 
 extern "C" void TEST_FN(seed)(const u32 key[8], u64 counter, u8 out[32]) { chacha20_seed(key, counter, out); }
 
