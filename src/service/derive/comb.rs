@@ -20,6 +20,7 @@ pub(crate) const ROWS: usize = rows_cols(W).0;
 /// 1行のエントリ数（0..=2^(W-1)。負の桁は符号反転で表す）
 pub(crate) const COLS: usize = (1 << (W - 1)) + 1;
 /// 桁の絶対値の上限 2^(W-1)
+#[cfg(test)]
 const HALF: i32 = 1 << (W - 1);
 
 // 桁は i16 に入れる。最上位桁は繰り上げないので、m（251 ビット）の残りのビットに
@@ -318,6 +319,14 @@ fn build_rows(w: usize) -> Vec<Niels> {
     entries
 }
 
+/// 幅 `w` の表（[`build_rows`]）の各エントリの `[y+x, y-x, 2dxy]`（行ごとに並べる。定数時間の倍算の表を作るのに使う）
+pub(crate) fn entries(w: usize) -> Vec<[Fe; 3]> {
+    build_rows(w)
+        .iter()
+        .map(|n| [n.ypx, n.ymx, n.xy2d])
+        .collect()
+}
+
 /// 幅 `w` の表（[`build_rows`] と同じ点）の `i` 行目の各エントリの `[y+x, y-x, 2dxy]` を、前から順に
 /// `f(k, エントリ)` に渡す（GPU 用。GPU は表の幅を選べる）。行ごとに独立して作れるので、行を並列に作れる。
 /// W = 20 で表が数百 MB になるので、点は [`ROW_CHUNK`] 個ずつ作ってアフィンにし、行全体は持たない
@@ -377,6 +386,15 @@ pub(crate) fn is_clamped(s: &[u8; 32]) -> bool {
 /// 下の桁から W ビットずつ取り出して繰り上がりを足し、2^(W-1) 以上なら 2^W を引いて上へ繰り上げる
 #[inline(always)]
 pub(crate) fn signed_digits(s: &[u8; 32]) -> [i16; ROWS] {
+    signed_digits_w::<W, ROWS>(s)
+}
+
+/// [`signed_digits`] を幅 `WD`（行数 `R` = ceil(251 / `WD`)）で。分岐は桁の位置だけで決まり、
+/// スカラーの値によらない（定数時間の倍算 [`crate::service::derive::ct`] でも使う）
+#[inline(always)]
+pub(crate) fn signed_digits_w<const WD: usize, const R: usize>(s: &[u8; 32]) -> [i16; R] {
+    const { assert!(WD >= 2 && WD <= 15 && R == M_BITS.div_ceil(WD)) };
+    let half = 1i32 << (WD - 1);
     debug_assert!(is_clamped(s), "クランプしていないスカラー");
     // m = s の 3〜253 ビット目。5語目は、最後の桁が4語目からはみ出して読むときの 0
     let mut words = [0u64; 5];
@@ -387,21 +405,21 @@ pub(crate) fn signed_digits(s: &[u8; 32]) -> [i16; ROWS] {
         words[i] = words[i] >> 3 | words[i + 1] << 61;
     }
     words[3] &= (1 << (M_BITS - 192)) - 1;
-    let mut out = [0i16; ROWS];
+    let mut out = [0i16; R];
     let mut carry = 0i32;
     for (i, o) in out.iter_mut().enumerate() {
-        let (q, r) = (i * W / 64, i * W % 64);
+        let (q, r) = (i * WD / 64, i * WD % 64);
         let mut bits = words[q] >> r;
-        if r + W > 64 {
+        if r + WD > 64 {
             bits |= words[q + 1] << (64 - r);
         }
-        let v = (bits & ((1 << W) - 1)) as i32 + carry;
-        if i == ROWS - 1 {
-            // 最上位桁は繰り上げない（ファイル先頭の assert により 2^(W-1) 以下）
+        let v = (bits & ((1 << WD) - 1)) as i32 + carry;
+        if i == R - 1 {
+            // 最上位桁は繰り上げない（rows_cols のとおり、251 は素数なので 2^(WD-1) 以下）
             *o = v as i16;
         } else {
-            carry = (v + HALF) >> W;
-            *o = (v - (carry << W)) as i16;
+            carry = (v + half) >> WD;
+            *o = (v - (carry << WD)) as i16;
         }
     }
     out

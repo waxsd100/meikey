@@ -16,7 +16,8 @@
 //! 体演算以外（このファイル）は2通りで共通:
 //! - 表: 1エントリ = 64 ビット × 16 ワード（128 バイト、キャッシュライン2本）。y+x, y-x, 2dxy を
 //!   5 ワードずつ（[`Field8::pack`] の形）並べ、最後の1ワードは空き
-//! - 表引き: `vpgatherqq` で8鍵ぶんの同じワードを1命令で集める（1エントリ 15 命令）
+//! - 表引き: 8鍵ぶんのエントリを読み込み、8×8 の転置でワードごとのレジスタにする。定数時間の倍算（[`ct`]、
+//!   `*_ct` の関数）では、行の全エントリを読み込み、`vpermt2q` で各レーンの桁のエントリを選ぶ（[`CtTable8`]）
 //! - 符号反転: 桁の符号ビットをそのままマスクレジスタ（k）にして、負の桁のレーンだけ y+x と y-x を
 //!   入れ替え（`vpblendmq`）、2dxy を反転する（マスク付きの `vpsubq`）
 //!
@@ -36,6 +37,7 @@ pub mod f;
 pub mod ifma;
 
 use crate::service::derive::comb::{COLS, Extended, ROWS, Table, signed_digits};
+use crate::service::derive::ct;
 use crate::service::derive::field::Fe;
 use std::arch::x86_64::*;
 
@@ -172,41 +174,199 @@ unsafe fn add_niels<F: Field8, const WITH_T: bool>(p: &mut Ext8<F>, q: &Niels8<F
 pub(crate) struct Entry([u64; 16]);
 
 /// [`Table`] と同じ値を [`Field8::pack`] した形で持つテーブル（W = 12 で約 5.8MB）
-pub(crate) struct Table8(Box<[Entry]>);
+pub(crate) struct Table8 {
+    entries: Box<[Entry]>,
+    /// 1行のエントリ数
+    cols: usize,
+}
 
 impl Table8 {
     pub(crate) fn build<F: Field8>() -> Table8 {
         // 51 ビット版は変換にだけ使って捨てる（AVX-512 を使うときは要らないので、共有のものは作らない）
         let table = Table::build();
-        let mut entries = vec![Entry([0; 16]); ROWS * COLS];
-        for (n, e) in entries.iter_mut().enumerate() {
-            for (f, fe) in table.entry(n / COLS, n % COLS).into_iter().enumerate() {
-                e.0[5 * f..5 * f + 5].copy_from_slice(&F::pack(fe.reduce()));
-            }
-        }
-        Table8(entries.into_boxed_slice())
+        let entries = (0..ROWS * COLS).map(|n| table.entry(n / COLS, n % COLS));
+        Table8::pack::<F>(entries, COLS)
+    }
+
+    fn pack<F: Field8>(entries: impl Iterator<Item = [Fe; 3]>, cols: usize) -> Table8 {
+        let entries = entries
+            .map(|entry| {
+                let mut e = Entry([0; 16]);
+                for (f, fe) in entry.into_iter().enumerate() {
+                    e.0[5 * f..5 * f + 5].copy_from_slice(&F::pack(fe.reduce()));
+                }
+                e
+            })
+            .collect();
+        Table8 { entries, cols }
     }
 
     #[inline(always)]
-    fn row(&self, i: usize) -> &[Entry; COLS] {
-        &self.0.as_chunks::<COLS>().0[i]
+    fn row(&self, i: usize) -> &[Entry] {
+        &self.entries[i * self.cols..(i + 1) * self.cols]
     }
 }
 
-/// 8鍵ぶんの表の値 `d[k] * 2^(W*i) * B` を集め、レーンにそろえる（負の桁は符号を反転する）
+/// 8鍵ぶんの表の値 `d[k] * 2^(W*i) * B` を集め、レーンにそろえる（負の桁は符号を反転する）。
+/// 8つのエントリをそれぞれ 512 ビット × 2 で読み、8×8 の転置でワードごとのレジスタにする
+/// （`vpgatherqq` で 15 回集めるより速かった）
 #[inline(always)]
-unsafe fn gather<F: Field8>(row: &[Entry; COLS], d: &[i16; 8]) -> Niels8<F> {
+unsafe fn gather<F: Field8>(row: &[Entry], d: &[i16; 8]) -> Niels8<F> {
+    unsafe {
+        // |d| ≤ 2^(W-1) < COLS なので行の中
+        let e: [&Entry; 8] = std::array::from_fn(|k| &row[usize::from(d[k].unsigned_abs())]);
+        let mut w = [_mm512_setzero_si512(); 15];
+        for half in 0..2 {
+            let r: [__m512i; 8] =
+                std::array::from_fn(|k| _mm512_load_si512(e[k].0[8 * half..].as_ptr().cast()));
+            let t = transpose8(&r);
+            for q in 0..8.min(15 - 8 * half) {
+                w[8 * half + q] = t[q];
+            }
+        }
+        // 桁の符号ビットがそのまま「負のレーン」のマスクになる
+        let d = _mm512_cvtepi16_epi64(_mm_loadu_si128(d.as_ptr().cast()));
+        let neg = _mm512_cmplt_epi64_mask(d, _mm512_setzero_si512());
+        niels(&w, neg)
+    }
+}
+
+/// 8×8 の 64 ビットの転置（`r[k]` の `q` 番目のワードが、結果の `q` 番目のレジスタのレーン `k` になる）
+#[inline(always)]
+unsafe fn transpose8(r: &[__m512i; 8]) -> [__m512i; 8] {
+    unsafe {
+        let t: [__m512i; 8] = std::array::from_fn(|i| {
+            let (a, b) = (r[i / 2 * 2], r[i / 2 * 2 + 1]);
+            match i % 2 {
+                0 => _mm512_unpacklo_epi64(a, b),
+                _ => _mm512_unpackhi_epi64(a, b),
+            }
+        });
+        // t[0..8] = lo(r0,r1), hi(r0,r1), lo(r2,r3), hi(r2,r3), ...
+        let u = [
+            _mm512_shuffle_i64x2::<0x88>(t[0], t[2]),
+            _mm512_shuffle_i64x2::<0x88>(t[1], t[3]),
+            _mm512_shuffle_i64x2::<0xdd>(t[0], t[2]),
+            _mm512_shuffle_i64x2::<0xdd>(t[1], t[3]),
+            _mm512_shuffle_i64x2::<0x88>(t[4], t[6]),
+            _mm512_shuffle_i64x2::<0x88>(t[5], t[7]),
+            _mm512_shuffle_i64x2::<0xdd>(t[4], t[6]),
+            _mm512_shuffle_i64x2::<0xdd>(t[5], t[7]),
+        ];
+        [
+            _mm512_shuffle_i64x2::<0x88>(u[0], u[4]),
+            _mm512_shuffle_i64x2::<0x88>(u[1], u[5]),
+            _mm512_shuffle_i64x2::<0x88>(u[2], u[6]),
+            _mm512_shuffle_i64x2::<0x88>(u[3], u[7]),
+            _mm512_shuffle_i64x2::<0xdd>(u[0], u[4]),
+            _mm512_shuffle_i64x2::<0xdd>(u[1], u[5]),
+            _mm512_shuffle_i64x2::<0xdd>(u[2], u[6]),
+            _mm512_shuffle_i64x2::<0xdd>(u[3], u[7]),
+        ]
+    }
+}
+
+/// 定数時間の倍算（[`ct`]）の表。並べ替え命令で選べるよう、行・ワードごとに 1 番目以降のエントリの
+/// 同じワードを 16 個ずつ（512 ビットのレジスタ2本分）並べ、0 番目のエントリは別に持つ
+pub(crate) struct CtTable8 {
+    /// [行][ワード q（15）][16 個の組 c][前半・後半] の 8 ワード。組 c の j 番目は 1 + 16c + j 番目のエントリ
+    perm: Box<[Words8]>,
+    /// [行] の 0 番目のエントリの 15 ワード（最上位の行以外は単位元）
+    zero: Box<[[u64; 16]]>,
+    /// 1行の 16 個の組の数
+    groups: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Words8([u64; 8]);
+
+impl CtTable8 {
+    /// 幅 `w` の表（`w` は 4 以上。1 番目以降のエントリが 2^(w-1) 個で、16 個の組にそろえる）
+    pub(crate) fn build<F: Field8>(w: usize) -> CtTable8 {
+        let cols = ct::cols(w);
+        let groups = (cols - 1).div_ceil(16);
+        assert!(groups <= 16, "表引きのマスクは 16 組まで");
+        let entries: Vec<[u64; 15]> = ct::table(w)
+            .into_iter()
+            .map(|entry| {
+                let mut words = [0u64; 15];
+                for (f, fe) in entry.into_iter().enumerate() {
+                    words[5 * f..5 * f + 5].copy_from_slice(&F::pack(fe.reduce()));
+                }
+                words
+            })
+            .collect();
+        let mut perm = Vec::new();
+        let mut zero = Vec::new();
+        for row in entries.chunks(cols) {
+            let mut z = [0u64; 16];
+            z[..15].copy_from_slice(&row[0]);
+            zero.push(z);
+            for q in 0..15 {
+                for c in 0..groups {
+                    for half in 0..2 {
+                        perm.push(Words8(std::array::from_fn(|l| {
+                            row.get(1 + 16 * c + 8 * half + l).map_or(0, |e| e[q])
+                        })));
+                    }
+                }
+            }
+        }
+        CtTable8 {
+            perm: perm.into_boxed_slice(),
+            zero: zero.into_boxed_slice(),
+            groups,
+        }
+    }
+}
+
+/// [`gather`] の定数時間版: `i` 行目の全エントリを読み込み、`vpermt2q`（2本のレジスタの 16 個から、
+/// レーンごとの番号で1つを選ぶ）で |d| - 1 番目を選ぶ。16 個の組が複数あれば全部の組で選び、
+/// 番号の組と一致したレーンにだけ移す。桁が 0 のレーンは 0 番目のエントリにする。
+/// 読む場所と命令の列は桁の値によらない
+#[inline(always)]
+unsafe fn select_ct<F: Field8>(table: &CtTable8, i: usize, d: &[i16; 8]) -> Niels8<F> {
     unsafe {
         let d = _mm512_cvtepi16_epi64(_mm_loadu_si128(d.as_ptr().cast()));
-        // 桁の符号ビットがそのまま「負のレーン」のマスクになる
         let neg = _mm512_cmplt_epi64_mask(d, _mm512_setzero_si512());
-        // エントリの番号 × 16 ワード（gather の位置は 8 バイト単位）。|d| ≤ 2^(W-1) < COLS なので行の中
-        let idx = _mm512_slli_epi64::<4>(_mm512_abs_epi64(d));
-        let base: *const i64 = row.as_ptr().cast();
+        let abs = _mm512_abs_epi64(d);
+        let is_zero = _mm512_cmpeq_epi64_mask(abs, _mm512_setzero_si512());
+        // vpermt2q は番号の下 4 ビットだけを使う。桁が 0 のレーンの番号（-1）は、最後に上書きする
+        let idx = _mm512_sub_epi64(abs, _mm512_set1_epi64(1));
+        let group = _mm512_srli_epi64::<4>(idx);
+        let groups = table.groups;
+        let mut in_group = [0 as __mmask8; 16];
+        for (c, k) in in_group.iter_mut().enumerate().take(groups) {
+            *k = _mm512_cmpeq_epi64_mask(group, _mm512_set1_epi64(c as i64));
+        }
+        let zero = &table.zero[i];
+        let words = &table.perm[i * 15 * groups * 2..(i + 1) * 15 * groups * 2];
         let mut w = [_mm512_setzero_si512(); 15];
         for q in 0..15 {
-            w[q] = _mm512_i64gather_epi64::<8>(idx, base.add(q));
+            let g = &words[q * groups * 2..(q + 1) * groups * 2];
+            let pick = |c: usize| {
+                let (lo, hi) = (g[2 * c].0.as_ptr(), g[2 * c + 1].0.as_ptr());
+                _mm512_permutex2var_epi64(
+                    _mm512_load_si512(lo.cast()),
+                    idx,
+                    _mm512_load_si512(hi.cast()),
+                )
+            };
+            let mut r = pick(0);
+            for c in 1..groups {
+                r = _mm512_mask_mov_epi64(r, in_group[c], pick(c));
+            }
+            w[q] = _mm512_mask_set1_epi64(r, is_zero, zero[q] as i64);
         }
+        niels(&w, neg)
+    }
+}
+
+/// 集めた 15 ワード（y+x, y-x, 2dxy の 5 ワードずつ）を体の元に戻し、マスク `neg` のレーンの符号を反転する
+#[inline(always)]
+unsafe fn niels<F: Field8>(w: &[__m512i; 15], neg: __mmask8) -> Niels8<F> {
+    unsafe {
         let field = |r: usize| F::unpack(w[r..].first_chunk().expect("15 ワードのうち 5 個"));
         let (ypx, ymx, xy2d) = (field(0), field(5), field(10));
         // -P = (-x, y): y+x と y-x を入れ替え、2dxy を反転する
@@ -220,7 +380,7 @@ unsafe fn gather<F: Field8>(row: &[Entry; COLS], d: &[i16; 8]) -> Niels8<F> {
 
 /// 8鍵ぶんの表の値（1エントリ = キャッシュライン2本）を L1 に読み込み始める
 #[inline(always)]
-unsafe fn prefetch(row: &[Entry; COLS], d: &[i16; 8]) {
+unsafe fn prefetch(row: &[Entry], d: &[i16; 8]) {
     unsafe {
         for &x in d {
             let p: *const i8 = (&raw const row[usize::from(x.unsigned_abs())]).cast();
@@ -315,12 +475,7 @@ unsafe fn mul_base_batch<F: Field8, const N: usize>(
     }
 }
 
-/// [`mul_base_batch`] に続けて、1/Z と y の圧縮形式まで8鍵ずつ計算する（`N` は 8 の倍数）。
-/// `ys[k]` は k 番目の公開鍵の圧縮形式で x の符号のビットを 0 にしたもの、`xs[k]`・`zinvs[k]` は
-/// 符号を後から計算するための X と 1/Z。
-///
-/// 1/Z は Montgomery の一括逆元をレーンごとに（8本の鎖を並べて）する: 組を順に掛けた積の逆元を
-/// 1回だけ計算し、後ろの組から 1/Z を取り出す
+/// [`mul_base_batch`] に続けて、1/Z と y の圧縮形式まで8鍵ずつ計算する（`N` は 8 の倍数。[`compress`]）
 #[inline(always)]
 unsafe fn mul_base_compress<F: Field8, const N: usize>(
     table: &Table8,
@@ -332,10 +487,30 @@ unsafe fn mul_base_compress<F: Field8, const N: usize>(
     unsafe {
         let (mut acc, last) = mul_base_until_last::<F, N>(table, scalars);
         let row = table.row(ROWS - 1);
+        for (p, d) in acc.iter_mut().zip(last.as_chunks::<8>().0) {
+            add_niels::<F, false>(p, &gather(row, d));
+        }
+        compress::<F, N>(&acc, ys, xs, zinvs);
+    }
+}
+
+/// 8鍵ずつの組の点から、1/Z と y の圧縮形式を計算する。
+/// `ys[k]` は k 番目の公開鍵の圧縮形式で x の符号のビットを 0 にしたもの、`xs[k]`・`zinvs[k]` は
+/// 符号を後から計算するための X と 1/Z。
+///
+/// 1/Z は Montgomery の一括逆元をレーンごとに（8本の鎖を並べて）する: 組を順に掛けた積の逆元を
+/// 1回だけ計算し、後ろの組から 1/Z を取り出す
+#[inline(always)]
+unsafe fn compress<F: Field8, const N: usize>(
+    acc: &[Ext8<F>],
+    ys: &mut [[u8; 32]; N],
+    xs: &mut [Fe; N],
+    zinvs: &mut [Fe; N],
+) {
+    unsafe {
         // prefix[g] = 0〜g 番目の組の Z の積（レーンごと）
         let mut prefix: Vec<F> = Vec::with_capacity(N / 8);
-        for (g, (p, d)) in acc.iter_mut().zip(last.as_chunks::<8>().0).enumerate() {
-            add_niels::<F, false>(p, &gather(row, d));
+        for (g, p) in acc.iter().enumerate() {
             prefix.push(match g {
                 0 => p.z,
                 _ => prefix[g - 1].mul(&p.z),
@@ -358,6 +533,77 @@ unsafe fn mul_base_compress<F: Field8, const N: usize>(
                 zinvs[8 * g + k] = zi[k];
             }
         }
+    }
+}
+
+/// 定数時間の倍算（[`ct`]。幅 `W`、行数 `R`）で、8鍵ずつの組の点を最後の加算まで（T は計算しない）
+#[inline(always)]
+unsafe fn points_ct<F: Field8, const W: usize, const R: usize, const N: usize>(
+    table: &CtTable8,
+    scalars: &[[u8; 32]; N],
+) -> Vec<Ext8<F>> {
+    unsafe {
+        const { assert!(N > 0 && N.is_multiple_of(8)) };
+        // digits[i][k] = k 番目の鍵の i 桁目
+        let mut digits = [[0i16; N]; R];
+        for (k, s) in scalars.iter().enumerate() {
+            for (i, d) in ct::digits::<W, R>(s).into_iter().enumerate() {
+                digits[i][k] = d;
+            }
+        }
+        let mut acc: Vec<Ext8<F>> = digits[0]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|d| to_extended(&select_ct::<F>(table, 0, d)))
+            .collect();
+        for (i, ds) in digits.iter().enumerate().take(R - 1).skip(1) {
+            for (a, d) in acc.iter_mut().zip(ds.as_chunks::<8>().0) {
+                add_niels::<F, true>(a, &select_ct(table, i, d));
+            }
+        }
+        for (a, d) in acc.iter_mut().zip(digits[R - 1].as_chunks::<8>().0) {
+            add_niels::<F, false>(a, &select_ct(table, R - 1, d));
+        }
+        acc
+    }
+}
+
+/// [`mul_base_batch`] の定数時間版（表は [`CtTable8::build`] で幅 `W` のもの）
+#[inline(always)]
+unsafe fn mul_base_batch_ct<F: Field8, const W: usize, const R: usize, const N: usize>(
+    table: &CtTable8,
+    scalars: &[[u8; 32]; N],
+    out: &mut [Extended; N],
+) {
+    unsafe {
+        let acc = points_ct::<F, W, R, N>(table, scalars);
+        for (p, o) in acc.iter().zip(out.as_chunks_mut::<8>().0) {
+            let (x, y, z) = (p.x.lanes(), p.y.lanes(), p.z.lanes());
+            for k in 0..8 {
+                o[k] = Extended {
+                    x: x[k],
+                    y: y[k],
+                    z: z[k],
+                    t: Fe::ZERO,
+                };
+            }
+        }
+    }
+}
+
+/// [`mul_base_compress`] の定数時間版（表は [`CtTable8::build`] で幅 `W` のもの）
+#[inline(always)]
+unsafe fn mul_base_compress_ct<F: Field8, const W: usize, const R: usize, const N: usize>(
+    table: &CtTable8,
+    scalars: &[[u8; 32]; N],
+    ys: &mut [[u8; 32]; N],
+    xs: &mut [Fe; N],
+    zinvs: &mut [Fe; N],
+) {
+    unsafe {
+        let acc = points_ct::<F, W, R, N>(table, scalars);
+        compress::<F, N>(&acc, ys, xs, zinvs);
     }
 }
 
@@ -412,14 +658,28 @@ mod tests {
         Ifma,
     }
 
-    /// `path` で `scalars[k] * B` を計算する（CPU が対応していなければ None）
-    fn mul_base<const N: usize>(path: Path, scalars: &[[u8; 32]; N]) -> Option<[Extended; N]> {
+    /// `path` で `scalars[k] * B` を計算する（`ct` なら定数時間の倍算。CPU が対応していなければ None）
+    fn mul_base<const N: usize>(
+        path: Path,
+        ct: bool,
+        scalars: &[[u8; 32]; N],
+    ) -> Option<[Extended; N]> {
         let mut out = [Extended::IDENTITY; N];
-        match path {
-            Path::F => f::mul_base_batch(available("avx512", Avx512::detect())?, scalars, &mut out),
-            Path::Ifma => {
+        match (path, ct) {
+            (Path::F, false) => {
+                f::mul_base_batch(available("avx512", Avx512::detect())?, scalars, &mut out)
+            }
+            (Path::F, true) => {
+                f::mul_base_batch_ct(available("avx512", Avx512::detect())?, scalars, &mut out)
+            }
+            (Path::Ifma, false) => {
                 ifma::mul_base_batch(available("avx512-ifma", Ifma::detect())?, scalars, &mut out)
             }
+            (Path::Ifma, true) => ifma::mul_base_batch_ct(
+                available("avx512-ifma", Ifma::detect())?,
+                scalars,
+                &mut out,
+            ),
         }
         Some(out)
     }
@@ -536,15 +796,17 @@ mod tests {
     }
 
     /// 8・16・256 鍵（8鍵の組が1つ・2つ・32）をまとめて倍算すると、どの位置の鍵も curve25519-dalek と
-    /// 一致する。組が複数あると、先読み（次の組・次の行）とアキュムレータの切り替えも通る
+    /// 一致する（テーブルの倍算と定数時間の倍算）。組が複数あると、先読み（次の組・次の行）と
+    /// アキュムレータの切り替えも通る
     #[rstest]
     fn mul_base_batch_matches_dalek(
         #[values(Path::F, Path::Ifma)] path: Path,
+        #[values(false, true)] ct: bool,
         #[values(8, 16, 256)] n: usize,
     ) {
-        fn run<const N: usize>(path: Path, cases: u32) {
+        fn run<const N: usize>(path: Path, ct: bool, cases: u32) {
             check(cases, scalars::<N>(), |s| {
-                let Some(out) = mul_base(path, &s) else {
+                let Some(out) = mul_base(path, ct, &s) else {
                     return Ok(());
                 };
                 for (k, (p, s)) in out.iter().zip(&s).enumerate() {
@@ -554,9 +816,9 @@ mod tests {
             });
         }
         match n {
-            8 => run::<8>(path, 64),
-            16 => run::<16>(path, 32),
-            _ => run::<256>(path, 2),
+            8 => run::<8>(path, ct, 64),
+            16 => run::<16>(path, ct, 32),
+            _ => run::<256>(path, ct, 2),
         }
     }
 
@@ -565,12 +827,13 @@ mod tests {
     #[rstest]
     fn mul_base_batch_matches_rfc_vectors(
         #[values(Path::F, Path::Ifma)] path: Path,
+        #[values(false, true)] ct: bool,
         vectors: Vec<Vector>,
     ) {
         let v = vectors;
         assert_eq!(v.len(), 5);
         let s: [[u8; 32]; 8] = from_fn(|k| to_le32(&secret_expand(&v[k % v.len()].secret).0));
-        let Some(out) = mul_base(path, &s) else {
+        let Some(out) = mul_base(path, ct, &s) else {
             return;
         };
         for (k, p) in out.iter().enumerate() {

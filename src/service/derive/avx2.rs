@@ -6,7 +6,9 @@
 //! 隣り合う2リムを `l[2i] + l[2i+1]·2^26` とまとめると [`Fe`] の 51 ビットのリムになるので、
 //! 倍算が終わったら [`Extended`] に戻し、圧縮は今までどおり行う。
 //!
-//! テーブルのアクセス位置が秘密に依存する（定数時間ではない）ので、探索の高速化専用。
+//! [`Table4::mul_base_batch`] はテーブルのアクセス位置が秘密に依存する（定数時間ではない）ので、低セキュリティモード専用。
+//! [`CtTable4::mul_base_batch`] は定数時間の倍算（[`ct`]。表の行の全エントリを読み込み、並べ替え命令で選ぶ）で、
+//! 既定のモードで使う。
 //!
 //! `#[target_feature]` の付いた関数は `#[inline(always)]` にできず、体演算が関数呼び出しのまま
 //! 残って遅くなる。そこで `#[target_feature]` は入口（[`Table4::mul_base_batch`] の中の safe な
@@ -21,6 +23,7 @@
 )]
 
 use crate::service::derive::comb::{COLS, Extended, ROWS, Table, signed_digits};
+use crate::service::derive::ct;
 use crate::service::derive::field::Fe;
 use std::arch::x86_64::*;
 use std::sync::LazyLock;
@@ -130,7 +133,7 @@ unsafe fn sub(a: &Fe4, b: &Fe4) -> Fe4 {
 
 /// `mask` のレーンは a、それ以外は b
 #[inline(always)]
-unsafe fn select(mask: __m256i, a: &Fe4, b: &Fe4) -> Fe4 {
+unsafe fn select_fe(mask: __m256i, a: &Fe4, b: &Fe4) -> Fe4 {
     unsafe {
         let mut r = a.0;
         for i in 0..10 {
@@ -353,7 +356,11 @@ fn lanes(f: &Fe4) -> [Fe; 4] {
 struct Entry([u32; 32]);
 
 /// [`Table`] と同じ値を 25.5 ビットのリムで持つテーブル（W = 12 で約 5.8MB）
-pub struct Table4(Box<[Entry]>);
+pub struct Table4 {
+    entries: Box<[Entry]>,
+    /// 1行のエントリ数
+    cols: usize,
+}
 
 impl Table4 {
     /// プロセスで1つだけ作って共有する
@@ -365,19 +372,29 @@ impl Table4 {
     fn build() -> Table4 {
         // 51 ビット版は変換にだけ使って捨てる（AVX2 を使うときは要らないので、共有のものは作らない）
         let table = Table::build();
-        let mut entries = vec![Entry([0; 32]); ROWS * COLS];
-        for (n, e) in entries.iter_mut().enumerate() {
-            for (f, fe) in table.entry(n / COLS, n % COLS).into_iter().enumerate() {
-                for (dst, src) in e.0[10 * f..10 * f + 10].iter_mut().zip(split(fe.reduce())) {
-                    *dst = src as u32;
-                }
-            }
-        }
-        Table4(entries.into_boxed_slice())
+        Table4::pack(
+            (0..ROWS * COLS).map(|n| table.entry(n / COLS, n % COLS)),
+            COLS,
+        )
     }
 
-    fn row(&self, i: usize) -> &[Entry; COLS] {
-        &self.0.as_chunks::<COLS>().0[i]
+    fn pack(entries: impl Iterator<Item = [Fe; 3]>, cols: usize) -> Table4 {
+        let entries = entries
+            .map(|entry| {
+                let mut e = Entry([0; 32]);
+                for (f, fe) in entry.into_iter().enumerate() {
+                    for (dst, src) in e.0[10 * f..10 * f + 10].iter_mut().zip(split(fe.reduce())) {
+                        *dst = src as u32;
+                    }
+                }
+                e
+            })
+            .collect();
+        Table4 { entries, cols }
+    }
+
+    fn row(&self, i: usize) -> &[Entry] {
+        &self.entries[i * self.cols..(i + 1) * self.cols]
     }
 
     /// [`Table::mul_base_batch`] と同じ計算を、4鍵ずつ AVX2 で（`N` は 4 の倍数）
@@ -468,7 +485,7 @@ impl Table4 {
 
 /// 4鍵ぶんの表の値 `d[k] * 2^(W*i) * B` を引き、レーンにそろえる（負の桁は符号を反転する）
 #[inline(always)]
-unsafe fn gather(row: &[Entry; COLS], d: &[i16; 4]) -> Niels4 {
+unsafe fn gather(row: &[Entry], d: &[i16; 4]) -> Niels4 {
     unsafe {
         let e = d.map(|x| &row[usize::from(x.unsigned_abs())].0);
         // 各エントリの4リムずつを 64 ビットに広げて読み、4×4 を転置してレーンにそろえる
@@ -493,6 +510,175 @@ unsafe fn gather(row: &[Entry; COLS], d: &[i16; 4]) -> Niels4 {
             l[4 * q + 2] = _mm256_permute2x128_si256::<0x31>(t0, t2);
             l[4 * q + 3] = _mm256_permute2x128_si256::<0x31>(t1, t3);
         }
+        niels(&l, d)
+    }
+}
+
+/// 定数時間の倍算（[`ct`]）の表。並べ替え命令（`vpermd`）で選べるよう、行・リムごとに 1 番目以降の
+/// エントリの同じリムを 8 個ずつ（256 ビットのレジスタ1本分）並べ、0 番目のエントリは別に持つ
+pub struct CtTable4 {
+    /// [行][リム q（30）][8 個の組 c] の 8 リム。組 c の j 番目は 1 + 8c + j 番目のエントリ
+    perm: Box<[Limbs8]>,
+    /// [行] の 0 番目のエントリの 30 リム（最上位の行以外は単位元）
+    zero: Box<[[u32; 32]]>,
+    /// 1行の 8 個の組の数
+    groups: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct Limbs8([u32; 8]);
+
+impl CtTable4 {
+    /// プロセスで1つだけ作って共有する（幅 [`ct::W_AVX2`]）
+    pub fn get(_: Avx2) -> &'static CtTable4 {
+        static TABLE: LazyLock<CtTable4> = LazyLock::new(|| CtTable4::build(ct::W_AVX2));
+        &TABLE
+    }
+
+    fn build(w: usize) -> CtTable4 {
+        let cols = ct::cols(w);
+        let groups = (cols - 1).div_ceil(8);
+        assert!(groups <= 16, "表引きのマスクは 16 組まで");
+        let entries: Vec<[u32; 32]> = ct::table(w)
+            .into_iter()
+            .map(|entry| {
+                let mut limbs = [0u32; 32];
+                for (f, fe) in entry.into_iter().enumerate() {
+                    for (dst, src) in limbs[10 * f..10 * f + 10]
+                        .iter_mut()
+                        .zip(split(fe.reduce()))
+                    {
+                        *dst = src as u32;
+                    }
+                }
+                limbs
+            })
+            .collect();
+        let mut perm = Vec::new();
+        let mut zero = Vec::new();
+        for row in entries.chunks(cols) {
+            zero.push(row[0]);
+            for q in 0..30 {
+                for c in 0..groups {
+                    perm.push(Limbs8(std::array::from_fn(|j| {
+                        row.get(1 + 8 * c + j).map_or(0, |e| e[q])
+                    })));
+                }
+            }
+        }
+        CtTable4 {
+            perm: perm.into_boxed_slice(),
+            zero: zero.into_boxed_slice(),
+            groups,
+        }
+    }
+
+    /// [`Table4::mul_base_batch`] の定数時間版（[`ct`]。`N` は 4 の倍数）
+    pub fn mul_base_batch<const N: usize>(
+        &self,
+        avx2: Avx2,
+        scalars: &[[u8; 32]; N],
+        out: &mut [Extended; N],
+    ) {
+        let _ = avx2;
+        // SAFETY: Avx2 があるので、CPU は AVX2 に対応している
+        unsafe {
+            self.mul_base_batch_avx2::<{ ct::W_AVX2 }, { ct::rows(ct::W_AVX2) }, N>(scalars, out)
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn mul_base_batch_avx2<const W: usize, const R: usize, const N: usize>(
+        &self,
+        scalars: &[[u8; 32]; N],
+        out: &mut [Extended; N],
+    ) {
+        const { assert!(N.is_multiple_of(4)) };
+        // digits[i][k] = k 番目の鍵の i 桁目
+        let mut digits = [[0i16; N]; R];
+        for (k, s) in scalars.iter().enumerate() {
+            for (i, d) in ct::digits::<W, R>(s).into_iter().enumerate() {
+                digits[i][k] = d;
+            }
+        }
+        // SAFETY: この関数は AVX2 を有効にしてコンパイルされ、AVX2 に対応した CPU でだけ呼ばれる
+        unsafe {
+            let mut acc: Vec<Ext4> = digits[0]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|d| to_extended(&self.select(0, d)))
+                .collect();
+            for (i, ds) in digits.iter().enumerate().take(R - 1).skip(1) {
+                for (a, d) in acc.iter_mut().zip(ds.as_chunks::<4>().0) {
+                    *a = add_niels::<true>(a, &self.select(i, d));
+                }
+            }
+            let last = digits[R - 1].as_chunks::<4>().0;
+            for ((a, d), o) in acc.iter_mut().zip(last).zip(out.as_chunks_mut::<4>().0) {
+                *a = add_niels::<false>(a, &self.select(R - 1, d));
+                let (x, y, z) = (lanes(&a.x), lanes(&a.y), lanes(&a.z));
+                for k in 0..4 {
+                    o[k] = Extended {
+                        x: x[k],
+                        y: y[k],
+                        z: z[k],
+                        t: Fe::ZERO,
+                    };
+                }
+            }
+        }
+    }
+
+    /// [`gather`] の定数時間版: `i` 行目の全エントリを読み込み、`vpermd`（レジスタの 8 個から、
+    /// 32 ビットの要素ごとの番号で1つを選ぶ）で |d| - 1 番目を選ぶ。8 個の組が複数あれば全部の組で選び、
+    /// 番号の組と一致したレーンにだけ移す。桁が 0 のレーンは 0 番目のエントリにする。
+    /// 読む場所と命令の列は桁の値によらない
+    #[inline(always)]
+    unsafe fn select(&self, i: usize, d: &[i16; 4]) -> Niels4 {
+        unsafe {
+            // 絶対値も分岐なしで（m は負なら -1、そうでなければ 0）
+            let abs = d.map(|x| {
+                let m = x >> 15;
+                i64::from((x ^ m) - m)
+            });
+            let abs = _mm256_set_epi64x(abs[3], abs[2], abs[1], abs[0]);
+            let is_zero = _mm256_cmpeq_epi64(abs, _mm256_setzero_si256());
+            // 64 ビットのレーンの下の 32 ビットが番号（vpermd は下 3 ビットだけを使う）。上の 32 ビットで選んだ値は
+            // 最後に捨てる。桁が 0 のレーンの番号（-1）は、最後に上書きする
+            let idx = _mm256_sub_epi64(abs, _mm256_set1_epi64x(1));
+            let group = _mm256_srli_epi64::<3>(idx);
+            let groups = self.groups;
+            let mut in_group = [_mm256_setzero_si256(); 16];
+            for (c, m) in in_group.iter_mut().enumerate().take(groups) {
+                *m = _mm256_cmpeq_epi64(group, _mm256_set1_epi64x(c as i64));
+            }
+            let low = _mm256_set1_epi64x(0xffff_ffff);
+            let zero = &self.zero[i];
+            let limbs = &self.perm[i * 30 * groups..(i + 1) * 30 * groups];
+            let mut l = [_mm256_setzero_si256(); 32];
+            for q in 0..30 {
+                let g = &limbs[q * groups..(q + 1) * groups];
+                let pick = |c: usize| {
+                    _mm256_permutevar8x32_epi32(_mm256_load_si256(g[c].0.as_ptr().cast()), idx)
+                };
+                let mut r = pick(0);
+                for c in 1..groups {
+                    r = _mm256_blendv_epi8(r, pick(c), in_group[c]);
+                }
+                let r = _mm256_and_si256(r, low);
+                l[q] = _mm256_blendv_epi8(r, _mm256_set1_epi64x(i64::from(zero[q])), is_zero);
+            }
+            niels(&l, d)
+        }
+    }
+}
+
+/// レーンにそろえたリム（y+x, y-x, 2dxy の 10 個ずつ）を体の元にし、負の桁のレーンの符号を反転する
+#[inline(always)]
+unsafe fn niels(l: &[__m256i; 32], d: &[i16; 4]) -> Niels4 {
+    unsafe {
         let fe = |r: usize| Fe4(*l[r..].first_chunk().expect("32 リムのうち 10 個"));
         let (ypx, ymx, xy2d) = (fe(0), fe(10), fe(20));
         // -P = (-x, y): y+x と y-x を入れ替え、2dxy を反転する
@@ -503,16 +689,16 @@ unsafe fn gather(row: &[Entry; COLS], d: &[i16; 4]) -> Niels4 {
         );
         let zero = splat([0; 10]);
         Niels4 {
-            ypx: select(neg, &ymx, &ypx),
-            ymx: select(neg, &ypx, &ymx),
-            xy2d: select(neg, &sub(&zero, &xy2d), &xy2d),
+            ypx: select_fe(neg, &ymx, &ypx),
+            ymx: select_fe(neg, &ypx, &ymx),
+            xy2d: select_fe(neg, &sub(&zero, &xy2d), &xy2d),
         }
     }
 }
 
 /// 4鍵ぶんの表の値（1エントリ = 64 バイトの行2つ）を L1 に読み込み始める
 #[inline(always)]
-unsafe fn prefetch(row: &[Entry; COLS], d: &[i16; 4]) {
+unsafe fn prefetch(row: &[Entry], d: &[i16; 4]) {
     unsafe {
         for &x in d {
             let p: *const i8 = (&raw const row[usize::from(x.unsigned_abs())]).cast();
@@ -694,7 +880,7 @@ mod tests {
     /// 8鍵（4レーン × 2組）をまとめて倍算すると、どの位置の鍵も curve25519-dalek と一致する。
     /// 桁が 0（m = 0）・負（符号の反転）・最大の鍵を混ぜる（どれもクランプ済み）
     #[rstest]
-    fn mul_base_batch_matches_dalek(avx2: Option<Avx2>) {
+    fn mul_base_batch_matches_dalek(avx2: Option<Avx2>, #[values(false, true)] ct: bool) {
         let Some(avx2) = avx2 else { return };
         let special = [
             {
@@ -716,7 +902,10 @@ mod tests {
                 None => clamp_integer(random[k]),
             });
             let mut out = [Extended::IDENTITY; 8];
-            Table4::get(avx2).mul_base_batch(avx2, &s, &mut out);
+            match ct {
+                true => CtTable4::get(avx2).mul_base_batch(avx2, &s, &mut out),
+                false => Table4::get(avx2).mul_base_batch(avx2, &s, &mut out),
+            }
             for (k, (p, s)) in out.iter().zip(&s).enumerate() {
                 prop_assert_eq!(compress(p), dalek(s), "#{}", k);
             }
@@ -726,12 +915,19 @@ mod tests {
 
     /// RFC 8032 Section 7.1 のテストベクタの秘密スカラーで、参照実装と一致する
     #[rstest]
-    fn mul_base_batch_matches_rfc_vectors(avx2: Option<Avx2>, vectors: Vec<Vector>) {
+    fn mul_base_batch_matches_rfc_vectors(
+        avx2: Option<Avx2>,
+        vectors: Vec<Vector>,
+        #[values(false, true)] ct: bool,
+    ) {
         let Some(avx2) = avx2 else { return };
         let v = vectors;
         let s: [[u8; 32]; 4] = from_fn(|k| to_le32(&secret_expand(&v[k].secret).0));
         let mut out = [Extended::IDENTITY; 4];
-        Table4::get(avx2).mul_base_batch(avx2, &s, &mut out);
+        match ct {
+            true => CtTable4::get(avx2).mul_base_batch(avx2, &s, &mut out),
+            false => Table4::get(avx2).mul_base_batch(avx2, &s, &mut out),
+        }
         for (k, p) in out.iter().enumerate() {
             assert_eq!(compress(p), v[k].public, "TEST {}", v[k].name);
         }

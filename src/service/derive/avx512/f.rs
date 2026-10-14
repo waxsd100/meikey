@@ -6,8 +6,9 @@
 //! 表には隣り合う2リムを 64 ビットの1ワードに入れておき（下位 32 ビットに偶数番目、上位に奇数番目）、
 //! `vpgatherqq` 1 命令で8鍵の2リムを読む。
 
-use super::{Avx512, Field8, Table8};
+use super::{Avx512, CtTable8, Field8, Table8};
 use crate::service::derive::comb::Extended;
+use crate::service::derive::ct;
 use crate::service::derive::field::Fe;
 use std::arch::x86_64::*;
 use std::sync::LazyLock;
@@ -352,6 +353,63 @@ fn run_compress<const N: usize>(
 ) {
     // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
     unsafe { super::mul_base_compress::<Fe10, N>(table, scalars, ys, xs, zinvs) }
+}
+
+static CT_TABLE: LazyLock<CtTable8> = LazyLock::new(|| CtTable8::build::<Fe10>(ct::W_AVX512F));
+
+/// 定数時間の倍算の表を作っておく
+pub fn prepare_ct(_: Avx512) {
+    LazyLock::force(&CT_TABLE);
+}
+
+/// [`mul_base_batch`] の定数時間版（[`super::mul_base_batch_ct`]。`N` は 8 の倍数）
+pub fn mul_base_batch_ct<const N: usize>(
+    avx512: Avx512,
+    scalars: &[[u8; 32]; N],
+    out: &mut [Extended; N],
+) {
+    let _ = avx512;
+    // SAFETY: Avx512 があるので、CPU は下の target_feature の命令に対応している
+    unsafe { run_ct(&CT_TABLE, scalars, out) }
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl")]
+fn run_ct<const N: usize>(table: &CtTable8, scalars: &[[u8; 32]; N], out: &mut [Extended; N]) {
+    // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
+    unsafe {
+        super::mul_base_batch_ct::<Fe10, { ct::W_AVX512F }, { ct::rows(ct::W_AVX512F) }, N>(
+            table, scalars, out,
+        )
+    }
+}
+
+/// [`mul_base_compress`] の定数時間版（[`super::mul_base_compress_ct`]。`N` は 8 の倍数）
+pub fn mul_base_compress_ct<const N: usize>(
+    avx512: Avx512,
+    scalars: &[[u8; 32]; N],
+    ys: &mut [[u8; 32]; N],
+    xs: &mut [Fe; N],
+    zinvs: &mut [Fe; N],
+) {
+    let _ = avx512;
+    // SAFETY: Avx512 があるので、CPU は下の target_feature の命令に対応している
+    unsafe { run_compress_ct(&CT_TABLE, scalars, ys, xs, zinvs) }
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl")]
+fn run_compress_ct<const N: usize>(
+    table: &CtTable8,
+    scalars: &[[u8; 32]; N],
+    ys: &mut [[u8; 32]; N],
+    xs: &mut [Fe; N],
+    zinvs: &mut [Fe; N],
+) {
+    // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
+    unsafe {
+        super::mul_base_compress_ct::<Fe10, { ct::W_AVX512F }, { ct::rows(ct::W_AVX512F) }, N>(
+            table, scalars, ys, xs, zinvs,
+        )
+    }
 }
 
 #[cfg(test)]

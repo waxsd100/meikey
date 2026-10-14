@@ -155,13 +155,15 @@ const HELP: &[(&str, &str, &str)] = &[
         "低セキュリティモード: 速さを優先する。基点倍算を定数時間でない表の倍算にし（数倍速いが、同じマシン上の\
          他プロセスからキャッシュのタイミングで秘密鍵を推測される余地がある）、シードは鍵ごとの ChaCha20 ではなく、\
          OS の乱数（スレッドごとに1回）に通し番号を足したものにする。--gpu・--both はこのモードでだけ使える\
-         （GPU の計算は定数時間でない）。付けなければ、倍算は定数時間の実装（curve25519-dalek）",
+         （GPU の計算は定数時間でない）。付けなければ、倍算は定数時間の実装（AVX2・AVX-512 では表の行の\
+         全エントリを読んで選ぶもの、SIMD を使わなければ curve25519-dalek）",
         "Low-security mode: prioritize speed. Use the table-based base-point multiplication, which is \
          not constant-time (several times faster, but leaves room for other processes on the same \
          machine to infer the private key from cache timing), and make seeds by adding a counter to \
          OS randomness (once per thread) instead of ChaCha20 for each key. --gpu and --both work only \
          in this mode (the GPU computation is not constant-time). Without it, the multiplication \
-         uses the constant-time implementation (curve25519-dalek)",
+         is constant-time (with AVX2 or AVX-512, a table walk that reads every entry of each row; \
+         without SIMD, curve25519-dalek)",
     ),
     (
         "no_batch",

@@ -8,8 +8,9 @@
 //! 黙って捨てられ、結果が壊れる。そこで「乗算に渡す値はリムが 2^52 未満」を型の約束にし、
 //! `add`・`sub`・`mul` は結果を必ず繰り上げて 2^51 + 2^17 未満にする（[`Fe5`] を参照）。
 
-use super::{Field8, Ifma, Table8};
+use super::{CtTable8, Field8, Ifma, Table8};
 use crate::service::derive::comb::Extended;
+use crate::service::derive::ct;
 use crate::service::derive::field::Fe;
 use std::arch::x86_64::*;
 use std::sync::LazyLock;
@@ -232,6 +233,63 @@ fn run_compress<const N: usize>(
 ) {
     // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
     unsafe { super::mul_base_compress::<Fe5, N>(table, scalars, ys, xs, zinvs) }
+}
+
+static CT_TABLE: LazyLock<CtTable8> = LazyLock::new(|| CtTable8::build::<Fe5>(ct::W_IFMA));
+
+/// 定数時間の倍算の表を作っておく
+pub fn prepare_ct(_: Ifma) {
+    LazyLock::force(&CT_TABLE);
+}
+
+/// [`mul_base_batch`] の定数時間版（[`super::mul_base_batch_ct`]。`N` は 8 の倍数）
+pub fn mul_base_batch_ct<const N: usize>(
+    ifma: Ifma,
+    scalars: &[[u8; 32]; N],
+    out: &mut [Extended; N],
+) {
+    let _ = ifma;
+    // SAFETY: Ifma があるので、CPU は下の target_feature の命令に対応している
+    unsafe { run_ct(&CT_TABLE, scalars, out) }
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512ifma")]
+fn run_ct<const N: usize>(table: &CtTable8, scalars: &[[u8; 32]; N], out: &mut [Extended; N]) {
+    // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
+    unsafe {
+        super::mul_base_batch_ct::<Fe5, { ct::W_IFMA }, { ct::rows(ct::W_IFMA) }, N>(
+            table, scalars, out,
+        )
+    }
+}
+
+/// [`mul_base_compress`] の定数時間版（[`super::mul_base_compress_ct`]。`N` は 8 の倍数）
+pub fn mul_base_compress_ct<const N: usize>(
+    ifma: Ifma,
+    scalars: &[[u8; 32]; N],
+    ys: &mut [[u8; 32]; N],
+    xs: &mut [Fe; N],
+    zinvs: &mut [Fe; N],
+) {
+    let _ = ifma;
+    // SAFETY: Ifma があるので、CPU は下の target_feature の命令に対応している
+    unsafe { run_compress_ct(&CT_TABLE, scalars, ys, xs, zinvs) }
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512ifma")]
+fn run_compress_ct<const N: usize>(
+    table: &CtTable8,
+    scalars: &[[u8; 32]; N],
+    ys: &mut [[u8; 32]; N],
+    xs: &mut [Fe; N],
+    zinvs: &mut [Fe; N],
+) {
+    // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
+    unsafe {
+        super::mul_base_compress_ct::<Fe5, { ct::W_IFMA }, { ct::rows(ct::W_IFMA) }, N>(
+            table, scalars, ys, xs, zinvs,
+        )
+    }
 }
 
 #[cfg(test)]

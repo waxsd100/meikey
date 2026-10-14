@@ -12,11 +12,13 @@
 //! 中の部品（crate の外には公開しない）:
 //! - `field` — GF(2^255 - 19) の体演算（51 ビット × 5 リム）
 //! - `comb` — 櫛形テーブルによる固定基点倍算
+//! - `ct` — 定数時間の固定基点倍算（符号付き 2^5 進の櫛形テーブル。SIMD の経路は `avx2`・`avx512` の中）
 //! - `avx2`・`avx512` — 倍算を4鍵・8鍵ずつ同時に
 //! - `amx` — 体の乗算を AMX のタイル演算で（実験的。feature `amx`）
 //! - `sha512x4`・`sha512x8` — SHA-512 を4シード・8シードずつ同時に
 
 pub(crate) mod comb;
+pub(crate) mod ct;
 pub(crate) mod field;
 
 // SIMD の部品は x86_64 だけ
@@ -31,7 +33,7 @@ cfg_select! {
 
         #[cfg(feature = "amx")]
         use amx::Amx;
-        use avx2::{Avx2, Table4};
+        use avx2::{Avx2, CtTable4, Table4};
         use avx512::{Avx512, Ifma};
     }
     _ => {}
@@ -129,7 +131,21 @@ impl Lanes {
 impl Backend {
     /// 探索で使う表を作っておく（探索の時間に含めないため。2回目からは何もしない）
     pub fn prepare(&self) {
-        if self.mul != Mul::Table {
+        if self.mul == Mul::ConstantTime {
+            match Lanes::detect(self.simd) {
+                #[cfg(all(target_arch = "x86_64", feature = "amx"))]
+                Lanes::Amx(a) => avx512::f::prepare_ct(a.avx512()),
+                #[cfg(target_arch = "x86_64")]
+                Lanes::Ifma(i) => avx512::ifma::prepare_ct(i),
+                #[cfg(target_arch = "x86_64")]
+                Lanes::Avx512(a) => avx512::f::prepare_ct(a),
+                #[cfg(target_arch = "x86_64")]
+                Lanes::Avx2(a) => {
+                    CtTable4::get(a);
+                }
+                // SIMD が無ければ curve25519-dalek の倍算を使う（表は dalek が持っている）
+                Lanes::Scalar => {}
+            }
             return;
         }
         match Lanes::detect(self.simd) {
@@ -186,8 +202,11 @@ pub struct Deriver {
     /// 1/Z（逆元を計算したあと）
     zs: Box<[Fe; BATCH]>,
     scratch: Vec<Fe>,
-    /// 定数時間の倍算で計算した x の符号（テーブルの倍算では [`Deriver::sign`] で後から計算する）
+    /// curve25519-dalek の倍算（SIMD の無い CPU での定数時間の倍算）で計算した x の符号。
+    /// ほかの経路では `xs`・`zs` から [`Deriver::sign`] で後から計算する
     signs: Box<[u8; BATCH]>,
+    /// 直前の計算で `signs` を使ったか
+    dalek: bool,
 }
 
 impl Deriver {
@@ -201,6 +220,7 @@ impl Deriver {
             zs: Box::new([Fe::ZERO; BATCH]),
             scratch: Vec::with_capacity(BATCH),
             signs: Box::new([0; BATCH]),
+            dalek: false,
         }
     }
 
@@ -215,24 +235,27 @@ impl Deriver {
     /// 全シードの公開鍵を、x の符号（最後のバイトの最上位ビット）を 0 にして。符号は [`Deriver::sign`] で、
     /// 要るときだけ計算する（探索では、文字列が含まれそうな鍵だけ）
     pub fn public_keys_unsigned(&mut self, seeds: &Seeds, out: &mut PublicKeys) {
-        let scalars = self.scalars(seeds);
-        match self.backend.mul {
-            Mul::Table => self.table(&scalars, out),
-            Mul::ConstantTime => {
-                constant_time(&scalars, out, self.backend.compress);
-                for (o, s) in out.iter_mut().zip(self.signs.iter_mut()) {
-                    *s = o[31] >> 7;
-                    o[31] &= 0x7f;
-                }
+        let mut scalars = self.scalars(seeds);
+        let ct = self.backend.mul == Mul::ConstantTime;
+        self.dalek = ct && matches!(self.lanes, Lanes::Scalar);
+        if self.dalek {
+            constant_time(&scalars, out, self.backend.compress);
+            for (o, s) in out.iter_mut().zip(self.signs.iter_mut()) {
+                *s = o[31] >> 7;
+                o[31] &= 0x7f;
             }
+        } else {
+            self.simd(&scalars, out, ct);
         }
+        // 秘密スカラーをメモリに残さない
+        zeroize::Zeroize::zeroize(scalars.as_flattened_mut());
     }
 
     /// 直前の [`Deriver::public_keys_unsigned`] の `k` 番目の鍵の x の符号（0 か 1）
     pub fn sign(&self, k: usize) -> u8 {
-        match self.backend.mul {
-            Mul::Table => (self.xs[k] * self.zs[k]).to_bytes()[0] & 1,
-            Mul::ConstantTime => self.signs[k],
+        match self.dalek {
+            true => self.signs[k],
+            false => (self.xs[k] * self.zs[k]).to_bytes()[0] & 1,
         }
     }
 
@@ -266,38 +289,57 @@ impl Deriver {
         out
     }
 
-    /// テーブルの倍算。y の圧縮形式（符号のビットは 0）を `out` に、X と 1/Z を `xs`・`zs` に。
+    /// SIMD の倍算（`ct` なら定数時間の倍算 [`ct`]、そうでなければテーブルの倍算）。SIMD が無ければ
+    /// テーブルの倍算を1鍵ずつ（定数時間の倍算は [`constant_time`] で、ここには来ない）。
+    /// y の圧縮形式（符号のビットは 0）を `out` に、X と 1/Z を `xs`・`zs` に。
     /// AVX-512 では、逆元と圧縮も8鍵ずつ同時に計算する（逆元を [`Compress::Each`] で 1 鍵ずつ計算するときは、
     /// 比較用に1つずつ）。AVX2 は 4 レーンの乗算が1鍵ずつの乗算より何倍も遅く、逆元と圧縮は1つずつのほうが速い
-    fn table(&mut self, scalars: &Seeds, out: &mut PublicKeys) {
+    fn simd(&mut self, scalars: &Seeds, out: &mut PublicKeys, ct: bool) {
         let batch = self.backend.compress == Compress::Batch;
+        let (xs, zs) = (&mut self.xs, &mut self.zs);
         match self.lanes {
+            #[cfg(all(target_arch = "x86_64", feature = "amx"))]
+            Lanes::Amx(a) if batch && ct => {
+                return avx512::f::mul_base_compress_ct(a.avx512(), scalars, out, xs, zs);
+            }
             #[cfg(target_arch = "x86_64")]
             Lanes::Ifma(i) if batch => {
-                return avx512::ifma::mul_base_compress(
-                    i,
-                    scalars,
-                    out,
-                    &mut self.xs,
-                    &mut self.zs,
-                );
+                return match ct {
+                    true => avx512::ifma::mul_base_compress_ct(i, scalars, out, xs, zs),
+                    false => avx512::ifma::mul_base_compress(i, scalars, out, xs, zs),
+                };
             }
             #[cfg(target_arch = "x86_64")]
             Lanes::Avx512(a) if batch => {
-                return avx512::f::mul_base_compress(a, scalars, out, &mut self.xs, &mut self.zs);
+                return match ct {
+                    true => avx512::f::mul_base_compress_ct(a, scalars, out, xs, zs),
+                    false => avx512::f::mul_base_compress(a, scalars, out, xs, zs),
+                };
             }
             _ => {}
         }
-        match self.lanes {
+        let points = &mut self.points;
+        match (self.lanes, ct) {
             #[cfg(all(target_arch = "x86_64", feature = "amx"))]
-            Lanes::Amx(a) => amx::mul_base_batch(a, scalars, &mut self.points),
+            (Lanes::Amx(a), true) => avx512::f::mul_base_batch_ct(a.avx512(), scalars, points),
+            #[cfg(all(target_arch = "x86_64", feature = "amx"))]
+            (Lanes::Amx(a), false) => amx::mul_base_batch(a, scalars, points),
             #[cfg(target_arch = "x86_64")]
-            Lanes::Ifma(i) => avx512::ifma::mul_base_batch(i, scalars, &mut self.points),
+            (Lanes::Ifma(i), true) => avx512::ifma::mul_base_batch_ct(i, scalars, points),
             #[cfg(target_arch = "x86_64")]
-            Lanes::Avx512(a) => avx512::f::mul_base_batch(a, scalars, &mut self.points),
+            (Lanes::Ifma(i), false) => avx512::ifma::mul_base_batch(i, scalars, points),
             #[cfg(target_arch = "x86_64")]
-            Lanes::Avx2(a) => Table4::get(a).mul_base_batch(a, scalars, &mut self.points),
-            Lanes::Scalar => Table::get().mul_base_batch(scalars, &mut self.points),
+            (Lanes::Avx512(a), true) => avx512::f::mul_base_batch_ct(a, scalars, points),
+            #[cfg(target_arch = "x86_64")]
+            (Lanes::Avx512(a), false) => avx512::f::mul_base_batch(a, scalars, points),
+            #[cfg(target_arch = "x86_64")]
+            (Lanes::Avx2(a), true) => CtTable4::get(a).mul_base_batch(a, scalars, points),
+            #[cfg(target_arch = "x86_64")]
+            (Lanes::Avx2(a), false) => Table4::get(a).mul_base_batch(a, scalars, points),
+            (Lanes::Scalar, true) => {
+                unreachable!("SIMD の無い定数時間の倍算は constant_time で計算する")
+            }
+            (Lanes::Scalar, false) => Table::get().mul_base_batch(scalars, points),
         }
         for ((p, z), x) in self.points.iter().zip(&mut *self.zs).zip(&mut *self.xs) {
             *z = p.z;
