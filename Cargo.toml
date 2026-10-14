@@ -24,6 +24,10 @@ clap = { version = "4.6.7", features = ["derive"] }
 curve25519-dalek = "5.0.0"
 ed25519-dalek = "3.0.0"
 memchr = "2.8.3"
+# 正規表現で探す（--regex）。一致した位置は regex、判定と確率は regex-automata の DFA から作った表で
+regex = "1.13.1"
+regex-automata = "0.4.18"
+regex-syntax = "0.8.11"
 rand = { version = "0.10.3", features = ["chacha"] }
 sha2 = "0.11"
 dialoguer = { version = "0.12.0", default-features = false }

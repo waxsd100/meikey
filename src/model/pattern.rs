@@ -1,9 +1,16 @@
 //! 探す文字列と、公開鍵に含まれるかの判定（探索ループで速く判定するものは [`crate::service::matcher`]）
+//!
+//! 探し方は [`Mode`] で選ぶ: どこかに含む・末尾・正規表現。正規表現は [`dfa::Dfa`] にもして、
+//! 探索ループの判定と当たる確率の計算に使う
+
+pub mod dfa;
 
 use crate::lang::{t, tf};
 use crate::model::key::{FIXED_PREFIX, PUBLIC_B64_LEN, PublicB64};
+use dfa::Dfa;
 use std::fmt;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// 判定に使う範囲の先頭（固定部分の直後）
 pub(crate) const SEARCH_START: usize = FIXED_PREFIX.len();
@@ -27,21 +34,89 @@ pub enum PatternError {
         "the text is too long: {len} characters (at most {max})"
     ))]
     TooLong { len: usize, max: usize },
+    #[error("{}", tf!("正規表現が正しくない: {}", "invalid regular expression: {}", .0))]
+    Regex(String),
+    #[error("{}", tf!(
+        "正規表現が複雑すぎる（DFA の状態が {max} 個を超える）",
+        "the regular expression is too complex (the DFA has more than {max} states)"
+    ))]
+    TooComplex { max: usize },
+    #[error("{}", t!(
+        "空の文字列に一致する正規表現は使えない（どの鍵にも一致する）",
+        "a regular expression that matches the empty string cannot be used (it matches every key)"
+    ))]
+    MatchesEmpty,
+    #[error("{}", t!(
+        "この正規表現に一致する公開鍵は無い（使える文字は A-Z a-z 0-9 + /、固定部分の直後の 1 文字は A〜P）",
+        "no public key matches this regular expression (the characters are A-Z a-z 0-9 + /, and the one right after the fixed part is A-P)"
+    ))]
+    NeverMatches,
+}
+
+/// 探し方
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// 固定部分の後ろのどこかに含む
+    #[default]
+    Contains,
+    /// 公開鍵の最後が一致する
+    Suffix,
+    /// 固定部分の後ろ（43 文字）が正規表現に一致する（`^` は固定部分の直後、`$` は最後）
+    Regex,
+}
+
+impl Mode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Contains => t!("含む", "contains"),
+            Mode::Suffix => t!("末尾", "at the end"),
+            Mode::Regex => t!("正規表現", "regular expression"),
+        }
+    }
+}
+
+/// 正規表現をコンパイルしたもの（一致した位置を出す regex と、判定と確率に使う DFA）
+#[derive(Debug)]
+struct Compiled {
+    regex: regex::bytes::Regex,
+    dfa: Dfa,
+    probability: f64,
 }
 
 /// 公開鍵に含めたい文字列
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Pattern {
     needle: Box<[u8]>,
     case_sensitive: bool,
+    mode: Mode,
+    /// 正規表現のとき
+    compiled: Option<Arc<Compiled>>,
 }
 
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.needle, self.case_sensitive, self.mode)
+            == (&other.needle, other.case_sensitive, other.mode)
+    }
+}
+
+impl Eq for Pattern {}
+
 impl Pattern {
-    /// 指定できる最大文字数
+    /// 指定できる最大文字数（正規表現でないとき）
     pub const MAX_LEN: usize = FREE_LEN;
 
+    /// どこかに含む文字列
     pub fn new(s: &str, case_sensitive: bool) -> Result<Self, PatternError> {
+        Self::with_mode(s, case_sensitive, Mode::Contains)
+    }
+
+    /// 探し方 `mode` の文字列（正規表現なら、その正規表現）
+    pub fn with_mode(s: &str, case_sensitive: bool, mode: Mode) -> Result<Self, PatternError> {
         (!s.is_empty()).ok_or(PatternError::Empty)?;
+        if mode == Mode::Regex {
+            return Self::regex(s, case_sensitive);
+        }
         if let Some(c) = s.chars().find(|&c| !is_base64_char(c)) {
             return Err(PatternError::InvalidChar(c));
         }
@@ -52,7 +127,52 @@ impl Pattern {
         Ok(Self {
             needle: s.as_bytes().into(),
             case_sensitive,
+            mode,
+            compiled: None,
         })
+    }
+
+    fn regex(s: &str, case_sensitive: bool) -> Result<Self, PatternError> {
+        let hir = regex_syntax::ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .parse(s)
+            .map_err(|e| PatternError::Regex(e.to_string()))?;
+        if hir.properties().minimum_len() == Some(0) {
+            return Err(PatternError::MatchesEmpty);
+        }
+        let regex = regex::bytes::RegexBuilder::new(s)
+            .unicode(false)
+            .case_insensitive(!case_sensitive)
+            .size_limit(64 << 20)
+            .build()
+            .map_err(|e| PatternError::Regex(e.to_string()))?;
+        let dfa = Dfa::new(s, case_sensitive)?;
+        let probability = dfa.probability();
+        if probability == 0.0 {
+            return Err(PatternError::NeverMatches);
+        }
+        Ok(Self {
+            needle: s.as_bytes().into(),
+            case_sensitive,
+            mode: Mode::Regex,
+            compiled: Some(Arc::new(Compiled {
+                regex,
+                dfa,
+                probability,
+            })),
+        })
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// 正規表現の DFA（正規表現のときだけ）
+    pub fn dfa(&self) -> Option<&Dfa> {
+        self.compiled.as_ref().map(|c| &c.dfa)
     }
 
     /// 探す文字列のバイト列（検証済みの ASCII）
@@ -68,19 +188,30 @@ impl Pattern {
         self.case_sensitive
     }
 
-    /// 公開鍵の base64 の中で一致した位置
+    /// 公開鍵の base64 の中で一致した位置（正規表現なら、いちばん左で一致したもの）
     pub fn find(&self, b64: &PublicB64) -> Option<Range<usize>> {
-        let hit = b64[SEARCH_START..]
-            .windows(self.needle.len())
-            .find(|w| self.eq(w))?;
-        b64.subslice_range(hit).map(Into::into)
+        let hay = &b64[SEARCH_START..];
+        match (self.mode, &self.compiled) {
+            (Mode::Regex, Some(c)) => {
+                let m = c.regex.find(hay)?;
+                Some(SEARCH_START + m.start()..SEARCH_START + m.end())
+            }
+            (Mode::Suffix, _) => {
+                let start = PUBLIC_B64_LEN - self.needle.len();
+                self.same(&b64[start..]).then_some(start..PUBLIC_B64_LEN)
+            }
+            _ => {
+                let hit = hay.windows(self.needle.len()).find(|w| self.same(w))?;
+                b64.subslice_range(hit).map(Into::into)
+            }
+        }
     }
 
     pub fn is_match(&self, b64: &PublicB64) -> bool {
         self.find(b64).is_some()
     }
 
-    fn eq(&self, w: &[u8]) -> bool {
+    fn same(&self, w: &[u8]) -> bool {
         if self.case_sensitive {
             w == &self.needle[..]
         } else {
@@ -88,16 +219,16 @@ impl Pattern {
         }
     }
 
-    /// 1回の試行で当たる確率（正確には、1つの鍵に含まれる個数の期待値。当たりにくい文字列ではほぼ同じ）
+    /// 1回の試行で当たる確率（どこかに含むときは、正確には1つの鍵に含まれる個数の期待値。
+    /// 当たりにくい文字列ではほぼ同じ）
     pub fn probability(&self) -> f64 {
-        // 自由に変わる位置の1文字が一致する確率。大小文字を区別しないなら、英字は当たりが2通り
-        let per_char = |c: u8| {
-            if !self.case_sensitive && c.is_ascii_alphabetic() {
-                2.0 / 64.0
-            } else {
-                1.0 / 64.0
-            }
-        };
+        match (self.mode, &self.compiled) {
+            (Mode::Regex, Some(c)) => return c.probability,
+            // 最後の n 文字（42 文字までなので、固定部分の直後の A〜P の文字は含まない）
+            (Mode::Suffix, _) => return self.needle.iter().map(|&c| self.per_char(c)).product(),
+            _ => {}
+        }
+        let per_char = |c: u8| self.per_char(c);
         let (first, rest) = self.needle.split_first().expect("空でない");
         let rest: f64 = rest.iter().map(|&c| per_char(c)).product();
         // 固定部分の直後の次（26 文字目）から始まる位置
@@ -114,6 +245,15 @@ impl Pattern {
             0.0
         };
         free + at_start
+    }
+
+    /// 自由に変わる位置の1文字が一致する確率。大小文字を区別しないなら、英字は当たりが2通り
+    fn per_char(&self, c: u8) -> f64 {
+        if !self.case_sensitive && c.is_ascii_alphabetic() {
+            2.0 / 64.0
+        } else {
+            1.0 / 64.0
+        }
     }
 
     /// 当たりが出るまでの期待試行回数
@@ -229,6 +369,134 @@ pub(crate) mod tests {
         let p = pat(s, cs);
         assert_eq!(p.find(b64), want);
         assert_eq!(p.is_match(b64), want.is_some());
+    }
+
+    /// 末尾・正規表現で一致した位置（正規表現は、いちばん左で一致したもの）
+    #[rstest]
+    #[case::suffix(Mode::Suffix, "Gy9", true, Some(65..68))]
+    #[case::suffix_insensitive(Mode::Suffix, "gY9", false, Some(65..68))]
+    #[case::suffix_not_at_end(Mode::Suffix, "WaKo", true, None)]
+    #[case::regex_start(Mode::Regex, "^IQK2", true, Some(25..29))]
+    #[case::regex_start_miss(Mode::Regex, "^AQK2", true, None)]
+    #[case::regex_any(Mode::Regex, "Wa.o", true, Some(56..60))]
+    #[case::regex_insensitive(Mode::Regex, "wa.o", false, Some(56..60))]
+    #[case::regex_end(Mode::Regex, "[0-9]$", true, Some(67..68))]
+    #[case::regex_leftmost(Mode::Regex, "[0-9]", true, Some(28..29))]
+    #[case::regex_fixed_part(Mode::Regex, "NzaC1l", true, None)]
+    fn find_with_mode(
+        #[case] mode: Mode,
+        #[case] s: &str,
+        #[case] cs: bool,
+        #[case] want: Option<Range<usize>>,
+    ) {
+        let p = Pattern::with_mode(s, cs, mode).unwrap();
+        assert_eq!(p.find(SAMPLE), want);
+        assert_eq!(p.is_match(SAMPLE), want.is_some());
+        assert_eq!(
+            (p.mode(), p.as_str(), p.dfa().is_some()),
+            (mode, s, mode == Mode::Regex)
+        );
+    }
+
+    /// 正規表現で使えないもの（正しくない・空の文字列に一致する・一致する鍵が無い）。末尾は文字の検査が同じ
+    #[rstest]
+    #[case::syntax(
+        Mode::Regex,
+        "a(",
+        "正規表現が正しくない: regex parse error:\n    a(\n     ^\nerror: unclosed group"
+    )]
+    #[case::empty_match(
+        Mode::Regex,
+        "a*|b",
+        "空の文字列に一致する正規表現は使えない（どの鍵にも一致する）"
+    )]
+    #[case::anchor_only(
+        Mode::Regex,
+        "^",
+        "空の文字列に一致する正規表現は使えない（どの鍵にも一致する）"
+    )]
+    #[case::not_base64(
+        Mode::Regex,
+        "a=b",
+        "この正規表現に一致する公開鍵は無い（使える文字は A-Z a-z 0-9 + /、固定部分の直後の 1 文字は A〜P）"
+    )]
+    #[case::q_right_after_prefix(
+        Mode::Regex,
+        "^Q",
+        "この正規表現に一致する公開鍵は無い（使える文字は A-Z a-z 0-9 + /、固定部分の直後の 1 文字は A〜P）"
+    )]
+    #[case::too_long_for_key(
+        Mode::Regex,
+        "[a-z]{44}",
+        "この正規表現に一致する公開鍵は無い（使える文字は A-Z a-z 0-9 + /、固定部分の直後の 1 文字は A〜P）"
+    )]
+    #[case::too_complex(
+        Mode::Regex,
+        "a[A-Za-z0-9+/]{20}",
+        "正規表現が複雑すぎる（DFA の状態が 16384 個を超える）"
+    )]
+    #[case::empty(Mode::Regex, "", MSG_EMPTY)]
+    #[case::suffix_invalid(
+        Mode::Suffix,
+        "a-b",
+        "使えない文字: '-'（使える文字: A-Z a-z 0-9 + /）"
+    )]
+    #[case::suffix_too_long(Mode::Suffix, &"a".repeat(43), "文字列が長すぎる: 43 文字（最大 42 文字）")]
+    fn invalid_with_mode(#[case] mode: Mode, #[case] s: &str, #[case] message: &str) {
+        assert_eq!(
+            Pattern::with_mode(s, true, mode).unwrap_err().to_string(),
+            message
+        );
+    }
+
+    /// 同じ文字列でも、探し方が違えば別の Pattern
+    #[rstest]
+    fn equality_includes_mode() {
+        let p = |mode| Pattern::with_mode("ab", true, mode).unwrap();
+        assert_eq!(p(Mode::Contains) == p(Mode::Contains), true);
+        assert_eq!(p(Mode::Contains) == p(Mode::Suffix), false);
+        assert_eq!(p(Mode::Suffix) == p(Mode::Regex), false);
+        assert_eq!(p(Mode::Regex) == p(Mode::Regex), true);
+    }
+
+    /// 末尾の期待試行回数は、1 か所だけなので 64^n（大小文字を区別しないなら英字1文字ごとに半分）。
+    /// 正規表現の文字列そのものなら、位置の数が同じなのでどこかに含むときとほぼ同じ
+    #[rstest]
+    #[case::suffix_cs(Mode::Suffix, "ab", true, 4096.0)]
+    #[case::suffix_ci(Mode::Suffix, "ab", false, 1024.0)]
+    #[case::suffix_digits(Mode::Suffix, "12", false, 4096.0)]
+    #[case::regex_suffix(Mode::Regex, "ab$", true, 4096.0)]
+    #[case::regex_two_choices(Mode::Regex, "[ab]$", true, 32.0)]
+    fn expected_tries_with_mode(
+        #[case] mode: Mode,
+        #[case] s: &str,
+        #[case] cs: bool,
+        #[case] want: f64,
+    ) {
+        let got = Pattern::with_mode(s, cs, mode).unwrap().expected_tries();
+        assert_eq!(
+            (got / want - 1.0).abs() < 1e-9,
+            true,
+            "{got}（期待 {want}）"
+        );
+    }
+
+    /// 長い文字列は、どこかに含む（期待値）と正規表現（確率）でほぼ同じ
+    #[rstest]
+    fn regex_probability_close_to_contains() {
+        check(256, ("[A-Za-z0-9]{4,6}", any::<bool>()), |(needle, cs)| {
+            let contains = pat(&needle, cs).probability();
+            let regex = Pattern::with_mode(&needle, cs, Mode::Regex)
+                .unwrap()
+                .probability();
+            prop_assert!(
+                (regex / contains - 1.0).abs() < 1e-3,
+                "{} {}",
+                regex,
+                contains
+            );
+            Ok(())
+        });
     }
 
     /// --bench の表示。既定は memmem

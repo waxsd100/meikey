@@ -6,7 +6,7 @@
 use super::{CliError, ValueError, execute, parse_from, parse_secs};
 use crate::lang::{t, tf};
 use crate::model::key::{InvalidComment, check_comment};
-use crate::model::pattern::{Pattern, PatternError};
+use crate::model::pattern::{Mode, Pattern, PatternError};
 use crate::repository::key_file::{KeyFileError, KeyFiles, KeyRepository};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Select};
@@ -200,16 +200,41 @@ pub(super) fn ask(p: &mut impl Prompt, repo: &impl KeyRepository) -> Result<Vec<
         return start(p, args);
     }
 
-    let target = p.input(
-        t!(
+    let mode = [Mode::Contains, Mode::Suffix, Mode::Regex][p.select(
+        t!("探し方", "How to match"),
+        &[
+            t!(
+                "固定部分の後ろのどこかに含む",
+                "Anywhere after the fixed part"
+            ),
+            t!("公開鍵の最後", "At the end of the public key"),
+            t!(
+                "正規表現（固定部分の後ろの 43 文字に一致する）",
+                "Regular expression (matched against the 43 characters after the fixed part)"
+            ),
+        ],
+        0,
+    )?];
+    let question = match mode {
+        Mode::Regex => t!(
+            "正規表現（^ は固定部分の直後、$ は最後）",
+            "Regular expression (^ is right after the fixed part, $ is the end)"
+        ),
+        _ => t!(
             "公開鍵に入れたい文字列（A-Z a-z 0-9 + /、最大42文字）",
             "Text to put in the public key (A-Z a-z 0-9 + /, up to 42 characters)"
         ),
-        "",
-        &|s| Ok(Pattern::new(s, false).map(drop)?),
-    )?;
+    };
+    let target = p.input(question, "", &|s| {
+        Ok(Pattern::with_mode(s, false, mode).map(drop)?)
+    })?;
     let letters = target.bytes().any(|b| b.is_ascii_alphabetic());
     args.push(target);
+    match mode {
+        Mode::Suffix => args.push("--suffix".to_string()),
+        Mode::Regex => args.push("--regex".to_string()),
+        Mode::Contains => {}
+    }
     if letters
         && p.confirm(
             t!(
@@ -488,20 +513,28 @@ mod tests {
     /// 鍵を作る: 既定のまま答えれば文字列だけ、変えたものだけ引数になる。数字や記号だけなら大文字小文字は聞かない
     #[rstest]
     #[case::defaults(
-        vec![Some(Select(0)), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Select(0)), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
         &["abc"]
     )]
     #[case::everything(
-        vec![Some(Select(0)), Some(Input("Wako")), Some(Confirm(true)), safe(), Some(Input("keys/k")), Some(Input("me@host")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Select(0)), Some(Input("Wako")), Some(Confirm(true)), safe(), Some(Input("keys/k")), Some(Input("me@host")), Some(Confirm(true))],
         &["Wako", "-s", "--output=keys/k", "--comment=me@host"]
     )]
     #[case::no_letters(
-        vec![Some(Select(0)), Some(Input("12+/")), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Select(0)), Some(Input("12+/")), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
         &["12+/"]
     )]
     #[case::comment_with_space(
-        vec![Some(Select(0)), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("-k")), Some(Input("wako kara")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Select(0)), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("-k")), Some(Input("wako kara")), Some(Confirm(true))],
         &["abc", "--output=-k", "--comment=wako kara"]
+    )]
+    #[case::suffix(
+        vec![Some(Select(0)), Some(Select(1)), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        &["abc", "--suffix"]
+    )]
+    #[case::regex(
+        vec![Some(Select(0)), Some(Select(2)), Some(Input("^[A-P]ab|z9$")), Some(Confirm(true)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        &["^[A-P]ab|z9$", "--regex", "-s"]
     )]
     fn generate(
         #[case] answers: Vec<Option<Answer>>,
@@ -517,9 +550,9 @@ mod tests {
     /// 両方は --both）。鍵を作る・測る・見る のどれでも聞く
     #[cfg(feature = "cuda")]
     #[rstest]
-    #[case::generate_gpu(vec![Select(0), Input("123"), Confirm(true), Select(1), Input(""), Input(""), Confirm(true)], &["123", "--low-security", "--gpu"])]
-    #[case::generate_cpu(vec![Select(0), Input("123"), Confirm(true), Select(0), Input(""), Input(""), Confirm(true)], &["123", "--low-security"])]
-    #[case::bench_both(vec![Select(1), Input("123"), Confirm(true), Select(2), Input(""), Confirm(true)], &["123", "--low-security", "--both", "--bench=10"])]
+    #[case::generate_gpu(vec![Select(0), Select(0), Input("123"), Confirm(true), Select(1), Input(""), Input(""), Confirm(true)], &["123", "--low-security", "--gpu"])]
+    #[case::generate_cpu(vec![Select(0), Select(0), Input("123"), Confirm(true), Select(0), Input(""), Input(""), Confirm(true)], &["123", "--low-security"])]
+    #[case::bench_both(vec![Select(1), Select(0), Input("123"), Confirm(true), Select(2), Input(""), Confirm(true)], &["123", "--low-security", "--both", "--bench=10"])]
     #[case::check_gpu(vec![Select(2), Confirm(true), Select(1), Confirm(true)], &["--check", "--low-security", "--gpu"])]
     fn device_choice(#[case] answers: Vec<Answer>, #[case] want: &[&str], repo: MockKeyRepository) {
         let mut script = Script::new(answers.into_iter().map(Some));
@@ -530,6 +563,7 @@ mod tests {
     #[rstest]
     fn safe_mode_uses_cpu(repo: MockKeyRepository) {
         let mut script = Script::new([
+            Some(Select(0)),
             Some(Select(0)),
             Some(Input("123")),
             safe(),
@@ -560,6 +594,7 @@ mod tests {
         let repo = MockKeyRepository::new();
         let mut script = Script::new([
             Some(Select(1)),
+            Some(Select(0)),
             Some(Input("abc")),
             Some(Confirm(false)),
             safe(),
@@ -582,23 +617,28 @@ mod tests {
     /// 検査に通らない答えは理由を見せて入れ直してもらう（文字列・秒数・保存先）
     #[rstest]
     #[case::invalid_char(
-        vec![Some(Select(0)), Some(Input("ab-c")), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Select(0)), Some(Input("ab-c")), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
         &["abc"], &["ab-c: 使えない文字: '-'（使える文字: A-Z a-z 0-9 + /）"]
     )]
     #[case::empty_target(
-        vec![Some(Select(0)), Some(Input("")), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Select(0)), Some(Input("")), Some(Input("abc")), Some(Confirm(false)), safe(), Some(Input("")), Some(Input("")), Some(Confirm(true))],
         &["abc"], &[": 文字列が空"]
     )]
     #[case::too_long(
-        vec![Some(Select(1)), Some(Input("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), Some(Input("123")), safe(), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(1)), Some(Select(0)), Some(Input("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), Some(Input("123")), safe(), Some(Input("")), Some(Confirm(true))],
         &["123", "--bench=10"], &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: 文字列が長すぎる: 43 文字（最大 42 文字）"]
     )]
+    #[case::bad_regex(
+        vec![Some(Select(1)), Some(Select(2)), Some(Input("a(")), Some(Input("a*")), Some(Input("^Q")), Some(Input("a+")), Some(Confirm(false)), safe(), Some(Input("")), Some(Confirm(true))],
+        &["a+", "--regex", "--bench=10"],
+        &["a(: 正規表現が正しくない: regex parse error:\n    a(\n     ^\nerror: unclosed group", "a*: 空の文字列に一致する正規表現は使えない（どの鍵にも一致する）", "^Q: この正規表現に一致する公開鍵は無い（使える文字は A-Z a-z 0-9 + /、固定部分の直後の 1 文字は A〜P）"]
+    )]
     #[case::bad_secs(
-        vec![Some(Select(1)), Some(Input("123")), safe(), Some(Input("0")), Some(Input("x")), Some(Input("2")), Some(Confirm(true))],
+        vec![Some(Select(1)), Some(Select(0)), Some(Input("123")), safe(), Some(Input("0")), Some(Input("x")), Some(Input("2")), Some(Confirm(true))],
         &["123", "--bench=2"], &["0: 0 より大きい秒数が必要", "x: 秒数ではない"]
     )]
     #[case::blank_output(
-        vec![Some(Select(0)), Some(Input("123")), safe(), Some(Input("  ")), Some(Input("")), Some(Input("")), Some(Confirm(true))],
+        vec![Some(Select(0)), Some(Select(0)), Some(Input("123")), safe(), Some(Input("  ")), Some(Input("")), Some(Input("")), Some(Confirm(true))],
         &["123"], &["  : 空"]
     )]
     fn rejected_answers_are_asked_again(
@@ -625,7 +665,13 @@ mod tests {
             .with(eq(Path::new("other")))
             .returning(|_| Ok(None));
         repo.expect_check_writable().times(1).returning(|_| Ok(()));
-        let mut answers = vec![Some(Select(0)), Some(Input("123")), safe(), Some(Input(""))];
+        let mut answers = vec![
+            Some(Select(0)),
+            Some(Select(0)),
+            Some(Input("123")),
+            safe(),
+            Some(Input("")),
+        ];
         answers.extend(middle.iter().copied().map(Some));
         answers.extend([Some(Input("")), Some(Confirm(true))]);
 
@@ -651,6 +697,7 @@ mod tests {
             .returning(|_| Ok(()));
         let mut script = Script::new([
             Some(Select(0)),
+            Some(Select(0)),
             Some(Input("123")),
             safe(),
             Some(Input("nodir/k")),
@@ -666,6 +713,7 @@ mod tests {
     #[rstest]
     fn shows_equivalent_command(repo: MockKeyRepository) {
         let mut script = Script::new([
+            Some(Select(0)),
             Some(Select(0)),
             Some(Input("Wako")),
             Some(Confirm(true)),
@@ -687,7 +735,7 @@ mod tests {
     #[rstest]
     #[case::first_question(vec![Some(Cancel)])]
     #[case::target(vec![Some(Select(0)), Some(Cancel)])]
-    #[case::comment(vec![Some(Select(0)), Some(Input("123")), safe(), Some(Input("")), Some(Cancel)])]
+    #[case::comment(vec![Some(Select(0)), Some(Select(0)), Some(Input("123")), safe(), Some(Input("")), Some(Cancel)])]
     #[case::declined(vec![Some(Select(2)), safe(), Some(Confirm(false))])]
     fn cancel(#[case] answers: Vec<Option<Answer>>, repo: MockKeyRepository) {
         let mut script = Script::new(answers);
@@ -714,6 +762,7 @@ mod tests {
     fn english(repo: MockKeyRepository) {
         crate::lang::set(crate::lang::Lang::En);
         let mut script = Script::new([
+            Some(Select(0)),
             Some(Select(0)),
             Some(Input("ab-c")),
             Some(Input("abc")),

@@ -23,6 +23,7 @@
 
 use crate::lang::{t, tf};
 use crate::model::key::VanityKey;
+use crate::model::pattern::{Mode, Pattern};
 use crate::model::search::{Outcome, SearchConfig, SeedSource, Stats, counter_seed};
 use crate::service::derive::comb::{for_each_entry_in_row, rows_cols};
 use crate::service::derive::field::Fe;
@@ -332,6 +333,57 @@ impl Tables {
     }
 }
 
+/// kernel.cu の探し方（MODE_CONTAINS など。model::pattern::Mode の順）
+const MODE_CONTAINS: u32 = 0;
+const MODE_SUFFIX: u32 = 1;
+const MODE_REGEX: u32 = 2;
+
+/// GPU に渡す探す文字列（kernel.cu の pk_match の needle・len・fold・mode）
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Needle {
+    /// 文字列（大小文字を区別しないなら、GPU 側で base64 を小文字にして比べるので小文字に）か、
+    /// 正規表現なら DFA の表（[`crate::model::pattern::dfa::Dfa::gpu_table`]）
+    bytes: Vec<u8>,
+    len: u32,
+    fold: bool,
+    mode: u32,
+}
+
+impl Needle {
+    fn new(pattern: Option<&Pattern>) -> Needle {
+        let Some(p) = pattern else {
+            // ベンチマークで判定しないとき: 長さ 0 は一致しない
+            return Needle {
+                bytes: Vec::new(),
+                len: 0,
+                fold: false,
+                mode: MODE_CONTAINS,
+            };
+        };
+        if let Some(dfa) = p.dfa() {
+            return Needle {
+                bytes: dfa.gpu_table(),
+                len: dfa.states() as u32,
+                fold: false,
+                mode: MODE_REGEX,
+            };
+        }
+        let bytes = match p.case_sensitive() {
+            true => p.as_str().as_bytes().to_vec(),
+            false => p.as_str().to_ascii_lowercase().into_bytes(),
+        };
+        Needle {
+            len: bytes.len() as u32,
+            bytes,
+            fold: !p.case_sensitive(),
+            mode: match p.mode() {
+                Mode::Suffix => MODE_SUFFIX,
+                _ => MODE_CONTAINS,
+            },
+        }
+    }
+}
+
 /// 探索の1回の起動に渡すもの（カーネルの引数のうち、起動ごとに変わらないもの）
 struct Launch {
     key: CudaSlice<u32>,
@@ -340,6 +392,7 @@ struct Launch {
     needle: CudaSlice<u8>,
     needle_len: u32,
     fold: u32,
+    mode: u32,
     stop_on_hit: u32,
     result: CudaSlice<u64>,
     sink: CudaSlice<u32>,
@@ -450,23 +503,22 @@ impl Kernel {
         u64::from(self.grid) * u64::from(BLOCK) * u64::from(self.options.batch)
     }
 
-    /// 起動に渡すものを GPU に置く。`key` はシードを作る乱数（ChaCha20 の鍵か、通し番号を足す 32 バイト）、
-    /// `needle` は探す文字列（fold なら小文字にしたもの）
+    /// 起動に渡すものを GPU に置く。`key` はシードを作る乱数（ChaCha20 の鍵か、通し番号を足す 32 バイト）
     fn prepare(
         &self,
         stream: &Arc<CudaStream>,
         key: &[u8; 32],
         source: SeedSource,
-        needle: &[u8],
-        fold: bool,
+        needle: &Needle,
         stop_on_hit: bool,
     ) -> Result<Launch, GpuError> {
         Ok(Launch {
             key: stream.clone_htod(&key_words(key))?,
             counter: u32::from(source == SeedSource::Counter),
-            needle: stream.clone_htod(&[needle, &[0; 64]].concat())?,
-            needle_len: needle.len() as u32,
-            fold: u32::from(fold),
+            needle: stream.clone_htod(&[&needle.bytes[..], &[0; 64]].concat())?,
+            needle_len: needle.len,
+            fold: u32::from(needle.fold),
+            mode: needle.mode,
             stop_on_hit: u32::from(stop_on_hit),
             result: stream.alloc_zeros::<u64>(2)?,
             sink: stream.alloc_zeros::<u32>((self.grid * BLOCK) as usize)?,
@@ -489,6 +541,7 @@ impl Kernel {
             .arg(&l.needle)
             .arg(&l.needle_len)
             .arg(&l.fold)
+            .arg(&l.mode)
             .arg(&base)
             .arg(&iters)
             .arg(&l.stop_on_hit)
@@ -510,14 +563,13 @@ impl Kernel {
     /// （最初の1回は、繰り返し回数を決めるための短い起動）
     fn measure(&self, stream: &Arc<CudaStream>) -> Result<f64, GpuError> {
         // GPU で探すのは低セキュリティモード（通し番号のシード）だけなので、それで測る
-        let mut l = self.prepare(
-            stream,
-            &[0x5a; 32],
-            SeedSource::Counter,
-            MEASURE_NEEDLE,
-            true,
-            false,
-        )?;
+        let needle = Needle {
+            bytes: MEASURE_NEEDLE.to_vec(),
+            len: MEASURE_NEEDLE.len() as u32,
+            fold: true,
+            mode: MODE_CONTAINS,
+        };
+        let mut l = self.prepare(stream, &[0x5a; 32], SeedSource::Counter, &needle, false)?;
         let start = Instant::now();
         self.launch(stream, &mut l, 0, 1)?;
         let once = start.elapsed().as_secs_f64().max(1e-6);
@@ -697,15 +749,9 @@ impl Gpu {
         let (stream, kernel) = (&self.stream, &self.kernel);
         // シードを作る ChaCha20 の鍵（起動ごとに新しい乱数）
         let key: [u8; 32] = rand::random();
-        // 探す文字列（大小文字を区別しないなら、GPU 側で base64 を小文字にして比べるので小文字に）
-        let (needle, fold) = match &config.pattern {
-            Some(p) if p.case_sensitive() => (p.as_str().as_bytes().to_vec(), false),
-            Some(p) => (p.as_str().to_ascii_lowercase().into_bytes(), true),
-            // ベンチマークで判定しないとき: 長さ 0 は一致しない
-            None => (Vec::new(), false),
-        };
+        let needle = Needle::new(config.pattern.as_ref());
         // ベンチマークでは当たっても止まらない
-        let mut l = kernel.prepare(stream, &key, config.seeds, &needle, fold, !config.bench)?;
+        let mut l = kernel.prepare(stream, &key, config.seeds, &needle, !config.bench)?;
 
         let start = Instant::now();
         let mut tries = 0u64;
@@ -970,7 +1016,6 @@ fn table_words(width: u32) -> Vec<u32> {
 mod tests {
     //! kernel.cu を CPU 向けにコンパイルしたもの（build.rs）を呼んで、Rust の実装と突き合わせる
     use super::*;
-    use crate::model::pattern::Pattern;
     #[cfg(meikey_gpu_host)]
     use crate::property::check;
     #[cfg(meikey_gpu_host)]
@@ -1003,12 +1048,19 @@ mod tests {
         fn meikey_test_fe_mul(a: *const u32, b: *const u32, out: *mut u32);
         fn meikey_test_fe_sq(a: *const u32, out: *mut u32);
         fn meikey_test_fe_invert_bytes(a: *const u32, out: *mut u8);
-        fn meikey_test_contains(pk: *const u8, needle: *const u8, len: u32, fold: u32) -> i32;
+        fn meikey_test_contains(
+            pk: *const u8,
+            needle: *const u8,
+            len: u32,
+            fold: u32,
+            mode: u32,
+        ) -> i32;
         fn meikey_test_contains_unsigned(
             pk: *const u8,
             needle: *const u8,
             len: u32,
             fold: u32,
+            mode: u32,
         ) -> i32;
         fn meikey_test_tail_b64(pk: *const u8, out: *mut u8);
         fn meikey_test_block() -> u32;
@@ -1023,6 +1075,7 @@ mod tests {
         *const u32,
         u32,
         *const u8,
+        u32,
         u32,
         u32,
         u64,
@@ -1333,6 +1386,7 @@ mod tests {
     fn contains_unsigned_never_misses(
         #[values(false, true)] case_sensitive: bool,
         #[values("[A-Za-z0-9+/]{1,2}", "[A-Za-z0-9+/]{3,6}")] needles: &'static str,
+        #[values(Mode::Contains, Mode::Suffix, Mode::Regex)] mode: Mode,
     ) {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -1354,23 +1408,10 @@ mod tests {
                 text[start..start + n.len()].copy_from_slice(n.as_bytes());
                 pk = *b64.decode(text).unwrap().last_chunk::<32>().unwrap();
             }
-            let p = Pattern::new(&n, case_sensitive).unwrap();
-            let bytes = if case_sensitive {
-                n.clone()
-            } else {
-                n.to_ascii_lowercase()
-            };
+            let p = mode_pattern(&n, case_sensitive, mode);
             let mut unsigned = pk;
             unsigned[31] &= 0x7f;
-            // SAFETY: pk は 32 バイト、needle は len バイト
-            let maybe = unsafe {
-                meikey_test_contains_unsigned(
-                    unsigned.as_ptr(),
-                    bytes.as_ptr(),
-                    bytes.len() as u32,
-                    u32::from(!case_sensitive),
-                )
-            } != 0;
+            let maybe = host_match(&unsigned, &p, true);
             for sign in [0u8, 0x80] {
                 let mut k = unsigned;
                 k[31] |= sign;
@@ -1386,7 +1427,10 @@ mod tests {
     /// base64 は model::key と同じで、判定は Pattern と同じ（大小文字の区別あり・なし）
     #[cfg(meikey_gpu_host)]
     #[rstest]
-    fn b64_and_match_agree_with_pattern(#[values(false, true)] case_sensitive: bool) {
+    fn b64_and_match_agree_with_pattern(
+        #[values(false, true)] case_sensitive: bool,
+        #[values(Mode::Contains, Mode::Suffix, Mode::Regex)] mode: Mode,
+    ) {
         let needle = "[A-Za-z0-9+/]{1,3}";
         check(1024, (any::<[u8; 32]>(), needle), |(seed, n)| {
             let key = VanityKey::from_seed(seed);
@@ -1396,22 +1440,8 @@ mod tests {
             unsafe { meikey_test_tail_b64(pk.as_ptr(), tail.as_mut_ptr()) };
             prop_assert_eq!(&tail[..], &key.public_b64()[24..]);
 
-            let p = Pattern::new(&n, case_sensitive).unwrap();
-            let bytes = if case_sensitive {
-                n.clone()
-            } else {
-                n.to_ascii_lowercase()
-            };
-            // SAFETY: pk は 32 バイト、needle は len バイト
-            let got = unsafe {
-                meikey_test_contains(
-                    pk.as_ptr(),
-                    bytes.as_ptr(),
-                    bytes.len() as u32,
-                    u32::from(!case_sensitive),
-                )
-            } != 0;
-            prop_assert_eq!(got, p.is_match(&key.public_b64()));
+            let p = mode_pattern(&n, case_sensitive, mode);
+            prop_assert_eq!(host_match(pk, &p, false), p.is_match(&key.public_b64()));
             Ok(())
         });
     }
@@ -1420,7 +1450,10 @@ mod tests {
     /// Pattern と同じ結果になる（先頭 2 文字で候補を絞ったあとの、残りを比べる部分も通す）
     #[cfg(meikey_gpu_host)]
     #[rstest]
-    fn match_agrees_with_pattern_for_parts_of_the_key(#[values(false, true)] case_sensitive: bool) {
+    fn match_agrees_with_pattern_for_parts_of_the_key(
+        #[values(false, true)] case_sensitive: bool,
+        #[values(Mode::Contains, Mode::Suffix, Mode::Regex)] mode: Mode,
+    ) {
         let cases = (
             any::<[u8; 32]>(),
             0usize..44,
@@ -1447,23 +1480,14 @@ mod tests {
                 n[i % len] = alphabet[v as usize];
             }
             let n = String::from_utf8(n).unwrap();
-            let Ok(p) = Pattern::new(&n, case_sensitive) else {
+            let source = match mode {
+                Mode::Regex => regex_syntax::escape(&n),
+                _ => n.clone(),
+            };
+            let Ok(p) = Pattern::with_mode(&source, case_sensitive, mode) else {
                 return Ok(()); // 長すぎるなど、Pattern が受け付けない文字列
             };
-            let bytes = if case_sensitive {
-                n.clone()
-            } else {
-                n.to_ascii_lowercase()
-            };
-            // SAFETY: pk は 32 バイト、needle は len バイト
-            let got = unsafe {
-                meikey_test_contains(
-                    key.public_bytes().as_ptr(),
-                    bytes.as_ptr(),
-                    bytes.len() as u32,
-                    u32::from(!case_sensitive),
-                )
-            } != 0;
+            let got = host_match(key.public_bytes(), &p, false);
             prop_assert_eq!(
                 got,
                 p.is_match(&b64),
@@ -1473,6 +1497,47 @@ mod tests {
             );
             Ok(())
         });
+    }
+
+    /// 文字列 `n` を探し方 `mode` で探す Pattern（正規表現なら、文字列そのものと、それを少し広げたもの
+    /// （1 文字目は大小文字のどちらでも・最後は 1 文字足してもよい）を交互に）
+    #[cfg(meikey_gpu_host)]
+    fn mode_pattern(n: &str, case_sensitive: bool, mode: Mode) -> Pattern {
+        let s = match mode {
+            Mode::Regex if n.len().is_multiple_of(2) => regex_syntax::escape(n),
+            Mode::Regex => {
+                let (first, rest) = n.split_at(1);
+                format!(
+                    "[{}{}]{}.?",
+                    first.to_ascii_lowercase(),
+                    first.to_ascii_uppercase(),
+                    regex_syntax::escape(rest)
+                )
+            }
+            _ => n.to_string(),
+        };
+        Pattern::with_mode(&s, case_sensitive, mode).unwrap()
+    }
+
+    /// CPU 向けにコンパイルした kernel.cu の pk_match で判定する（`unsigned` なら x の符号のビットは 0 にしてある）
+    #[cfg(meikey_gpu_host)]
+    fn host_match(pk: &[u8; 32], p: &Pattern, unsigned: bool) -> bool {
+        let n = Needle::new(Some(p));
+        let bytes = [&n.bytes[..], &[0; 64]].concat();
+        let f = match unsigned {
+            true => meikey_test_contains_unsigned,
+            false => meikey_test_contains,
+        };
+        // SAFETY: pk は 32 バイト、needle は len バイト（正規表現なら DFA の表）と余白
+        unsafe {
+            f(
+                pk.as_ptr(),
+                bytes.as_ptr(),
+                n.len,
+                u32::from(n.fold),
+                n.mode,
+            ) != 0
+        }
     }
 
     /// 埋め込んだ PTX は今の kernel.cu とその設定から作ったもの（違えば `cargo make ptx` で作り直す）
@@ -1837,6 +1902,7 @@ mod tests {
                 needle.as_ptr(),
                 2,
                 1,
+                MODE_CONTAINS,
                 0,
                 32,
                 1,
@@ -1856,5 +1922,48 @@ mod tests {
                 "{i} が先に当たる"
             );
         }
+    }
+
+    /// 末尾・正規表現でも、カーネル全体（CPU で真似たもの）が最初の当たりを返す（幅・リムの違う設定で）
+    #[cfg(meikey_gpu_host)]
+    #[rstest]
+    fn search_finds_first_hit_with_mode(
+        #[values(0, 7, 19)] variant: usize,
+        #[values((Mode::Suffix, "a"), (Mode::Suffix, "Q9"), (Mode::Regex, "^[A-P][0-9]"), (Mode::Regex, "x.y|z$"))]
+        pattern: (Mode, &str),
+    ) {
+        let h = &HOSTS[variant];
+        let (table, search) = (table(h.options.width), h.search);
+        let key: [u8; 32] = from_fn(|i| i as u8 * 11);
+        let p = Pattern::with_mode(pattern.1, false, pattern.0).unwrap();
+        let n = Needle::new(Some(&p));
+        let bytes = [&n.bytes[..], &[0; 64]].concat();
+        let mut result = [0u64; 2];
+        // SAFETY: 表・鍵・文字列・結果の大きさは kernel.cu の前提どおり
+        unsafe {
+            search(
+                1,
+                table.as_ptr(),
+                key_words(&key).as_ptr(),
+                1,
+                bytes.as_ptr(),
+                n.len,
+                u32::from(n.fold),
+                n.mode,
+                0,
+                1024,
+                1,
+                result.as_mut_ptr(),
+            );
+        }
+        assert_eq!(
+            result[0], 1,
+            "3 万鍵以上のうちにほぼ確実に出る（Q9 は 2048 鍵に 1 回）"
+        );
+        let hit = result[1];
+        let matches =
+            |i| p.is_match(&VanityKey::from_seed(seed(&key, SeedSource::Counter, i)).public_b64());
+        assert_eq!(matches(hit), true);
+        assert_eq!((0..hit).any(matches), false, "{hit} より前に当たりがある");
     }
 }

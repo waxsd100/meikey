@@ -1,9 +1,12 @@
 //! 探索ループで、公開鍵の base64 に文字列が含まれるかを速く判定する
 //!
-//! 結果は [`Pattern::find`] と同じ（最初に一致した位置）。探す方法は [`Find`] で選ぶ。
+//! 結果は [`Pattern::find`] と同じ（最初に一致した位置）。どこかに含む文字列を探す方法は [`Find`] で選ぶ。
+//! 末尾は最後の文字を比べるだけ、正規表現は DFA（[`Dfa`]）で判定する
 
+use crate::lang::t;
 use crate::model::key::{PUBLIC_B64_LEN, PublicB64};
-use crate::model::pattern::{Find, Pattern, SEARCH_START};
+use crate::model::pattern::dfa::Dfa;
+use crate::model::pattern::{Find, Mode, Pattern, SEARCH_START};
 use memchr::memmem;
 use std::ops::Range;
 
@@ -18,7 +21,10 @@ pub struct Matcher(Inner);
 )]
 #[derive(Debug, Clone)]
 enum Inner {
+    /// [`Pattern::find`] で判定する（総当たり・末尾）
     Naive(Pattern),
+    /// 正規表現の DFA
+    Dfa(Pattern),
     Memmem {
         finder: memmem::Finder<'static>,
         /// 公開鍵を小文字にそろえてから探す（大小文字を区別しないとき）
@@ -28,9 +34,10 @@ enum Inner {
 
 impl Matcher {
     pub fn new(pattern: &Pattern, find: Find) -> Matcher {
-        Matcher(match find {
-            Find::Naive => Inner::Naive(pattern.clone()),
-            Find::Memmem => {
+        Matcher(match (pattern.mode(), find) {
+            (Mode::Regex, _) => Inner::Dfa(pattern.clone()),
+            (Mode::Suffix, _) | (_, Find::Naive) => Inner::Naive(pattern.clone()),
+            (Mode::Contains, Find::Memmem) => {
                 // 大小文字を区別しないなら、探す文字列も公開鍵も小文字にそろえてから探す
                 let fold = !pattern.case_sensitive();
                 let needle: Vec<u8> = if fold {
@@ -46,11 +53,20 @@ impl Matcher {
         })
     }
 
+    /// 判定のしかたの名前（状態の表示用）
+    pub fn name(pattern: Option<&Pattern>, find: Find) -> &'static str {
+        match pattern.map(Pattern::mode) {
+            Some(Mode::Suffix) => t!("末尾を比べる", "compare the end"),
+            Some(Mode::Regex) => "DFA",
+            _ => find.name(),
+        }
+    }
+
     /// 公開鍵の base64 の中で一致した位置
     #[inline]
     pub fn find(&self, b64: &PublicB64) -> Option<Range<usize>> {
         match &self.0 {
-            Inner::Naive(p) => p.find(b64),
+            Inner::Naive(p) | Inner::Dfa(p) => p.find(b64),
             Inner::Memmem { finder, fold } => {
                 let hay: &[u8; PUBLIC_B64_LEN - SEARCH_START] =
                     b64[SEARCH_START..].as_array().expect("長さは定数");
@@ -69,7 +85,10 @@ impl Matcher {
 
     #[inline]
     pub fn is_match(&self, b64: &PublicB64) -> bool {
-        self.find(b64).is_some()
+        match &self.0 {
+            Inner::Dfa(p) => dfa(p).is_match(b64),
+            _ => self.find(b64).is_some(),
+        }
     }
 
     /// x の符号を 0 にした公開鍵の base64 `b64` に、符号が 0 でも 1 でも文字列が含まれる可能性があるか。
@@ -78,8 +97,17 @@ impl Matcher {
     /// （符号を毎回計算する）
     #[inline]
     pub fn may_match_unsigned(&self, b64: &PublicB64) -> bool {
-        let Inner::Memmem { finder, fold } = &self.0 else {
-            return true;
+        let (finder, fold) = match &self.0 {
+            Inner::Memmem { finder, fold } => (finder, fold),
+            Inner::Dfa(p) => {
+                return dfa(p).is_match_either(b64, SIGN_CHAR, with_sign(b64[SIGN_CHAR]));
+            }
+            Inner::Naive(p) if p.mode() == Mode::Suffix => {
+                let mut signed = *b64;
+                signed[SIGN_CHAR] = with_sign(b64[SIGN_CHAR]);
+                return p.is_match(b64) || p.is_match(&signed);
+            }
+            Inner::Naive(_) => return true,
         };
         if self.is_match(b64) {
             return true;
@@ -99,6 +127,10 @@ impl Matcher {
         }
         finder.find(window).is_some()
     }
+}
+
+fn dfa(p: &Pattern) -> &Dfa {
+    p.dfa().expect("正規表現の Pattern")
 }
 
 /// 公開鍵の base64 で、x の符号で変わる文字の位置（blob の最後のバイトの最上位ビットは、この文字の値のビット 1）
@@ -122,6 +154,7 @@ fn fold_case(c: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::pattern::Mode;
     use crate::model::pattern::tests::{ALPHABET, PREFIX_ONLY, SAMPLE, b64_with};
     use crate::property::check;
     use proptest::prelude::*;
@@ -130,6 +163,49 @@ mod tests {
 
     fn matcher(s: &str, cs: bool, how: Find) -> Matcher {
         Matcher::new(&Pattern::new(s, cs).unwrap(), how)
+    }
+
+    /// 文字列 `needle` を探し方 `mode` で探す Pattern（正規表現なら、文字列そのものに一致するよう逃がす）
+    fn pattern(needle: &str, cs: bool, mode: Mode) -> Pattern {
+        let s = match mode {
+            Mode::Regex => regex_syntax::escape(needle),
+            _ => needle.to_string(),
+        };
+        Pattern::with_mode(&s, cs, mode).unwrap()
+    }
+
+    /// 末尾・正規表現でも、判定は Pattern と同じ（--no-memmem でも同じ判定器）
+    #[rstest]
+    #[case::suffix(Mode::Suffix, "Gy9", true)]
+    #[case::suffix_miss(Mode::Suffix, "WaKo", false)]
+    #[case::regex(Mode::Regex, "W[a-z]Ko", true)]
+    #[case::regex_end(Mode::Regex, "9$", true)]
+    #[case::regex_miss(Mode::Regex, "^A", false)]
+    fn modes(
+        #[case] mode: Mode,
+        #[case] s: &str,
+        #[case] want: bool,
+        #[values(Find::Memmem, Find::Naive)] how: Find,
+    ) {
+        let p = Pattern::with_mode(s, true, mode).unwrap();
+        let m = Matcher::new(&p, how);
+        assert_eq!((m.is_match(SAMPLE), m.find(SAMPLE)), (want, p.find(SAMPLE)));
+    }
+
+    /// 状態の表示の名前: 末尾・正規表現は探し方で決まり、どこかに含むなら検索の方法
+    #[rstest]
+    fn names() {
+        let p = |mode| Pattern::with_mode("ab", true, mode).unwrap();
+        assert_eq!(Matcher::name(None, Find::Naive), "総当たり");
+        assert_eq!(
+            Matcher::name(Some(&p(Mode::Contains)), Find::Memmem),
+            "memmem"
+        );
+        assert_eq!(
+            Matcher::name(Some(&p(Mode::Suffix)), Find::Memmem),
+            "末尾を比べる"
+        );
+        assert_eq!(Matcher::name(Some(&p(Mode::Regex)), Find::Naive), "DFA");
     }
 
     #[rstest]
@@ -174,11 +250,17 @@ mod tests {
         #[values(false, true)] cs: bool,
         #[values(false, true)] planted: bool,
         #[values(Find::Memmem, Find::Naive)] how: Find,
+        #[values(Mode::Contains, Mode::Suffix, Mode::Regex)] mode: Mode,
     ) {
         let strategy = ("[A-Za-z0-9+/]{43}", needles, any::<usize>());
-        check(1024, strategy, |(rest, needle, pos)| {
+        check(256, strategy, |(rest, needle, pos)| {
+            // 末尾なら最後に埋め込む
+            let pos = match mode {
+                Mode::Suffix => 43 - needle.len(),
+                _ => pos,
+            };
             let b64 = b64_with(&needle, planted.then_some(pos), &rest);
-            let p = Pattern::new(&needle, cs).unwrap();
+            let p = pattern(&needle, cs, mode);
             let m = Matcher::new(&p, how);
             prop_assert_eq!(m.find(&b64), p.find(&b64));
             prop_assert_eq!(m.is_match(&b64), p.is_match(&b64));
@@ -218,10 +300,11 @@ mod tests {
         #[values("[A-Za-z0-9+/]{1,3}", "[A-Za-z0-9+/]{4,8}")] needles: &'static str,
         #[values(false, true)] cs: bool,
         #[values(Find::Memmem, Find::Naive)] how: Find,
+        #[values(Mode::Contains, Mode::Suffix, Mode::Regex)] mode: Mode,
     ) {
         let strategy = (any::<[u8; 32]>(), needles, 0usize..12, any::<bool>());
-        check(2048, strategy, |(mut pk, needle, back, plant)| {
-            let p = Pattern::new(&needle, cs).unwrap();
+        check(1024, strategy, |(mut pk, needle, back, plant)| {
+            let p = pattern(&needle, cs, mode);
             let m = Matcher::new(&p, how);
             let encode = |pk: &[u8; 32]| {
                 let mut b = [0u8; PUBLIC_B64_LEN];

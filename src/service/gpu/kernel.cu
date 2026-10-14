@@ -993,11 +993,11 @@ DEV void needle_values(u8 c, bool fold, u32 v[2]) {
     v[1] = fold && c >= 'a' && c <= 'z' ? v[0] - 26 : v[0];
 }
 
-/// pk の base64 の判定の範囲（後半の 1 文字目から）に needle があるか。needle は fold なら小文字にしてある。
-/// 文字にはせず 6 ビットの値のまま、全部の位置で先頭 2 文字（1 文字なら 1 文字）を比べて候補を絞り、
-/// 候補があるときだけ残りを比べる。`sign_unknown` なら pk の x の符号のビットは 0 にしてあり、符号が 0 でも
-/// 1 でも含まれる可能性があれば true（含まれる鍵はかならず true）
-DEV bool pk_contains(const u8 pk[32], const u8* needle, u32 len, bool fold, bool sign_unknown) {
+/// pk の base64 の判定の範囲（後半の 1 文字目から）に needle があるか（`suffix` なら最後にあるか）。
+/// needle は fold なら小文字にしてある。文字にはせず 6 ビットの値のまま、全部の位置で先頭 2 文字（1 文字なら
+/// 1 文字）を比べて候補を絞り、候補があるときだけ残りを比べる。`sign_unknown` なら pk の x の符号のビットは
+/// 0 にしてあり、符号が 0 でも 1 でも含まれる可能性があれば true（含まれる鍵はかならず true）
+DEV bool pk_contains(const u8 pk[32], const u8* needle, u32 len, bool fold, bool suffix, bool sign_unknown) {
     if (len == 0 || len > TAIL_B64 - SEARCH_FROM) return false;
     u32 c0[2], c1[2];
     needle_values(needle[0], fold, c0);
@@ -1020,9 +1020,62 @@ DEV bool pk_contains(const u8 pk[32], const u8* needle, u32 len, bool fold, bool
     u64 candidates = len >= 2 ? m0 & (m1 >> 1) : m0;
     // 判定の範囲（SEARCH_FROM から）で、needle が収まる位置（s + len ≤ 44）だけ
     candidates &= ((2ull << (TAIL_B64 - len)) - 1) & ~((1ull << SEARCH_FROM) - 1);
+    // 末尾なら、最後に収まる位置だけ
+    if (suffix) candidates &= 1ull << (TAIL_B64 - len);
     if (candidates == 0) return false;
     if (len <= 2) return true;
     return b64_contains_at(pk, fold, needle, len, candidates, sign_unknown);
+}
+
+/// 正規表現の DFA の表（model::pattern::dfa の gpu_table）で、状態 s から 6 ビットの値 v を読んだ後の状態。
+/// 表は状態ごとに 65 個の u16（リトルエンディアン）で、64 番目は文字列の終わりで一致するか
+DEV u32 dfa_at(const u8* table, u32 s, u32 i) {
+    u32 at = (s * 65u + i) * 2u;
+    return (u32)table[at] | (u32)table[at + 1] << 8;
+}
+
+/// 一致した状態（どの文字でもここに留まる）
+#define DFA_ACCEPT 0u
+/// 判定の範囲の最初の文字を読む前の状態
+#define DFA_START 1u
+
+/// DFA の状態 s が一致しているか（一致した状態か、ここで文字列が終わると一致するか）
+DEV bool dfa_done(const u8* table, u32 s) { return s == DFA_ACCEPT || dfa_at(table, s, 64) != 0; }
+
+/// pk の base64 の判定の範囲（後半の 1 文字目から最後まで）が、正規表現の DFA `table` に一致するか。
+/// `sign_unknown` なら pk の x の符号のビットは 0 にしてあり、SIGN_CHAR の文字は符号が 1 のときの値でも
+/// 読んで（そこから先は 2 つの状態を進める）、どちらかで一致すれば true
+DEV bool pk_dfa(const u8 pk[32], const u8* table, bool sign_unknown) {
+    u32 s = DFA_START, alt = DFA_START;
+    UNROLL
+    for (int g = 0; g < 11; g++) {
+        u32 b0 = g == 0 ? 32u : pk[3 * g - 1];
+        u32 n = b0 << 16 | (u32)pk[3 * g] << 8 | pk[3 * g + 1];
+        UNROLL
+        for (int k = 0; k < 4; k++) {
+            int pos = 4 * g + k;
+            if (pos < SEARCH_FROM) continue;
+            u32 v = (n >> (18 - 6 * k)) & 63;
+            if (pos == SIGN_CHAR) {
+                alt = dfa_at(table, s, sign_unknown ? v | 2 : v);
+            } else if (pos > SIGN_CHAR) {
+                alt = dfa_at(table, alt, v);
+            }
+            s = dfa_at(table, s, v);
+        }
+    }
+    return dfa_done(table, s) || dfa_done(table, alt);
+}
+
+/// 探し方（model::pattern::Mode）。needle は、MODE_REGEX なら DFA の表、ほかは文字列
+#define MODE_CONTAINS 0u
+#define MODE_SUFFIX 1u
+#define MODE_REGEX 2u
+
+/// pk の base64 が、探し方 `mode` で needle に一致するか（`sign_unknown` は pk_contains・pk_dfa と同じ）
+DEV bool pk_match(const u8 pk[32], const u8* needle, u32 len, bool fold, u32 mode, bool sign_unknown) {
+    if (mode == MODE_REGEX) return pk_dfa(pk, needle, sign_unknown);
+    return pk_contains(pk, needle, len, fold, mode == MODE_SUFFIX, sign_unknown);
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,7 +1146,7 @@ DEV void derive_batch(const u32* table, const u32 key[8], u64 first, bool counte
 /// 鍵の通し番号は base + ((it·nthreads + gid)·MEIKEY_BATCH + j)。
 /// 見つけたら result[0] を 0 → 1 にした最初のスレッドが result[1] に通し番号を書く
 DEV u32 thread_work(u64 gid, u64 nthreads, const u32* table, const u32 key[8], u32 counter, const u8* needle,
-                    u32 needle_len, u32 fold, u64 base, u32 iters, u32 stop_on_hit, u64* result) {
+                    u32 needle_len, u32 fold, u32 mode, u64 base, u32 iters, u32 stop_on_hit, u64* result) {
     u32 sink = 0;
     for (u32 it = 0; it < iters; it++) {
         if (stop_on_hit && VOLATILE_LOAD64(result) != 0) break;
@@ -1104,10 +1157,10 @@ DEV u32 thread_work(u64 gid, u64 nthreads, const u32* table, const u32 key[8], u
         // x の符号は、文字列が含まれそうな鍵だけ計算する（ほとんどの鍵は符号によらず含まれない）
         derive_batch_each(table, key, first, counter != 0, [&](int j, u8 pk[32], const fe& x, const fe& zinv) {
             sink ^= pk[31];
-            bool hit = pk_contains(pk, needle, needle_len, fold != 0, true);
+            bool hit = pk_match(pk, needle, needle_len, fold != 0, mode, true);
             if (hit) {
                 pk[31] |= (u8)(x_sign(x, zinv) << 7);
-                hit = pk_contains(pk, needle, needle_len, fold != 0, false);
+                hit = pk_match(pk, needle, needle_len, fold != 0, mode, false);
             }
             hits |= (u64)hit << j;
         });
@@ -1128,15 +1181,15 @@ DEV u32 thread_work(u64 gid, u64 nthreads, const u32* table, const u32 key[8], u
 // 制限しないと 160〜180 本になり、載るブロックが 2〜3 に減る）
 extern "C" __global__ void __launch_bounds__(MEIKEY_BLOCK, 4)
     meikey_search(const u32* __restrict__ table, const u32* __restrict__ key, u32 counter,
-                  const u8* __restrict__ needle, u32 needle_len, u32 fold, u64 base, u32 iters, u32 stop_on_hit,
-                  u64* result, u32* sink) {
+                  const u8* __restrict__ needle, u32 needle_len, u32 fold, u32 mode, u64 base, u32 iters,
+                  u32 stop_on_hit, u64* result, u32* sink) {
     u64 gid = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     u64 nthreads = (u64)gridDim.x * blockDim.x;
     u32 k[8];
     UNROLL
     for (int i = 0; i < 8; i++) k[i] = key[i];
-    sink[gid] = thread_work(gid, nthreads, table, k, counter, needle, needle_len, fold, base, iters, stop_on_hit,
-                            result);
+    sink[gid] = thread_work(gid, nthreads, table, k, counter, needle, needle_len, fold, mode, base, iters,
+                            stop_on_hit, result);
 }
 
 /// テスト用: スレッド gid が通し番号 first + gid·MEIKEY_BATCH から MEIKEY_BATCH 本の公開鍵を out に書く
@@ -1219,21 +1272,23 @@ extern "C" void TEST_FN(derive_batch)(const u32* table, const u32 key[8], u32 co
     derive_batch(table, key, first, counter != 0, out);
 }
 
-extern "C" int TEST_FN(contains)(const u8 pk[32], const u8* needle, u32 len, u32 fold) {
-    return pk_contains(pk, needle, len, fold != 0, false);
+extern "C" int TEST_FN(contains)(const u8 pk[32], const u8* needle, u32 len, u32 fold, u32 mode) {
+    return pk_match(pk, needle, len, fold != 0, mode, false);
 }
 
-extern "C" int TEST_FN(contains_unsigned)(const u8 pk[32], const u8* needle, u32 len, u32 fold) {
-    return pk_contains(pk, needle, len, fold != 0, true);
+extern "C" int TEST_FN(contains_unsigned)(const u8 pk[32], const u8* needle, u32 len, u32 fold, u32 mode) {
+    return pk_match(pk, needle, len, fold != 0, mode, true);
 }
 
 extern "C" void TEST_FN(tail_b64)(const u8 pk[32], u8 out[TAIL_B64]) { tail_b64(pk, false, out); }
 
 /// カーネル全体を CPU で真似る（スレッドを順に回す）
 extern "C" void TEST_FN(search)(u64 nthreads, const u32* table, const u32 key[8], u32 counter, const u8* needle,
-                                   u32 needle_len, u32 fold, u64 base, u32 iters, u32 stop_on_hit, u64* result) {
+                                   u32 needle_len, u32 fold, u32 mode, u64 base, u32 iters, u32 stop_on_hit,
+                                   u64* result) {
     for (u64 gid = 0; gid < nthreads; gid++) {
-        thread_work(gid, nthreads, table, key, counter, needle, needle_len, fold, base, iters, stop_on_hit, result);
+        thread_work(gid, nthreads, table, key, counter, needle, needle_len, fold, mode, base, iters, stop_on_hit,
+                    result);
     }
 }
 

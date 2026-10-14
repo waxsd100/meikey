@@ -33,6 +33,8 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAiytFbrDh3MEGkK6xS5oe22CBkwAkOiHqOUBG+RECKz
 cargo make run wakokara --bench 10                                  # 速度と期待時間を測る
 cargo make run wakokara -C wakokara -o ~/.ssh/id_ed25519_wakokara   # 鍵を探して書き出す
 cargo make run wakokara --low-security --bench 10                   # 低セキュリティモード（速さを優先）
+cargo make run wakokara --suffix -o ~/.ssh/id_ed25519_wakokara      # 公開鍵の最後が wakokara の鍵
+cargo make run 'wako(kara)?$' --regex --bench 10                    # 正規表現で探す
 ```
 
 引数を付けずに起動すると、することと文字列・保存先・コメントなどを順に聞かれ、選んだり入力したりして始められる。始める前に、同じことをする引数を表示する。
@@ -59,6 +61,8 @@ cargo make run wakokara --low-security --both -C wakokara -o ~/.ssh/id_ed25519_w
 | オプション | 意味 |
 |---|---|
 | `-s`, `--case-sensitive` | 大文字小文字を区別する |
+| `--suffix` | 公開鍵の最後が文字列で終わる鍵だけを探す |
+| `--regex` | 文字列を正規表現として探す（下の「正規表現」を参照） |
 | `-j N` | スレッド数（既定: 全コア） |
 | `-o PATH` | 秘密鍵の出力先。公開鍵は `PATH.pub` |
 | `-C TEXT` | 鍵のコメント |
@@ -78,6 +82,18 @@ cargo make run wakokara --low-security --both -C wakokara -o ~/.ssh/id_ed25519_w
 - 使える文字は `A-Z a-z 0-9 + /`、最大 42 文字
 - 入るのは `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI` の後ろ
 - 大文字小文字を区別しないと、`WaKoKaRa` のように混ざった形で出る
+- 既定では固定部分の後ろのどこかに入った鍵を探し、`--suffix` を付けると最後に入った鍵だけを探す
+
+### 正規表現
+
+`--regex` を付けると、文字列を正規表現として、固定部分の後ろの 43 文字に一致する鍵を探す。
+
+- `^` は固定部分の直後、`$` は公開鍵の最後に一致する
+- 固定部分の直後の 1 文字は `A`〜`P` のどれかなので、`^Q` のように一致する鍵が無い正規表現はエラーになる
+- 空の文字列に一致する正規表現（`a*` など）はどの鍵にも一致するので使えない
+- `-s` を付けなければ大文字小文字を区別しない
+- 期待試行回数は、正規表現から作った DFA で、1 つの鍵が一致する確率を計算して出す
+- GPU（`--gpu`・`--both`）でも使える
 
 ## Google Colab
 

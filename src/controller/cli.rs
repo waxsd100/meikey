@@ -7,7 +7,7 @@ use crate::controller::format;
 use crate::lang::{Lang, current, t, tf};
 use crate::model::backend::{Compress, Mul, Simd};
 use crate::model::key::check_comment;
-use crate::model::pattern::{Find, Pattern};
+use crate::model::pattern::{Find, Mode, Pattern};
 use crate::model::search::{SearchConfig, SeedSource, Stats};
 use crate::repository::key_file::{KeyFiles, KeyRepository, pub_path};
 use crate::service::search::{Parallel, Searcher};
@@ -39,6 +39,12 @@ struct Cli {
 
     #[arg(short = 's', long)]
     case_sensitive: bool,
+
+    #[arg(long, conflicts_with = "regex")]
+    suffix: bool,
+
+    #[arg(long)]
+    regex: bool,
 
     #[arg(short = 'j', long, value_parser = |s: &str| int_in(s, 1, u16::MAX.into()).map(|n| n as u16))]
     threads: Option<u16>,
@@ -116,8 +122,8 @@ const ABOUT: (&str, &str) = (
 const HELP: &[(&str, &str, &str)] = &[
     (
         "target",
-        "公開鍵に入れたい文字列（A-Z a-z 0-9 + /、最大42文字）",
-        "Text to put in the public key (A-Z a-z 0-9 + /, up to 42 characters)",
+        "公開鍵に入れたい文字列（A-Z a-z 0-9 + /、最大42文字。--regex なら正規表現）",
+        "Text to put in the public key (A-Z a-z 0-9 + /, up to 42 characters; a regular expression with --regex)",
     ),
     (
         "check",
@@ -128,6 +134,18 @@ const HELP: &[(&str, &str, &str)] = &[
         "case_sensitive",
         "大文字小文字を区別する（英字8文字なら256倍遅くなる）",
         "Match upper and lower case exactly (8 letters make it 256 times slower)",
+    ),
+    (
+        "suffix",
+        "公開鍵の最後が文字列で終わる鍵だけを探す（既定は、固定部分の後ろのどこかに含む鍵）",
+        "Look only for keys whose public key ends with the text (by default, the text can be anywhere after the fixed part)",
+    ),
+    (
+        "regex",
+        "文字列を正規表現として、固定部分の後ろの 43 文字に一致する鍵を探す（^ は固定部分の直後、$ は最後。\
+         -s を付けなければ大小文字を区別しない）",
+        "Treat the text as a regular expression and look for keys whose 43 characters after the fixed part \
+         match it (^ is right after the fixed part and $ is the end; case-insensitive unless -s is given)",
     ),
     (
         "threads",
@@ -461,7 +479,7 @@ fn execute(cli: &Cli) -> Result<(), CliError> {
 fn gpu(cli: &Cli) -> Result<crate::service::gpu::Gpu, CliError> {
     use crate::service::gpu::{EMBEDDED, Gpu};
     if !cli.check {
-        Pattern::new(cli.target.as_ref().unwrap(), cli.case_sensitive)?;
+        pattern(cli)?;
         check_comment(&cli.comment)?;
         if cli.bench.is_none() {
             check_output(cli, &KeyFiles)?;
@@ -539,29 +557,14 @@ fn run(cli: &Cli, searcher: &impl Searcher, repo: &impl KeyRepository) -> Result
         return Ok(());
     }
 
-    let target = cli.target.as_ref().unwrap();
-    let pattern = Pattern::new(target, cli.case_sensitive)?;
+    let pattern = pattern(cli)?;
     check_comment(&cli.comment)?;
     config.pattern = Some(pattern.clone());
 
     let mut rows = searcher.status(&config);
     rows.push(seed_row(&config));
     rows.extend([
-        (
-            t!("文字列", "Text"),
-            match pattern.case_sensitive() {
-                true => tf!(
-                    "{}（大小文字の区別あり）",
-                    "{} (case-sensitive)",
-                    pattern.as_str()
-                ),
-                false => tf!(
-                    "{}（大小文字の区別なし）",
-                    "{} (case-insensitive)",
-                    pattern.as_str()
-                ),
-            },
-        ),
+        (t!("文字列", "Text"), describe(&pattern)),
         (
             t!("期待試行", "Est. tries"),
             about(&format::count(pattern.expected_tries())),
@@ -572,6 +575,37 @@ fn run(cli: &Cli, searcher: &impl Searcher, repo: &impl KeyRepository) -> Result
     match cli.bench {
         Some(limit) => bench(searcher, config, &pattern, limit),
         None => generate(cli, searcher, repo, config, &pattern),
+    }
+}
+
+/// 探す文字列と探し方（--suffix・--regex）
+fn pattern(cli: &Cli) -> Result<Pattern, CliError> {
+    let mode = match (cli.suffix, cli.regex) {
+        (true, _) => Mode::Suffix,
+        (_, true) => Mode::Regex,
+        _ => Mode::Contains,
+    };
+    Ok(Pattern::with_mode(
+        cli.target.as_ref().unwrap(),
+        cli.case_sensitive,
+        mode,
+    )?)
+}
+
+/// 状態の表示の「文字列」の値（探し方と、大小文字を区別するか）
+fn describe(pattern: &Pattern) -> String {
+    let case = match pattern.case_sensitive() {
+        true => t!("大小文字の区別あり", "case-sensitive"),
+        false => t!("大小文字の区別なし", "case-insensitive"),
+    };
+    match pattern.mode() {
+        Mode::Contains => tf!("{}（{case}）", "{} ({case})", pattern.as_str()),
+        mode => tf!(
+            "{}（{}・{case}）",
+            "{} ({}, {case})",
+            pattern.as_str(),
+            mode.name()
+        ),
     }
 }
 

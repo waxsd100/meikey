@@ -48,7 +48,7 @@ fn hosts_rs() -> String {
         decls += &format!(
             "    fn {p}derive_batch(table: *const u32, key: *const u32, counter: u32, first: u64, out: *mut u8);\n\
              \x20   fn {p}search(nthreads: u64, table: *const u32, key: *const u32, counter: u32, needle: *const u8, \
-             needle_len: u32, fold: u32, base: u64, iters: u32, stop_on_hit: u32, result: *mut u64);\n\
+             needle_len: u32, fold: u32, mode: u32, base: u64, iters: u32, stop_on_hit: u32, result: *mut u64);\n\
              \x20   fn {p}fe_op_words(op: u32, a: *const u32, b: *const u32, out: *mut u8);\n\
              \x20   fn {p}batch() -> u32;\n\
              \x20   fn {p}width() -> u32;\n\

@@ -60,7 +60,10 @@ impl Searcher for Parallel {
             ("SIMD", b.simd.effective().name().into()),
             (t!("倍算", "Multiply"), b.mul.name().into()),
             (t!("逆元", "Inverse"), b.compress.name()),
-            (t!("検索", "Search"), config.find.name().into()),
+            (
+                t!("検索", "Search"),
+                Matcher::name(config.pattern.as_ref(), config.find).into(),
+            ),
             (
                 t!("並列", "Threads"),
                 tf!("{} スレッド", "{}", config.threads),
@@ -280,7 +283,7 @@ mod tests {
     use super::MockSearcher;
     use super::*;
     use crate::model::backend::Backend;
-    use crate::model::pattern::{Find, Pattern};
+    use crate::model::pattern::{Find, Mode, Pattern};
     use crate::property::check;
     use proptest::prelude::*;
     use rstest::{fixture, rstest};
@@ -337,6 +340,28 @@ mod tests {
         let key = out.key.expect("短い文字列ならすぐ見つかる");
         assert_eq!(cfg.pattern.unwrap().is_match(&key.public_b64()), true);
         assert_eq!(out.stats.tries >= 1, true);
+    }
+
+    /// 末尾・正規表現でも、短いものはすぐ見つかり、見つかった鍵は一致している。末尾の 2 文字目は x の符号で
+    /// 変わる文字なので、符号を後から計算する判定も通る
+    #[rstest]
+    fn finds_matching_key_with_mode(
+        #[values((Mode::Suffix, "a"), (Mode::Suffix, "Wa"), (Mode::Regex, "^[A-P][0-9]"), (Mode::Regex, "a.b|9$"))]
+        pattern: (Mode, &str),
+        #[values(Backend::FAST, Backend::BASELINE)] backend: Backend,
+        #[values(SeedSource::ChaCha20, SeedSource::Counter)] seeds: SeedSource,
+    ) {
+        let (mode, s) = pattern;
+        let cfg = SearchConfig {
+            threads: 2,
+            backend,
+            seeds,
+            time_limit: Some(Duration::from_secs(10)),
+            ..SearchConfig::new(Some(Pattern::with_mode(s, false, mode).unwrap()))
+        };
+        let key = run(&cfg, |_| {}).key.expect("すぐ見つかる");
+        let recomputed = VanityKey::from_seed(*key.seed()).public_b64();
+        assert_eq!(cfg.pattern.unwrap().is_match(&recomputed), true);
     }
 
     /// 見つからない探索（--bench で当たりを無視する場合も）は、時間制限が来たらすぐ止まる

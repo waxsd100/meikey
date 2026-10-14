@@ -63,6 +63,7 @@ mod tests {
     fn generates_key(dir: TempDir) {
         let mut p = spawn_in(dir.path());
         answer(&mut p, "何をする", ENTER);
+        answer(&mut p, "探し方", ENTER);
         answer(&mut p, "公開鍵に入れたい文字列", &format!("12{ENTER}"));
         // 低セキュリティモードにしない（使うものは聞かれず CPU）
         answer(&mut p, "低セキュリティモードにする", ENTER);
@@ -84,6 +85,25 @@ mod tests {
         assert_eq!(dir.path().join("id_ed25519_meikey").exists(), true);
     }
 
+    /// 探し方で「公開鍵の最後」（下矢印で 2 つ目）を選ぶと --suffix になり、最後がその文字列の鍵を書き出す
+    #[rstest]
+    fn suffix_from_menu(dir: TempDir) {
+        let mut p = spawn_in(dir.path());
+        answer(&mut p, "何をする", ENTER);
+        answer(&mut p, "探し方", &format!("\x1b[B{ENTER}"));
+        answer(&mut p, "公開鍵に入れたい文字列", &format!("7{ENTER}"));
+        answer(&mut p, "低セキュリティモードにする", ENTER);
+        answer(&mut p, "秘密鍵の保存先", ENTER);
+        answer(&mut p, "鍵のコメント", ENTER);
+        answer(&mut p, "引数で起動するなら: meikey 7 --suffix", "");
+        answer(&mut p, "始める？", "y");
+        answer(&mut p, "パスフレーズ", "");
+        assert_eq!(exit_code(p), 0);
+        let public = read_to_string(dir.path().join("id_ed25519_meikey.pub")).unwrap();
+        let b64 = public.split(' ').nth(1).unwrap();
+        assert_eq!(b64.trim_end().ends_with('7'), true, "{public}");
+    }
+
     /// 最初の質問で Esc を押すと、何もせずに終わる
     #[rstest]
     fn esc_cancels(dir: TempDir) {
@@ -99,6 +119,7 @@ mod tests {
     fn ctrl_c_during_search(dir: TempDir) {
         let mut p = spawn_in(dir.path());
         answer(&mut p, "何をする", ENTER);
+        answer(&mut p, "探し方", ENTER);
         // 何年もかかる文字列
         answer(
             &mut p,
@@ -121,6 +142,7 @@ mod tests {
     fn english_locale(dir: TempDir) {
         let mut p = spawn_with_locale(dir.path(), "en_US.UTF-8");
         answer(&mut p, "What to do", ENTER);
+        answer(&mut p, "How to match", ENTER);
         answer(
             &mut p,
             "Text to put in the public key",

@@ -67,6 +67,11 @@ mod tests {
     #[case::bench_nan(&["wako", "--bench", "NaN"], &[], "0 より大きい秒数")]
     #[case::bench_not_a_number(&["wako", "--bench", "abc"], &[], "秒数ではない")]
     #[case::unknown_simd(&["wako", "--simd", "avx1024"], &[], "'--simd <LEVEL>'")]
+    #[case::suffix_and_regex(&["wako", "--suffix", "--regex"], &[], "'--suffix' と '--regex' は一緒に付けられない")]
+    #[case::suffix_invalid(&["wa-ko", "--suffix"], &[], "使えない文字: '-'")]
+    #[case::regex_syntax(&["wa(ko", "--regex"], &[], "正規表現が正しくない")]
+    #[case::regex_empty_match(&["w*", "--regex"], &[], "空の文字列に一致する正規表現は使えない")]
+    #[case::regex_never(&["^Q", "--regex"], &[], "この正規表現に一致する公開鍵は無い")]
     // コメントに改行（.pub が2行に割れる）
     #[case::comment_lf(&[PATTERN, "-C", "wako\nkara"], &[], "コメントに使えない文字")]
     #[case::comment_cr(&[PATTERN, "-C", "wako\rkara"], &[], "コメントに使えない文字")]
@@ -282,6 +287,44 @@ mod tests {
             let mode = metadata(dir.path().join(KEY)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "秘密鍵は所有者だけ読める");
         }
+    }
+
+    /// 末尾（--suffix）・正規表現（--regex）で探して書き出す。公開鍵は条件に合い、`^` は一致した位置を指す
+    #[rstest]
+    #[case::suffix(&["Q", "--suffix"], "(?i)q$")]
+    #[case::suffix_case_sensitive(&["k9", "--suffix", "-s"], "k9$")]
+    #[case::regex(&["^[A-P][0-9]", "--regex"], "^[A-P][0-9]")]
+    #[case::regex_alternation(&["w.k|zz$", "--regex", "-s"], "w.k|zz$")]
+    fn writes_key_with_mode(
+        #[case] args: &[&str],
+        #[case] want: &str,
+        #[values(Mode::Fast, Mode::ConstantTime)] mode: Mode,
+        dir: TempDir,
+    ) {
+        let mut all = args.to_vec();
+        all.extend(["-j", "2", "-C", COMMENT]);
+        all.extend(mode.args());
+        let out = run_with(dir.path(), &all, &[]);
+        assert_eq!(out.status.success(), true, "{}", stderr(&out));
+        let pub_line = read_to_string(dir.path().join(PUB)).unwrap();
+        let b64 = pub_line.split(' ').nth(1).unwrap();
+        let free = &b64["AAAAC3NzaC1lZDI1NTE5AAAAI".len()..];
+        let m = regex::Regex::new(want)
+            .unwrap()
+            .find(free)
+            .expect("条件に合う");
+
+        // ^ は固定部分の後ろの、一致した位置を指す
+        let marker = stderr(&out)
+            .lines()
+            .find(|l| l.trim_start().starts_with('^'))
+            .expect("^ の行がある")
+            .to_owned();
+        let start = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI".len() + m.start();
+        assert_eq!(
+            marker,
+            format!("{}{}", " ".repeat(start), "^".repeat(m.len()))
+        );
     }
 
     /// 表示の言語は OS のロケールで決まる: 日本語なら日本語、それ以外（英語・C・ほかの言語・未設定）は英語。
