@@ -213,7 +213,8 @@ mod tests {
             let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
             let seed_debug = format!("{seed:?}");
             prop_assert!(dbg.contains("ssh-ed25519"));
-            prop_assert!(!dbg.contains("seed"));
+            // フィールド名（公開鍵の base64 に「seed」が出ることはあるが、「:」は出ない）
+            prop_assert!(!dbg.contains("seed:"));
             prop_assert!(!dbg.contains(&hex));
             prop_assert!(!dbg.contains(&seed_debug));
             Ok(())
