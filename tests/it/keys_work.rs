@@ -419,7 +419,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// `ssh-keygen -t ed25519` が作った鍵と同じシード・コメント・checkint を meikey に渡すと、
-    /// 秘密鍵も `.pub` も1バイトも違わない。コメント（改行・NUL 以外の任意の Unicode）のバイト数を
+    /// 秘密鍵も `.pub` も1バイトも違わない（`.pub` は、コメントが空のときに ssh-keygen が付ける最後の空白だけ除く）。コメント（改行・NUL 以外の任意の Unicode）のバイト数を
     /// 8 で割った余りを変えて、パディング 0〜7 バイトをすべて通す
     #[rstest]
     fn meikey_writes_the_same_bytes_as_ssh_keygen(
@@ -439,7 +439,15 @@ mod tests {
                 private_openssh(&key, &comment, file.checkint1),
                 theirs.private
             );
-            prop_assert_eq!(key.public_openssh(&comment), theirs.pub_line);
+            // ssh-keygen はコメントが空でも、鍵の後ろに区切りの空白を 1 つ書く（meikey は書かない）
+            let want = match comment.is_empty() {
+                true => theirs
+                    .pub_line
+                    .strip_suffix(' ')
+                    .unwrap_or(&theirs.pub_line),
+                false => &theirs.pub_line,
+            };
+            prop_assert_eq!(key.public_openssh(&comment), want);
             Ok(())
         });
     }

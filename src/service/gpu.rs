@@ -1934,7 +1934,7 @@ mod tests {
     ) {
         let h = &HOSTS[variant];
         let (table, search) = (table(h.options.width), h.search);
-        let key: [u8; 32] = from_fn(|i| i as u8 * 11);
+        let key: [u8; 32] = from_fn(|i| (i as u8).wrapping_mul(11));
         let p = Pattern::with_mode(pattern.1, false, pattern.0).unwrap();
         let n = Needle::new(Some(&p));
         let bytes = [&n.bytes[..], &[0; 64]].concat();
