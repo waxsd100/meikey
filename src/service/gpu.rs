@@ -1461,7 +1461,9 @@ mod tests {
             any::<u64>(),
             proptest::option::of((0usize..44, 0u8..64)),
         );
-        check(4096, cases, |(seed, start, len, flips, edit)| {
+        // 正規表現は 1 件ごとに DFA と確率を計算するので、件数を減らす
+        let n = if mode == Mode::Regex { 512 } else { 4096 };
+        check(n, cases, |(seed, start, len, flips, edit)| {
             let key = VanityKey::from_seed(seed);
             let b64 = key.public_b64();
             let tail = &b64[24..];

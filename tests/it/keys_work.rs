@@ -468,12 +468,12 @@ mod tests {
         let (key, pub_path) = files.write_to(dir.path());
         run(Command::new("ssh-keygen").args(args).arg("-f").arg(&key));
 
-        let rewritten = read_to_string(&key).unwrap();
+        let rewritten = lf(&read_to_string(&key).unwrap());
         let checkint = parse_private_key_file(&rewritten).unwrap().checkint1;
         let vanity = VanityKey::from_seed(files.seed());
         assert_eq!(private_openssh(&vanity, comment, checkint), rewritten);
         assert_eq!(
-            read_to_string(&pub_path).unwrap(),
+            lf(&read_to_string(&pub_path).unwrap()),
             vanity.public_openssh(comment) + "\n"
         );
     }

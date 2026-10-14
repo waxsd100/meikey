@@ -1,4 +1,5 @@
-//! 表示する言語: OS のロケールが日本語なら日本語、それ以外は英語
+//! 表示する言語: ロケールが日本語なら日本語、それ以外は英語。ロケールは、環境変数（LANGUAGE・LC_ALL・
+//! LC_MESSAGES・LANG の順）にあればそれ、無ければ OS の設定（Windows では表示言語）
 //!
 //! 表示する文はどれも、その場で日本語と英語を並べて書き、[`t!`]（そのまま）か [`tf!`]（`format!` する）で
 //! 今の言語のほうを選ぶ。
@@ -24,11 +25,24 @@ impl Lang {
     }
 }
 
-/// 今の言語（OS のロケールから、最初に1回だけ決める。ロケールがわからなければ英語）
+/// ロケールの環境変数（POSIX と同じ LANGUAGE・LC_ALL・LC_MESSAGES・LANG の順で、空でない最初のもの）からの言語。
+/// LANGUAGE は「:」区切りの最初のもの。Unix では OS の設定もこの環境変数なので同じになり、Windows でも
+/// 環境変数で選べる（Git Bash などが LANG を設定する）
+pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Option<Lang> {
+    ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .filter_map(&get)
+        .find_map(|v| v.split(':').find(|p| !p.is_empty()).map(Lang::from_locale))
+}
+
+/// 今の言語（最初に1回だけ決める。ロケールがわからなければ英語）
 #[cfg(not(test))]
 pub fn current() -> Lang {
     static LANG: std::sync::OnceLock<Lang> = std::sync::OnceLock::new();
-    *LANG.get_or_init(|| sys_locale::get_locale().map_or(Lang::En, |l| Lang::from_locale(&l)))
+    *LANG.get_or_init(|| {
+        from_env(|k| std::env::var(k).ok())
+            .unwrap_or_else(|| sys_locale::get_locale().map_or(Lang::En, |l| Lang::from_locale(&l)))
+    })
 }
 
 #[cfg(test)]
@@ -75,6 +89,24 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use similar_asserts::assert_eq;
+
+    /// 環境変数は LANGUAGE・LC_ALL・LC_MESSAGES・LANG の順に、空でない最初のものを使う
+    #[rstest]
+    #[case::none(&[], None)]
+    #[case::lang(&[("LANG", "ja_JP.UTF-8")], Some(Lang::Ja))]
+    #[case::lc_all_first(&[("LC_ALL", "en_US.UTF-8"), ("LANG", "ja_JP.UTF-8")], Some(Lang::En))]
+    #[case::language_first(&[("LANGUAGE", "ja:en"), ("LC_ALL", "C")], Some(Lang::Ja))]
+    #[case::empty_is_skipped(&[("LC_ALL", ""), ("LANG", "ja_JP.UTF-8")], Some(Lang::Ja))]
+    #[case::lc_messages(&[("LC_MESSAGES", "ja_JP"), ("LANG", "C")], Some(Lang::Ja))]
+    #[case::c(&[("LC_ALL", "C")], Some(Lang::En))]
+    fn from_env_order(#[case] vars: &[(&str, &str)], #[case] want: Option<Lang>) {
+        let get = |k: &str| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        };
+        assert_eq!(from_env(get), want);
+    }
 
     /// 言語が日本語のロケールだけ日本語。地域・文字コード・修飾子が付いていても、大文字でもよい
     #[rstest]

@@ -109,7 +109,7 @@ With `--regex`, the regular expression is matched against the 43 characters afte
 | `--gpu-width`, `--gpu-batch`, `--gpu-limbs` | GPU settings (without them, the fastest is measured on the GPU before searching) |
 | `--simd LEVEL` | Highest SIMD level to use (`avx512-ifma`, `avx512`, `avx2`, `off`) |
 
-`meikey --help` lists every option. Messages are in Japanese if the OS locale is Japanese, and in English otherwise.
+`meikey --help` lists every option. Messages are in Japanese if the locale (the LANG, LC_ALL and similar environment variables, or else the OS setting) is Japanese, and in English otherwise.
 
 ### GPU
 

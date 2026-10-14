@@ -235,9 +235,9 @@ pub fn ssh_keygen_ed25519(
         .args(args)
         .arg("-f")
         .arg(&path));
-    let pub_file = read_to_string(path.with_added_extension("pub")).unwrap();
+    let pub_file = lf(&read_to_string(path.with_added_extension("pub")).unwrap());
     KeyFiles {
-        private: read_to_string(&path).unwrap(),
+        private: lf(&read_to_string(&path).unwrap()),
         pub_line: pub_file.strip_suffix('\n').unwrap().to_owned(),
     }
 }
@@ -319,11 +319,18 @@ macro_rules! require {
 }
 pub(crate) use require;
 
-/// コマンドを実行し、失敗したら標準エラーを付けてパニックする
+/// 改行を LF にそろえる（Windows の OpenSSH は、標準出力にも鍵のファイルにも CRLF で書く）
+pub fn lf(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+/// ほかのコマンド（ssh-keygen など）を実行し、失敗したら標準エラーを付けてパニックする。
+/// 標準出力の改行は LF にそろえる（[`lf`]）
 pub fn run(cmd: &mut Command) -> Output {
-    let out = cmd
+    let mut out = cmd
         .output()
         .unwrap_or_else(|e| panic!("{cmd:?} を起動できない: {e}"));
+    out.stdout = lf(&String::from_utf8_lossy(&out.stdout)).into_bytes();
     assert_eq!(
         out.status.success(),
         true,

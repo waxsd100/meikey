@@ -109,7 +109,7 @@ ssh-keygen -p -f ~/.ssh/id_ed25519_wakokara
 | `--gpu-width`・`--gpu-batch`・`--gpu-limbs` | GPU の設定（付けなければ、探す前に GPU で測って一番速いものを使う） |
 | `--simd LEVEL` | 使う SIMD の上限（`avx512-ifma`・`avx512`・`avx2`・`off`） |
 
-全部のオプションは `meikey --help` で見られる。表示は、OS のロケールが日本語なら日本語、それ以外は英語になる。
+全部のオプションは `meikey --help` で見られる。表示は、ロケール（環境変数 LANG・LC_ALL など。無ければ OS の設定）が日本語なら日本語、それ以外は英語になる。
 
 ### GPU
 
