@@ -1,0 +1,80 @@
+# 整形・clippy・全テスト（cargo make ci と同じ確認）を、Linux と Windows で回す
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# 同じブランチで新しく push したら、前の実行は止める
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 警告が 1 つでもあれば失敗させる（cargo make ci と同じ）
+  CARGO_BUILD_WARNINGS: deny
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml の版を入れる
+      - run: rustup show
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (${{ matrix.os }}, ${{ matrix.features }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+        features: [default, all-features, no-default-features]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.features }}
+      - name: cargo clippy
+        shell: bash
+        run: |
+          case "${{ matrix.features }}" in
+            default) flags="" ;;
+            *) flags="--${{ matrix.features }}" ;;
+          esac
+          cargo clippy --all-targets $flags
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      # 全テスト（GPU が無いので、GPU で動かすテストは飛ばす。カーネルを CPU 向けにコンパイルしたテストは回る）
+      - run: cargo nextest run --profile ci
+      # feature amx を有効にしたときと、cuda を外したときに変わるテスト
+      - run: cargo nextest run --profile ci --all-features -E "test(/^service::(derive::amx|gpu)::/) | test(/^controller::/)"
+      - run: cargo nextest run --profile ci --no-default-features -E "test(/^controller::/)"
+      # nextest は doctest を回さない
+      - run: cargo test --doc
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
