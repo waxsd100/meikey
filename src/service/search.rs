@@ -259,11 +259,20 @@ fn worker(config: &SearchConfig, stop: &AtomicBool, tries: &AtomicU64, found: &O
                 let _ = found.set(*seed); // 同時に当たったら先着を採用
                 stop.store(true, Relaxed);
                 tries.fetch_add(i as u64 + 1, Relaxed);
+                wipe(&mut seeds, &mut base);
                 return;
             }
         }
         tries.fetch_add(BATCH as u64, Relaxed);
     }
+    wipe(&mut seeds, &mut base);
+}
+
+/// 候補のシードと、低セキュリティモードの乱数をメモリから消す
+fn wipe(seeds: &mut Seeds, base: &mut [u8; 32]) {
+    use zeroize::Zeroize;
+    seeds.as_flattened_mut().zeroize();
+    base.zeroize();
 }
 
 #[cfg(test)]

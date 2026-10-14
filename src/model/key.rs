@@ -78,6 +78,13 @@ pub struct VanityKey {
     public: [u8; 32],
 }
 
+// 使い終わった秘密鍵（シード）をメモリに残さない
+impl Drop for VanityKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.seed);
+    }
+}
+
 impl std::fmt::Debug for VanityKey {
     // 秘密鍵をログに出さない
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

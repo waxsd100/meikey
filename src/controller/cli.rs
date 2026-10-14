@@ -659,7 +659,8 @@ fn check_output(cli: &Cli, repo: &impl KeyRepository) -> Result<(), CliError> {
 }
 
 /// 出力先に保存できなかったときに、代わりに保存する先（今のディレクトリ、一時ディレクトリの順）。
-/// 名前は出力先の名前と、保存した時刻（Unix 時間の秒）
+/// 名前は出力先の名前と、保存した時刻（Unix 時間の秒）と乱数。一時ディレクトリはほかのユーザーも
+/// ファイルを作れるので、先に同じ名前を作られて保存を邪魔されないよう、推測できない名前にする
 fn fallback_paths(output: &Path) -> Vec<PathBuf> {
     let name = output
         .file_name()
@@ -667,7 +668,7 @@ fn fallback_paths(output: &Path) -> Vec<PathBuf> {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let name = format!("{name}-{secs}");
+    let name = format!("{name}-{secs}.{:08x}", rand::random::<u32>());
     vec![PathBuf::from(&name), std::env::temp_dir().join(&name)]
 }
 
@@ -1066,7 +1067,7 @@ mod tests {
         match (saved_at, e) {
             (Some(i), CliError::SavedElsewhere { source, private }) => {
                 assert_eq!(source.to_string(), "out/id_test: 書けない");
-                // 名前の最後（保存した時刻）は、呼んだ時刻で変わる
+                // 名前の最後（保存した時刻と乱数）は、呼ぶたびに変わる
                 let name = fallbacks[i].to_string_lossy().into_owned();
                 let prefix = &name[..name.rfind('-').unwrap() + 1];
                 assert_eq!(

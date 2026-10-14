@@ -10,6 +10,7 @@ use base64::engine::general_purpose::STANDARD;
 use std::fs::{File, OpenOptions, remove_file, symlink_metadata};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroize;
 
 /// 鍵のファイルを調べる・書くときのエラー
 #[derive(Debug, thiserror::Error)]
@@ -130,12 +131,10 @@ pub fn save(
     if !overwrite && let Some(p) = existing(private)? {
         return Err(KeyFileError::AlreadyExists(p));
     }
-    write_file(
-        private,
-        &private_openssh(key, comment, rand::random()),
-        0o600,
-        overwrite,
-    )?;
+    let mut pem = private_openssh(key, comment, rand::random());
+    let written = write_file(private, &pem, 0o600, overwrite);
+    pem.zeroize();
+    written?;
     write_file(
         &pub_path(private),
         &(key.public_openssh(comment) + "\n"),
@@ -144,17 +143,29 @@ pub fn save(
     )
 }
 
-/// ファイルを新しく作る（既にあれば失敗する）。`mode` は Unix のパーミッションで、0600 なら
-/// Windows でも本人だけのアクセス権にする（中身を書く前なので、ほかの人に読める瞬間はない）
+/// ファイルを新しく作る（既にあれば失敗する。シンボリックリンクもたどらない）。`mode` は Unix の
+/// パーミッションで、0600 なら Windows でも本人だけのアクセス権にする。
+/// Windows では作った直後は親フォルダのアクセス権を継承しているので、アクセス権を絞り終えるまで
+/// ほかのプロセスに開かせない（共有なしで開く）。開いたハンドルはアクセス権を変えた後も使えるため、
+/// その間に開かれると、後から書く中身を読まれてしまう
 fn create_new(path: &Path, mode: u32) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, mode);
+    #[cfg(windows)]
+    if mode & 0o077 == 0 {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_GENERIC_WRITE, READ_CONTROL, WRITE_DAC,
+        };
+        opts.share_mode(0)
+            .access_mode(FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC);
+    }
     let file = opts.open(path)?;
     #[cfg(windows)]
     if mode & 0o077 == 0 {
-        restrict_to_owner(path)?;
+        restrict_to_owner(&file)?;
     }
     #[cfg(not(any(unix, windows)))]
     let _ = mode;
@@ -180,16 +191,17 @@ fn write_file(path: &Path, content: &str, mode: u32, overwrite: bool) -> Result<
     write().map_err(|e| with_path(path, e))
 }
 
-/// ファイルのアクセス権を、このプロセスのユーザーのフルコントロールだけにする（親フォルダから継承した
-/// アクセス権は外す）。Unix の 0600 に当たり、Windows の OpenSSH はほかのユーザーが読める秘密鍵を使わない
+/// 開いたファイルのアクセス権を、このプロセスのユーザーのフルコントロールだけにする（親フォルダから継承した
+/// アクセス権は外す）。Unix の 0600 に当たり、Windows の OpenSSH はほかのユーザーが読める秘密鍵を使わない。
+/// パスではなくハンドルで変えるので、途中で別のファイルに差し替えられても、作ったファイルのほうが変わる
 #[cfg(windows)]
-fn restrict_to_owner(path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
+fn restrict_to_owner(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
         EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
-        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+        SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
         ACL, DACL_SECURITY_INFORMATION, GetTokenInformation, NO_INHERITANCE,
@@ -237,12 +249,11 @@ fn restrict_to_owner(path: &Path) -> io::Result<()> {
     if e != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(e as i32));
     }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    // SAFETY: wide は NUL で終わるパス、acl は SetEntriesInAclW が作ったもの。継承を止めて（PROTECTED）
-    // この ACL だけにする
+    // SAFETY: ハンドルは file が開いているもの（WRITE_DAC 付き）、acl は SetEntriesInAclW が作ったもの。
+    // 継承を止めて（PROTECTED）この ACL だけにする
     let e = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_ptr(),
+        SetSecurityInfo(
+            file.as_raw_handle(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             null_mut(),
@@ -288,16 +299,23 @@ pub fn private_openssh(key: &VanityKey, comment: &str, checkint: u32) -> String 
         .string(key.public_blob().as_slice())
         .string(private.as_slice());
 
-    let b64 = STANDARD.encode(body);
-    let lines: Vec<&str> = b64
+    let mut b64 = STANDARD.encode(&body);
+    let mut joined = b64
         .as_bytes()
         .chunks(70)
         .map(|c| std::str::from_utf8(c).expect("base64 は ASCII"))
-        .collect();
-    format!(
-        "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
-        lines.join("\n")
-    )
+        .collect::<Vec<&str>>()
+        .join("\n");
+    let pem = format!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{joined}\n-----END OPENSSH PRIVATE KEY-----\n"
+    );
+    // 途中の秘密鍵を含むバッファを消す（返した文字列は呼び出し側で消す）
+    keypair.zeroize();
+    private.zeroize();
+    body.zeroize();
+    b64.zeroize();
+    joined.zeroize();
+    pem
 }
 
 /// SSH のワイヤ形式（RFC 4251）で書き込むヘルパー
