@@ -114,9 +114,28 @@ def has_nvcc() -> bool:
     return run("command -v nvcc", timeout=10)[0] == 0
 
 
+def has_cuda() -> bool:
+    """GPU と nvcc の両方がある（-arch=native や、GPU の世代を調べてビルドするため）"""
+    return has_gpu() and has_nvcc()
+
+
 def has_opencl_gpu() -> bool:
     code, out, _ = run("clinfo -l", timeout=60)
     return code == 0 and "NVIDIA" in out
+
+
+def gpu_cc() -> str:
+    """GPU の compute capability（例: 12.0 なら "120"）。-arch=native を使えない Makefile に渡す"""
+    out = run("nvidia-smi --query-gpu=compute_cap --format=csv,noheader", timeout=30)[1]
+    return out.strip().splitlines()[0].replace(".", "") if out.strip() else "75"
+
+
+def solanity(url: str, name: str) -> str:
+    """solanity をもとにしたツール（ed25519-gpu-vanity）のビルド。GPU の世代は Makefile の既定（sm_50〜sm_75）では
+    なく、この GPU の世代にする"""
+    return (clone(url, name)
+            + " && make V=release GPU_ARCHS=sm_{cc} GPU_PTX_ARCH=compute_{cc}"
+            + " && test -x src/release/cuda_ed25519_vanity")
 
 
 @dataclass
@@ -165,7 +184,13 @@ BUILDS = [
           # ホストのコンパイラがエラーにする）。世代は -arch=native
           + " && nvcc -O3 --use_fast_math --extra-device-vectorization -arch=native -rdc=true -lcudadevrt -t 0"
           + " -o ed25519brute_cuda src/main.cu -I src",
-          has_nvcc, "nvcc（CUDA Toolkit）"),
+          has_cuda, "GPU と nvcc（CUDA Toolkit）"),
+    Build("ed25519-gpu-vanity", "https://github.com/vikulin/ed25519-gpu-vanity",
+          solanity("https://github.com/vikulin/ed25519-gpu-vanity", "ed25519-gpu-vanity"),
+          has_cuda, "GPU と nvcc（CUDA Toolkit）"),
+    Build("ed25519-gpu-vanity（フォーク）", "https://github.com/84634E1A607A/ed25519-gpu-vanity",
+          solanity("https://github.com/84634E1A607A/ed25519-gpu-vanity", "ed25519-gpu-vanity-fork"),
+          has_cuda, "GPU と nvcc（CUDA Toolkit）"),
 ]
 
 
@@ -181,7 +206,8 @@ def build_all(only: Optional[list[str]] = None) -> dict[str, bool]:
             print(f"✗ {b.name}: {b.needs_text} が無いので飛ばす")
             built[b.name] = False
             continue
-        code, out, sec = run(b.commands, cwd=SRC, timeout=3600)
+        commands = b.commands.replace("{cc}", gpu_cc()) if "{cc}" in b.commands else b.commands
+        code, out, sec = run(commands, cwd=SRC, timeout=3600)
         with open(os.path.join(LOGS, f"{b.name}-build.log"), "w") as f:
             f.write(out)
         built[b.name] = code == 0
@@ -225,6 +251,7 @@ def anywhere_ignore_case(k: int) -> float:
 
 def suffix_case_sensitive(k: int) -> float:
     return 1 / 64**k
+
 
 
 @dataclass
@@ -307,7 +334,8 @@ def measure_hits(row: Row, seconds: int) -> tuple[Optional[float], str]:
 
 
 def slug(name: str) -> str:
-    return re.sub(r"[^0-9A-Za-z.+-]+", "_", name).strip("_")
+    """ログのファイル名（日本語も残す。「（フォーク）」を消すと元のツールと同じ名前になるため）"""
+    return re.sub(r"[^\w.+-]+", "_", name).strip("_")
 
 
 def src(*p: str) -> str:
@@ -377,8 +405,23 @@ ROWS = [
         cmd=lambda s: f"{src('ed25519brute-cuda', 'ed25519brute_cuda')} --fingerprint-prefix {NEVER}",
         rate=r"Speed: ([\d.]+) MKeys/s", scale=1e6),
     Row("SSH-Ed25519-VanityGen（GPU）", "SSH-Ed25519-VanityGen", "Python・OpenCL", "GPU", "公開鍵", "",
-        cmd=lambda s: f"python3 ssh_ed25519_vanity_gpu_opencl.py {NEVER}", rate=r"~([\d,]+) keys/sec",
+        # 5 秒ごとの行の「GPU0 47.7M/s」（GPU ごとの速度）を読む。「(~…/s)」の平均はカーネルのコンパイルの
+        # 時間も含むので読まない
+        cmd=lambda s: f"python3 ssh_ed25519_vanity_gpu_opencl.py {NEVER}", rate=r"\| GPU0 ([\d.]+)M/s", scale=1e6,
         cwd=src("SSH-Ed25519-VanityGen", "OpenCL-GPU"), needs=has_opencl_gpu),
+    # 探す条件はソースに書いてあり、引数では渡せない（公開鍵の先頭 4 バイトが 0）。端末でないと出力が
+    # まとめて書かれ、止めたときに失われるので、行ごとに書かせる。LD_LIBRARY_PATH は足す（Colab では
+    # CUDA のドライバ（libcuda）が LD_LIBRARY_PATH の /usr/lib64-nvidia にあり、置き換えると GPU が見つからない）
+    Row("ed25519-gpu-vanity", "ed25519-gpu-vanity", "CUDA", "GPU", "公開鍵（先頭のバイト）",
+        "条件はソースの既定（公開鍵の先頭 4 バイトが 0）",
+        cmd=lambda s: "LD_LIBRARY_PATH=src/release:$LD_LIBRARY_PATH stdbuf -oL src/release/cuda_ed25519_vanity",
+        rate=r"at ([\d.]+)cps", cwd=src("ed25519-gpu-vanity")),
+    # 条件はソースの既定（base64 の末尾が +Ajax、30 ビット）。1 つ見つけると止まるので、止まったらまた動かす
+    Row("ed25519-gpu-vanity（フォーク）", "ed25519-gpu-vanity（フォーク）", "CUDA", "GPU", "公開鍵（末尾）",
+        "条件はソースの既定（base64 の末尾が +Ajax）。見つけて止まったら起動し直す",
+        cmd=lambda s: ("while :; do LD_LIBRARY_PATH=src/release:$LD_LIBRARY_PATH stdbuf -oL src/release/cuda_ed25519_vanity"
+                       " || break; done"),
+        rate=r"at ([\d.]+)cps", cwd=src("ed25519-gpu-vanity-fork")),
 ]
 
 
