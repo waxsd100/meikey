@@ -3,6 +3,8 @@
 English | [日本語](README.ja.md)
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/waxsd100/meikey/blob/master/colab/meikey.ipynb)
+[![CI](https://github.com/waxsd100/meikey/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/waxsd100/meikey/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/waxsd100/meikey/badges/coverage.json)](https://github.com/waxsd100/meikey/actions/workflows/ci.yml)
 [![Benchmark: 955M keys/s](https://img.shields.io/badge/benchmark-955M%20keys%2Fs-brightgreen.svg)](docs/benchmark.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.99+](https://img.shields.io/badge/rust-1.99%2B-orange.svg?logo=rust)](https://www.rust-lang.org)

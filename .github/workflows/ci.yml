@@ -79,6 +79,45 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
 
+  # テストのカバレッジ（行）を測る。master では、README のバッジが読む JSON をブランチ badges に置く
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest,cargo-llvm-cov
+      # 計測を入れた開発ビルドではテストが遅すぎるので、--release で測る
+      - run: cargo llvm-cov nextest --profile ci --release --json --summary-only --output-path coverage.json
+      - name: Write badge data
+        run: |
+          percent=$(jq '.data[0].totals.lines.percent' coverage.json)
+          rounded=$(printf '%.1f' "$percent")
+          color=$(awk -v p="$percent" 'BEGIN { print (p >= 90 ? "brightgreen" : p >= 80 ? "green" : p >= 70 ? "yellowgreen" : p >= 60 ? "yellow" : "red") }')
+          mkdir -p badges
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$rounded" "$color" > badges/coverage.json
+          echo "Line coverage: ${rounded}%" >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish badge data
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        working-directory: badges
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q -b badges
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add coverage.json
+          git commit -qm "coverage ${GITHUB_SHA::7}"
+          git push -qf "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
+
   # 本物の GPU で、GPU のテスト（PTX の読み込み・起動・設定を測って選ぶところまで）を回す。
   # 自分のマシン（NVIDIA の GPU とドライバ、Rust、Windows なら Visual Studio の C++ ビルドツールが入ったもの）を
   # ラベル `gpu` を付けた self-hosted runner として登録し、リポジトリの変数 GPU_RUNNER を true にしたときだけ動く
