@@ -12,7 +12,7 @@ use crate::model::search::{SearchConfig, SeedSource, Stats};
 use crate::repository::key_file::{KeyFiles, KeyRepository, pub_path};
 use crate::service::search::{Parallel, Searcher};
 use clap::Parser;
-// --gpu-limbs の値（"10"・"8"）を数にする map のため
+// --gpu-limbs の値（"10"・"8" など）を Limbs にする map のため
 #[cfg(feature = "cuda")]
 use clap::builder::TypedValueParser as _;
 use std::io::{self, Write};
@@ -104,11 +104,11 @@ struct Cli {
     #[arg(
         long,
         value_name = "L",
-        value_parser = clap::builder::PossibleValuesParser::new(["10", "8"])
-            .map(|s| s.parse::<u32>().expect("10 か 8")),
+        value_parser = clap::builder::PossibleValuesParser::new(["10", "10u", "8", "10k", "10ku", "5f"])
+            .map(|s| s.parse::<crate::service::gpu::Limbs>().expect("--gpu-limbs の値")),
         requires = "gpu_device"
     )]
-    gpu_limbs: Option<u32>,
+    gpu_limbs: Option<crate::service::gpu::Limbs>,
 }
 
 /// コマンドの説明（日本語・英語）
@@ -213,40 +213,44 @@ const HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "gpu",
-        "CPU ではなく GPU（CUDA）で探す（--low-security と一緒に付ける）。--threads・--no-batch・--simd・\
-         --no-memmem は CPU 用なので使わない",
-        "Search on the GPU (CUDA) instead of the CPU (use with --low-security). --threads, \
-         --no-batch, --simd and --no-memmem are for the CPU and are not used",
+        "CPU ではなく GPU（CUDA）で探す（--low-security と一緒に付ける。GPU が複数あれば全部使う）。\
+         --threads・--no-batch・--simd・--no-memmem は CPU 用なので使わない",
+        "Search on the GPU (CUDA) instead of the CPU (use with --low-security; all GPUs are used if \
+         there are several). --threads, --no-batch, --simd and --no-memmem are for the CPU and are \
+         not used",
     ),
     (
         "both",
-        "GPU と CPU の両方で同時に探す（--low-security と一緒に付ける。CPU のスレッド数の既定は 全コア − 1。\
-         1 本は GPU の操作に使う）",
-        "Search on the GPU and the CPU at the same time (use with --low-security; the default \
-         number of CPU threads is all cores − 1; one drives the GPU)",
+        "GPU と CPU の両方で同時に探す（--low-security と一緒に付ける。CPU のスレッド数の既定は 全コア − GPU の数。\
+         GPU 1 枚に 1 本を操作に使う）",
+        "Search on the GPUs and the CPU at the same time (use with --low-security; the default \
+         number of CPU threads is all cores − the number of GPUs; one thread drives each GPU)",
     ),
     (
         "gpu_width",
         "GPU の表の幅 W（2〜20）。大きいほど点の足し算が減り、表は大きくなる（12 で約 4.1 MB、16 で約 50 MB、\
          20 で約 650 MB）。--gpu-width・--gpu-batch・--gpu-limbs を付けなければ、探す前にこの GPU で測って\
-         一番速い組み合わせを使う。幅 12・14・16・18・20、32・64 鍵、10・8 リムの組み合わせ以外は、\
-         起動時に NVRTC でカーネルをコンパイルする",
+         一番速い組み合わせを使う",
         "Width W of the GPU table (2-20). Larger widths need fewer point additions and a bigger \
          table (about 4.1 MB at 12, about 50 MB at 16, about 650 MB at 20). Without --gpu-width, \
          --gpu-batch and --gpu-limbs, the fastest combination is measured on this GPU before \
-         searching. Combinations other than widths 12, 14, 16, 18, 20 with 32 or 64 keys and 10 or 8 \
-         limbs are compiled with NVRTC at startup",
+         searching",
     ),
     (
         "gpu_batch",
-        "GPU の1スレッドが、逆元を1回にまとめて計算する鍵の数（1〜64）",
-        "Number of keys per GPU thread whose inverses are computed together (1-64)",
+        "GPU の1スレッドが、逆元を1回にまとめて計算する鍵の数（1〜64）。16・32 以外は、起動時に NVRTC で\
+         カーネルをコンパイルする",
+        "Number of keys per GPU thread whose inverses are computed together (1-64). Values other \
+         than 16 and 32 are compiled with NVRTC at startup",
     ),
     (
         "gpu_limbs",
-        "GPU の体演算のリムの数（10 = 25.5 ビット × 10、8 = 32 ビット × 8）。速いほうは GPU で違う",
-        "Number of limbs in the GPU field arithmetic (10 = 25.5 bits x 10, 8 = 32 bits x 8). \
-         Which is faster depends on the GPU",
+        "GPU の体演算の種類（10 = 25.5 ビット × 10、8 = 32 ビット × 8、10k = 26 ビット × 10 の積を Karatsuba 法で、\
+         5f = 51 ビット × 5 の積を倍精度浮動小数点数で。10u・10ku は 10・10k で、表をリムの形のまま持つ）。\
+         速いものは GPU で違う",
+        "Kind of GPU field arithmetic (10 = 25.5 bits x 10, 8 = 32 bits x 8, 10k = 26 bits x 10 \
+         multiplied with Karatsuba, 5f = 51 bits x 5 multiplied in double precision; 10u and 10ku are \
+         10 and 10k with the table stored as limbs). Which is fastest depends on the GPU",
     ),
 ];
 
@@ -464,20 +468,21 @@ fn execute(cli: &Cli) -> Result<(), CliError> {
     match device(cli) {
         Device::Cpu => run(cli, &Parallel, &KeyFiles),
         #[cfg(feature = "cuda")]
-        Device::Gpu => run(cli, &gpu(cli)?, &KeyFiles),
+        Device::Gpu => run(cli, &gpus(cli)?, &KeyFiles),
         #[cfg(feature = "cuda")]
         Device::Both => run(
             cli,
-            &crate::service::search::Both(gpu(cli)?, Parallel),
+            &crate::service::search::Both(gpus(cli)?, Parallel),
             &KeyFiles,
         ),
     }
 }
 
-/// GPU を使えるようにする。設定を測ると数秒かかるので、引数の誤りや既にある出力先は先に確かめる
+/// 全部の GPU を使えるようにする。設定を測ると数秒かかるので、引数の誤りや既にある出力先は先に確かめる。
+/// 設定を測るときは、同じ型の GPU（名前と世代が同じ）では最初の1枚で測った設定を使う
 #[cfg(feature = "cuda")]
-fn gpu(cli: &Cli) -> Result<crate::service::gpu::Gpu, CliError> {
-    use crate::service::gpu::{EMBEDDED, Gpu};
+fn gpus(cli: &Cli) -> Result<crate::service::search::All<crate::service::gpu::Gpu>, CliError> {
+    use crate::service::gpu::{Gpu, GpuSetting, device_count};
     if !cli.check {
         pattern(cli)?;
         check_comment(&cli.comment)?;
@@ -487,17 +492,40 @@ fn gpu(cli: &Cli) -> Result<crate::service::gpu::Gpu, CliError> {
     }
     let setting = gpu_options(cli);
     // GPU が使えるとわかって、測り始めるときに知らせる（測ると数秒かかるので）
-    let notify = || {
+    let notify = |n: usize| {
         eprintln!(
             "{}",
             tf!(
                 "GPU の設定を測っています（{} 通り）",
                 "Measuring GPU settings ({} combinations)",
-                EMBEDDED.len()
+                n
             )
         )
     };
-    Ok(Gpu::new(0, setting, notify)?)
+    // ドライバや GPU が無ければ、1 枚目を開くところでそのエラーになる
+    let count = device_count().max(1);
+    let mut out: Vec<Gpu> = Vec::new();
+    for i in 0..count {
+        let info = Gpu::info_of(i)?;
+        let same = out
+            .iter()
+            .find(|g| g.info().name == info.name && g.info().compute == info.compute);
+        let gpu = match (setting, same) {
+            (GpuSetting::Fastest, Some(g)) => {
+                Gpu::new(i, GpuSetting::Fixed(g.options()), |_| {})?.same_as_another()
+            }
+            _ => Gpu::new(i, setting, notify)?,
+        };
+        out.push(gpu);
+    }
+    if out.len() > 1 {
+        out = out
+            .into_iter()
+            .enumerate()
+            .map(|(i, g)| g.numbered(i))
+            .collect();
+    }
+    Ok(crate::service::search::All(out))
 }
 
 /// GPU の設定の決め方: --gpu-width・--gpu-batch・--gpu-limbs のどれかがあればそれ（無いものは既定）、
@@ -517,6 +545,14 @@ fn gpu_options(cli: &Cli) -> crate::service::gpu::GpuSetting {
     }
 }
 
+/// GPU を操作するスレッドの数（GPU の数。分からなければ 1）
+fn gpu_threads() -> usize {
+    #[cfg(feature = "cuda")]
+    return crate::service::gpu::device_count().max(1);
+    #[cfg(not(feature = "cuda"))]
+    1
+}
+
 fn device(cli: &Cli) -> Device {
     #[cfg(feature = "cuda")]
     if cli.both {
@@ -533,9 +569,9 @@ fn run(cli: &Cli, searcher: &impl Searcher, repo: &impl KeyRepository) -> Result
     if let Some(n) = cli.threads {
         config.threads = n.into();
     } else if device(cli) != Device::Cpu {
-        // GPU と両方で探すときは、GPU を操作するスレッドの分を空ける
+        // GPU と両方で探すときは、GPU を操作するスレッドの分（GPU 1 枚に 1 本）を空ける
         // （GPU だけのときは CPU で探さないので、この値は使わない）
-        config.threads = config.threads.saturating_sub(1).max(1);
+        config.threads = config.threads.saturating_sub(gpu_threads()).max(1);
     }
     // 既定は定数時間の倍算と ChaCha20 のシード。低セキュリティモードでは表の倍算と通し番号のシード
     match cli.low_security {
@@ -822,7 +858,7 @@ mod tests {
     use crate::model::search::Outcome;
     use crate::repository::key_file::MockKeyRepository;
     #[cfg(feature = "cuda")]
-    use crate::service::gpu::{GpuOptions, GpuSetting};
+    use crate::service::gpu::{GpuOptions, GpuSetting, Limbs};
     use crate::service::search::MockSearcher;
     use mockall::Sequence;
     use mockall::predicate::eq;
@@ -1205,14 +1241,18 @@ mod tests {
     #[rstest]
     #[case::fastest(&[], Some(GpuSetting::Fastest))]
     #[case::check(&["--check"], Some(GpuSetting::Default))]
-    #[case::all(&["--gpu-width", "16", "--gpu-batch", "64", "--gpu-limbs", "8"], Some(GpuSetting::Fixed(GpuOptions::new(16, 64, 8))))]
-    #[case::width_only(&["--gpu-width", "14"], Some(GpuSetting::Fixed(GpuOptions::new(14, 32, 10))))]
-    #[case::batch_only(&["--gpu-batch", "64"], Some(GpuSetting::Fixed(GpuOptions::new(12, 64, 10))))]
-    #[case::limbs_only(&["--gpu-limbs", "8"], Some(GpuSetting::Fixed(GpuOptions::new(12, 32, 8))))]
-    #[case::check_with_width(&["--check", "--gpu-width", "16"], Some(GpuSetting::Fixed(GpuOptions::new(16, 32, 10))))]
-    #[case::smallest(&["--gpu-width", "2", "--gpu-batch", "1"], Some(GpuSetting::Fixed(GpuOptions::new(2, 1, 10))))]
+    #[case::all(&["--gpu-width", "18", "--gpu-batch", "64", "--gpu-limbs", "8"], Some(GpuSetting::Fixed(GpuOptions::new(18, 64, Limbs::R32))))]
+    #[case::width_only(&["--gpu-width", "14"], Some(GpuSetting::Fixed(GpuOptions::new(14, 32, Limbs::R25))))]
+    #[case::batch_only(&["--gpu-batch", "64"], Some(GpuSetting::Fixed(GpuOptions::new(16, 64, Limbs::R25))))]
+    #[case::limbs_only(&["--gpu-limbs", "8"], Some(GpuSetting::Fixed(GpuOptions::new(16, 32, Limbs::R32))))]
+    #[case::karatsuba(&["--gpu-limbs", "10k"], Some(GpuSetting::Fixed(GpuOptions::new(16, 32, Limbs::K26))))]
+    #[case::karatsuba_table(&["--gpu-limbs", "10ku"], Some(GpuSetting::Fixed(GpuOptions::new(16, 32, Limbs::K26Table))))]
+    #[case::unpacked(&["--gpu-limbs", "10u"], Some(GpuSetting::Fixed(GpuOptions::new(16, 32, Limbs::R25Table))))]
+    #[case::fp64(&["--gpu-limbs", "5f"], Some(GpuSetting::Fixed(GpuOptions::new(16, 32, Limbs::F51))))]
+    #[case::check_with_width(&["--check", "--gpu-width", "12"], Some(GpuSetting::Fixed(GpuOptions::new(12, 32, Limbs::R25))))]
+    #[case::smallest(&["--gpu-width", "2", "--gpu-batch", "1"], Some(GpuSetting::Fixed(GpuOptions::new(2, 1, Limbs::R25))))]
     #[case::limbs_other(&["--gpu-limbs", "9"], None)]
-    #[case::widest(&["--gpu-width", "20"], Some(GpuSetting::Fixed(GpuOptions::new(20, 32, 10))))]
+    #[case::widest(&["--gpu-width", "20"], Some(GpuSetting::Fixed(GpuOptions::new(20, 32, Limbs::R25))))]
     #[case::width_too_large(&["--gpu-width", "21"], None)]
     #[case::width_too_small(&["--gpu-width", "1"], None)]
     #[case::batch_zero(&["--gpu-batch", "0"], None)]

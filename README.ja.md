@@ -105,7 +105,7 @@ ssh-keygen -p -f ~/.ssh/id_ed25519_wakokara
 | `--bench SECS` | 探さずに速さだけ測る |
 | `--check` | 使う CPU・GPU と計算方法を表示して終わる |
 | `--low-security` | 低セキュリティモード（速さを優先する） |
-| `--gpu` / `--both` | GPU だけ / GPU と CPU の両方で探す（`--low-security` のとき） |
+| `--gpu` / `--both` | GPU だけ / GPU と CPU の両方で探す（`--low-security` のとき）。GPU が複数あれば全部使う |
 | `--gpu-width`・`--gpu-batch`・`--gpu-limbs` | GPU の設定（付けなければ、探す前に GPU で測って一番速いものを使う） |
 | `--simd LEVEL` | 使う SIMD の上限（`avx512-ifma`・`avx512`・`avx2`・`off`） |
 

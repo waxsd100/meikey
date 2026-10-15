@@ -451,7 +451,7 @@ pub fn mul_base_batch<const N: usize>(amx: Amx, scalars: &[[u8; 32]; N], out: &m
 
     // 単位元から始めて、全部の行を足す（桁 0 は表の0列目 = 単位元を足す）
     for (i, ds) in digits.iter().enumerate() {
-        let with_t = i + 1 < ROWS; // 最後の加算では T を計算しない
+        let with_t = i + 1 < ROWS; // 最後の加算は分数の形のまま（掛け算 3 回）
         for (accs, ds) in acc.chunks_mut(GROUP).zip(ds.chunks(GROUP)) {
             let n = accs.len();
             // 1段目: (Y+X)·(y+x), (Y-X)·(y-x), T·2dxy
@@ -472,15 +472,25 @@ pub fn mul_base_batch<const N: usize>(amx: Amx, scalars: &[[u8; 32]; N], out: &m
                 let z2 = p.z.add(p.z);
                 xyzt[j] = [pp.sub(mm), pp.add(mm), z2.add(txy), z2.sub(txy)];
             }
+            if !with_t {
+                // 最後の加算: 分数の形（y = Y/Z、x = X/T。comb の add_niels_last と同じ）。2段目は要らない
+                for (p, [x, y, z, t]) in accs.iter_mut().zip(&xyzt[..n]) {
+                    *p = Point {
+                        x: *x,
+                        y: *y,
+                        z: *t,
+                        t: *z,
+                    };
+                }
+                continue;
+            }
             // 2段目: X3 = x·t, Y3 = y·z, Z3 = z·t, T3 = x·y
-            let per = if with_t { 4 } else { 3 };
+            let per = 4;
             for (j, [x, y, z, t]) in xyzt[..n].iter().enumerate() {
                 slots[per * j].set(x, t);
                 slots[per * j + 1].set(y, z);
                 slots[per * j + 2].set(z, t);
-                if with_t {
-                    slots[per * j + 3].set(x, y);
-                }
+                slots[per * j + 3].set(x, y);
             }
             tiles.run(&mut slots[..per * n]);
             for (j, p) in accs.iter_mut().enumerate() {
@@ -488,11 +498,7 @@ pub fn mul_base_batch<const N: usize>(amx: Amx, scalars: &[[u8; 32]; N], out: &m
                     x: slots[per * j].product(),
                     y: slots[per * j + 1].product(),
                     z: slots[per * j + 2].product(),
-                    t: if with_t {
-                        slots[per * j + 3].product()
-                    } else {
-                        F::ZERO
-                    },
+                    t: slots[per * j + 3].product(),
                 };
             }
         }
@@ -504,7 +510,7 @@ pub fn mul_base_batch<const N: usize>(amx: Amx, scalars: &[[u8; 32]; N], out: &m
             x: p.x.to_fe(),
             y: p.y.to_fe(),
             z: p.z.to_fe(),
-            t: Fe::ZERO,
+            t: p.t.to_fe(),
         };
     }
 }
@@ -513,7 +519,7 @@ pub fn mul_base_batch<const N: usize>(amx: Amx, scalars: &[[u8; 32]; N], out: &m
 mod tests {
     use super::*;
     use crate::property::check;
-    use crate::service::derive::comb::compress_with_zinv;
+    use crate::service::derive::comb::compress_frac;
     use crate::simd_support::available;
     use curve25519_dalek::edwards::EdwardsPoint;
     use curve25519_dalek::scalar::clamp_integer;
@@ -636,7 +642,7 @@ mod tests {
                         EdwardsPoint::mul_base(&curve25519_dalek::Scalar::from_bytes_mod_order(*s))
                             .compress()
                             .to_bytes();
-                    let got = compress_with_zinv(p, p.z.invert());
+                    let got = compress_frac(p);
                     prop_assert_eq!(got, want, "#{}", k);
                 }
                 Ok(())

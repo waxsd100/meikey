@@ -35,7 +35,7 @@ The A100, L4, T4 and CPU-only rows were measured with the version before it (8 k
 ### Speed by GPU setting (RTX PRO 6000)
 
 GPU speed with different `--gpu-width` (table width W) and `--gpu-batch` (keys per batch).
-This table was measured with the version that measured these 6 combinations. The current version measures 20 combinations on the GPU before searching (widths 12, 14, 16, 18, 20 × 32 or 64 keys per batch × 10 or 8 limbs in the field arithmetic) and uses the fastest.
+This table was measured with the version that measured these 6 combinations. The current version measures on the GPU in three steps before searching and uses the fastest: first the kind of field arithmetic at W = 16 and 32 keys per batch (5 kinds, and 6 on GPUs with fast double precision such as the A100 and H100), then W = 12, 14, 16, 18, 20 × 16 or 32 keys per batch with the fastest kind, and last 4, 3 or 2 blocks per SM with the fastest of those.
 
 | W | Keys per batch | GPU |
 |---|---|---|

@@ -317,7 +317,8 @@ unsafe fn to_extended(n: &Niels4) -> Ext4 {
     }
 }
 
-/// 拡張座標 + アフィン点（[`crate::service::derive::comb`] の `add_niels_impl` と同じ式）。
+/// 拡張座標 + アフィン点（[`crate::service::derive::comb`] の `add_niels_impl` と同じ式）。`WITH_T` が false なら
+/// 最後の加算で、結果は分数の形（y = Y/Z、x = X/T。各値は `carry` の結果）。
 /// 入力の X, Y, Z, T は 1.01 倍未満（`mul` か `carry` の結果）、`q` は正規化した値か、その符号反転
 #[inline(always)]
 unsafe fn add_niels<const WITH_T: bool>(p: &Ext4, q: &Niels4) -> Ext4 {
@@ -328,11 +329,20 @@ unsafe fn add_niels<const WITH_T: bool>(p: &Ext4, q: &Niels4) -> Ext4 {
         let z2 = add(&p.z, &p.z);
         let (x, y) = (sub(&pp, &mm), add(&pp, &mm)); // 3.01 倍, 2.02 倍
         let (z, t) = (add(&z2, &txy), sub(&z2, &txy)); // 3.03 倍, 4.02 倍
+        if !WITH_T {
+            // 最後の加算: 分数の形（y = Y/Z、x = X/T。comb の add_niels_last と同じ）。掛け算 3 回で済む
+            return Ext4 {
+                x: carry(x.0),
+                y: carry(y.0),
+                z: carry(t.0),
+                t: carry(z.0),
+            };
+        }
         Ext4 {
             x: mul(&t, &x),
             y: mul(&y, &z),
             z: mul(&t, &z),
-            t: if WITH_T { mul(&x, &y) } else { p.t },
+            t: mul(&x, &y),
         }
     }
 }
@@ -420,13 +430,13 @@ impl Table4 {
             .iter()
             .zip(out.as_chunks_mut::<4>().0)
         {
-            let (x, y, z) = (lanes(&p.x), lanes(&p.y), lanes(&p.z));
+            let (x, y, z, t) = (lanes(&p.x), lanes(&p.y), lanes(&p.z), lanes(&p.t));
             for k in 0..4 {
                 o[k] = Extended {
                     x: x[k],
                     y: y[k],
                     z: z[k],
-                    t: Fe::ZERO,
+                    t: t[k],
                 };
             }
         }
@@ -618,13 +628,13 @@ impl CtTable4 {
             let last = digits[R - 1].as_chunks::<4>().0;
             for ((a, d), o) in acc.iter_mut().zip(last).zip(out.as_chunks_mut::<4>().0) {
                 *a = add_niels::<false>(a, &self.select(R - 1, d));
-                let (x, y, z) = (lanes(&a.x), lanes(&a.y), lanes(&a.z));
+                let (x, y, z, t) = (lanes(&a.x), lanes(&a.y), lanes(&a.z), lanes(&a.t));
                 for k in 0..4 {
                     o[k] = Extended {
                         x: x[k],
                         y: y[k],
                         z: z[k],
-                        t: Fe::ZERO,
+                        t: t[k],
                     };
                 }
             }
@@ -725,7 +735,7 @@ mod tests {
     use crate::rfc8032::secret_expand;
     use crate::rfc8032::to_le32;
     use crate::rfc8032::{Vector, vectors};
-    use crate::service::derive::comb::compress_with_zinv;
+    use crate::service::derive::comb::compress_frac;
     use crate::simd_support::available;
     use curve25519_dalek::edwards::EdwardsPoint;
     use curve25519_dalek::scalar::clamp_integer;
@@ -868,7 +878,7 @@ mod tests {
     }
 
     fn compress(p: &Extended) -> [u8; 32] {
-        compress_with_zinv(p, p.z.invert())
+        compress_frac(p)
     }
 
     fn dalek(s: &[u8; 32]) -> [u8; 32] {

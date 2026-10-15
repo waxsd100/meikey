@@ -39,6 +39,16 @@ pub trait Searcher {
     fn status(&self, config: &SearchConfig) -> Vec<(&'static str, String)>;
 }
 
+impl<T: Searcher + ?Sized> Searcher for Box<T> {
+    fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome {
+        (**self).run(config, on_progress)
+    }
+
+    fn status(&self, config: &SearchConfig) -> Vec<(&'static str, String)> {
+        (**self).status(config)
+    }
+}
+
 /// 全コアで総当たりする [`Searcher`]（本番で使うもの。中身は [`run`]）
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Parallel;
@@ -82,49 +92,7 @@ const INNER_PROGRESS: Duration = Duration::from_millis(100);
 
 impl<A: Searcher + Sync, B: Searcher + Sync> Searcher for Both<A, B> {
     fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome {
-        // 内側の2つだけで共有する合図（外の合図は下のループで中継する）
-        let cancel = Cancel::default();
-        let inner = SearchConfig {
-            cancel: cancel.clone(),
-            progress_interval: INNER_PROGRESS,
-            ..config.clone()
-        };
-        let tries = [AtomicU64::new(0), AtomicU64::new(0)];
-        let start = Instant::now();
-        let stats = || Stats {
-            tries: tries.iter().map(|t| t.load(Relaxed)).sum(),
-            elapsed: start.elapsed(),
-        };
-
-        let (a, b) = thread::scope(|s| {
-            let a = s.spawn(|| side(&self.0, &inner, &tries[0]));
-            let b = s.spawn(|| side(&self.1, &inner, &tries[1]));
-            let mut next_report = start + config.progress_interval;
-            while !(a.is_finished() && b.is_finished()) {
-                thread::sleep(TICK);
-                if config.cancel.is_cancelled() {
-                    cancel.cancel();
-                }
-                if Instant::now() >= next_report {
-                    on_progress.report(stats());
-                    next_report += config.progress_interval;
-                }
-            }
-            // 片方がパニックしていたら、ここで呼び出し元に伝える
-            let join = |h: thread::ScopedJoinHandle<'_, Outcome>| {
-                h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
-            };
-            (join(a), join(b))
-        });
-
-        Outcome {
-            // 同時に当たったら1つ目を採用
-            key: a.key.or(b.key),
-            stats: Stats {
-                tries: a.stats.tries + b.stats.tries,
-                elapsed: start.elapsed(),
-            },
-        }
+        together(&[&self.0, &self.1], config, on_progress)
     }
 
     fn status(&self, config: &SearchConfig) -> Vec<(&'static str, String)> {
@@ -134,8 +102,85 @@ impl<A: Searcher + Sync, B: Searcher + Sync> Searcher for Both<A, B> {
     }
 }
 
-/// [`Both`] の片方を走らせる。終わったら（見つけた・時間切れ・パニック）もう片方を止める
-fn side(searcher: &impl Searcher, config: &SearchConfig, tries: &AtomicU64) -> Outcome {
+/// 複数の [`Searcher`] で同時に探す（例: 複数の GPU）。どれかが見つけたら（時間切れでも）ほかも止め、
+/// 試行回数は合計する。表示する状態は並べた順。1つだけなら、そのまま探す
+#[derive(Debug, Clone, Default)]
+pub struct All<S>(pub Vec<S>);
+
+impl<S: Searcher + Sync> Searcher for All<S> {
+    fn run(&self, config: &SearchConfig, on_progress: &mut dyn Progress) -> Outcome {
+        match self.0.as_slice() {
+            [one] => one.run(config, on_progress),
+            all => {
+                let list: Vec<&(dyn Searcher + Sync)> =
+                    all.iter().map(|s| s as &(dyn Searcher + Sync)).collect();
+                together(&list, config, on_progress)
+            }
+        }
+    }
+
+    fn status(&self, config: &SearchConfig) -> Vec<(&'static str, String)> {
+        self.0.iter().flat_map(|s| s.status(config)).collect()
+    }
+}
+
+/// `searchers` を別々のスレッドで同時に走らせる。どれかが終わったら（見つけた・時間切れ・パニック）ほかも止め、
+/// 外の合図を中継し、試行回数の合計を外の設定の間隔で渡す。鍵は、同時に当たったら並べた順で先のもの
+fn together(
+    searchers: &[&(dyn Searcher + Sync)],
+    config: &SearchConfig,
+    on_progress: &mut dyn Progress,
+) -> Outcome {
+    // 内側だけで共有する合図（外の合図は下のループで中継する）
+    let cancel = Cancel::default();
+    let inner = SearchConfig {
+        cancel: cancel.clone(),
+        progress_interval: INNER_PROGRESS,
+        ..config.clone()
+    };
+    let tries: Vec<AtomicU64> = searchers.iter().map(|_| AtomicU64::new(0)).collect();
+    let start = Instant::now();
+    let stats = || Stats {
+        tries: tries.iter().map(|t| t.load(Relaxed)).sum(),
+        elapsed: start.elapsed(),
+    };
+
+    let outcomes: Vec<Outcome> = thread::scope(|s| {
+        let handles: Vec<_> = searchers
+            .iter()
+            .zip(&tries)
+            .map(|(searcher, t)| s.spawn(|| side(*searcher, &inner, t)))
+            .collect();
+        let mut next_report = start + config.progress_interval;
+        while !handles.iter().all(|h| h.is_finished()) {
+            thread::sleep(TICK);
+            if config.cancel.is_cancelled() {
+                cancel.cancel();
+            }
+            if Instant::now() >= next_report {
+                on_progress.report(stats());
+                next_report += config.progress_interval;
+            }
+        }
+        // どれかがパニックしていたら、ここで呼び出し元に伝える
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+
+    let tries = outcomes.iter().map(|o| o.stats.tries).sum();
+    Outcome {
+        key: outcomes.into_iter().find_map(|o| o.key),
+        stats: Stats {
+            tries,
+            elapsed: start.elapsed(),
+        },
+    }
+}
+
+/// [`together`] の1つを走らせる。終わったら（見つけた・時間切れ・パニック）ほかを止める
+fn side(searcher: &(dyn Searcher + Sync), config: &SearchConfig, tries: &AtomicU64) -> Outcome {
     struct CancelOnDrop<'a>(&'a Cancel);
     impl Drop for CancelOnDrop<'_> {
         fn drop(&mut self) {
@@ -645,6 +690,39 @@ mod tests {
             true,
             "止まるのが遅い"
         );
+    }
+
+    /// 3 つで同時に探しても、どれかが見つけたらほか（時間制限の無い CPU の探索）もすぐ止まり、見つけた鍵と
+    /// 合計の試行回数を返す。1 つだけならそのまま探す
+    #[rstest]
+    fn all_stops_others_when_one_finds(#[values(0, 1, 2)] finder: usize) {
+        let cfg = SearchConfig {
+            threads: 1,
+            ..Endless::Impossible.config()
+        };
+        let started = Instant::now();
+        let mut list: Vec<Box<dyn Searcher + Sync>> = vec![Box::new(Parallel), Box::new(Parallel)];
+        list.insert(finder, Box::new(instant(true, 5)));
+        let out = All(list).run(&cfg, &mut |_: Stats| {});
+        assert_eq!(out.key.map(|k| *k.seed()), Some([7; 32]));
+        assert_eq!(out.stats.tries >= 5, true, "{:?}", out.stats);
+        assert_eq!(
+            started.elapsed() < Duration::from_secs(2),
+            true,
+            "止まるのが遅い: {:?}",
+            started.elapsed()
+        );
+        let one = All(vec![instant(true, 9)]).run(&cfg, &mut |_: Stats| {});
+        assert_eq!((one.key.is_some(), one.stats.tries), (true, 9));
+    }
+
+    /// 並べた全部の状態の行を、並べた順に出す
+    #[rstest]
+    fn all_status_lists_in_order() {
+        let cfg = SearchConfig::new(None);
+        let rows = All(vec![instant(false, 0), instant(false, 0)]).status(&cfg);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().all(|(l, _)| *l == "GPU"), true);
     }
 
     /// 状態の行は1つ目、2つ目の順に並ぶ

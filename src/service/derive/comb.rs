@@ -144,10 +144,21 @@ impl Extended {
         self.add_niels_impl::<true>(q)
     }
 
-    /// `add_niels` の T を計算しない版（最後の加算用。結果の T は使えない）
+    /// 最後の加算: 結果を分数の形（y = Y/Z、x = X/T。ふつうの拡張座標ではない）で返す。
+    /// `add_niels` の結果は X = (pp-mm)·t、Y = (pp+mm)·z、Z = t·z なので、y = Y/Z では z が、x = X/Z では t が
+    /// 約分でき、掛け算は 3 回で済む（y = (pp+mm)/t、x = (pp-mm)/z）
     #[inline(always)]
     fn add_niels_last(&self, q: &Niels) -> Extended {
-        self.add_niels_impl::<false>(q)
+        let pp = (self.y + self.x) * q.ypx;
+        let mm = (self.y - self.x) * q.ymx;
+        let txy = self.t * q.xy2d;
+        let z2 = self.z + self.z;
+        Extended {
+            x: pp - mm,
+            y: pp + mm,
+            z: z2 - txy,
+            t: z2 + txy,
+        }
     }
 
     #[inline(always)]
@@ -171,6 +182,14 @@ impl Extended {
         let zi = self.z.invert();
         (self.x * zi, self.y * zi)
     }
+}
+
+/// 最後の加算の結果（[`Extended::add_niels_last`] の分数の形: y = Y/Z、x = X/T）の圧縮形式（テストで点を比べる用）
+#[cfg(test)]
+pub fn compress_frac(p: &Extended) -> [u8; 32] {
+    let mut y = (p.y * p.z.invert()).to_bytes();
+    y[31] |= ((p.x * p.t.invert()).to_bytes()[0] & 1) << 7;
+    y
 }
 
 /// 圧縮形式（y の32バイト、最上位ビットに x の符号）。`z_inv` は事前に計算した 1/Z
@@ -225,7 +244,7 @@ impl Table {
     ///
     /// 鍵ごとに倍算を終わらせるのではなく、表の1行目を全部の鍵に足し、次に2行目を…と1行ずつ進める。
     /// 同時に使う表が1行だけになるので、表全体がキャッシュに収まらなくても速い。
-    /// 戻り値の T は計算していない（圧縮には X, Y, Z だけ使う）。
+    /// 結果は最後の加算の分数の形（[`Extended::add_niels_last`]: y = Y/Z、x = X/T）。
     pub fn mul_base_batch<const N: usize>(&self, scalars: &[[u8; 32]; N], out: &mut [Extended; N]) {
         // digits[i][k] = k 番目の鍵の i 桁目（行ごとに鍵を順に読めるよう転置しておく）
         let mut digits = [[0i16; N]; ROWS];
@@ -544,7 +563,7 @@ mod tests {
         assert_eq!(digits_in_range(&d), true, "{d:?}");
         assert_eq!(reconstruct(&d), from_le(&s), "桁分解");
 
-        let got = compress(&mul_base(&s));
+        let got = compress_frac(&mul_base(&s));
         let dalek = EdwardsPoint::mul_base(&curve25519_dalek::Scalar::from_bytes_mod_order(s));
         assert_eq!(got, dalek.compress().to_bytes(), "curve25519-dalek");
         assert_eq!(got, base_mul_encoded(&s), "RFC 8032 参照実装");
@@ -653,7 +672,7 @@ mod tests {
     #[case::rfc8032(Reference::Rfc8032, 128)]
     fn mul_base_matches(#[case] reference: Reference, #[case] cases: u32) {
         check(cases, clamped(), |s| {
-            prop_assert_eq!(compress(&mul_base(&s)), reference.mul_base(&s));
+            prop_assert_eq!(compress_frac(&mul_base(&s)), reference.mul_base(&s));
             Ok(())
         });
     }
@@ -670,7 +689,7 @@ mod tests {
             let mut out = [Extended::IDENTITY; 8];
             Table::get().mul_base_batch(&s, &mut out);
             for (k, (p, s)) in out.iter().zip(&s).enumerate() {
-                prop_assert_eq!(compress(p), Reference::Dalek.mul_base(s), "#{}", k);
+                prop_assert_eq!(compress_frac(p), Reference::Dalek.mul_base(s), "#{}", k);
             }
             Ok(())
         });
@@ -692,7 +711,7 @@ mod tests {
     enum Variant {
         /// 通常版（拡張座標 + アフィン、乗算7回）
         WithT,
-        /// 最後の加算用（T を計算しない。圧縮に使う X, Y, Z は通常版と同じ）
+        /// 最後の加算用（分数の形: y = Y/Z、x = X/T）
         WithoutT,
     }
 
@@ -715,7 +734,11 @@ mod tests {
                 Variant::WithoutT => p_ext.add_niels_last(&q_niels),
             };
             let want = point_add(&p, &q);
-            prop_assert_eq!(compress(&got), point_compress(&want));
+            let compressed = match variant {
+                Variant::WithT => compress(&got),
+                Variant::WithoutT => compress_frac(&got),
+            };
+            prop_assert_eq!(compressed, point_compress(&want));
             if let Relation::Negated = relation {
                 prop_assert!(is_identity(&want));
             }

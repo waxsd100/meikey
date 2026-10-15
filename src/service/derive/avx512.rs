@@ -142,7 +142,7 @@ unsafe fn to_extended<F: Field8>(n: &Niels8<F>) -> Ext8<F> {
 }
 
 /// 拡張座標 + アフィン点（[`crate::service::derive::comb`] の `add_niels_impl` と同じ式）。`WITH_T` が false なら
-/// T を計算しない（最後の加算用。結果の T は使えない）。
+/// 最後の加算で、結果は分数の形（y = Y/Z、x = X/T。各値は `carry` の結果。comb の `add_niels_last` と同じ）。
 ///
 /// 右の数字は [`f`] での各リムの大きさ（[`f::Fe10`] を参照）。`mul(a, b)` は a が 5 倍未満、
 /// b が 3.25 倍未満でなければならないので、大きいほうを左に置いている。[`ifma`] は
@@ -158,12 +158,18 @@ unsafe fn add_niels<F: Field8, const WITH_T: bool>(p: &mut Ext8<F>, q: &Niels8<F
         let z2 = p.z.add(&p.z); // 2.02 倍
         let (x, y) = (pp.sub(&mm), pp.add(&mm)); // 3.01 倍, 2.02 倍
         let (z, t) = (z2.add(&txy), z2.sub(&txy)); // 3.03 倍, 4.02 倍
+        if !WITH_T {
+            // 最後の加算: 分数の形（y = Y/Z、x = X/T。comb の add_niels_last と同じ）。掛け算 3 回で済む
+            p.x = x.carry();
+            p.y = y.carry();
+            p.z = t.carry();
+            p.t = z.carry();
+            return;
+        }
         p.x = t.mul(&x);
         p.y = y.mul(&z);
         p.z = t.mul(&z);
-        if WITH_T {
-            p.t = x.mul(&y);
-        }
+        p.t = x.mul(&y);
     }
 }
 
@@ -462,13 +468,13 @@ unsafe fn mul_base_batch<F: Field8, const N: usize>(
             .zip(out.as_chunks_mut::<8>().0)
         {
             add_niels::<F, false>(p, &gather(row, d));
-            let (x, y, z) = (p.x.lanes(), p.y.lanes(), p.z.lanes());
+            let (x, y, z, t) = (p.x.lanes(), p.y.lanes(), p.z.lanes(), p.t.lanes());
             for k in 0..8 {
                 o[k] = Extended {
                     x: x[k],
                     y: y[k],
                     z: z[k],
-                    t: Fe::ZERO,
+                    t: t[k],
                 };
             }
         }
@@ -482,7 +488,7 @@ unsafe fn mul_base_compress<F: Field8, const N: usize>(
     scalars: &[[u8; 32]; N],
     ys: &mut [[u8; 32]; N],
     xs: &mut [Fe; N],
-    zinvs: &mut [Fe; N],
+    xds: &mut [Fe; N],
 ) {
     unsafe {
         let (mut acc, last) = mul_base_until_last::<F, N>(table, scalars);
@@ -490,13 +496,13 @@ unsafe fn mul_base_compress<F: Field8, const N: usize>(
         for (p, d) in acc.iter_mut().zip(last.as_chunks::<8>().0) {
             add_niels::<F, false>(p, &gather(row, d));
         }
-        compress::<F, N>(&acc, ys, xs, zinvs);
+        compress::<F, N>(&acc, ys, xs, xds);
     }
 }
 
-/// 8鍵ずつの組の点から、1/Z と y の圧縮形式を計算する。
-/// `ys[k]` は k 番目の公開鍵の圧縮形式で x の符号のビットを 0 にしたもの、`xs[k]`・`zinvs[k]` は
-/// 符号を後から計算するための X と 1/Z。
+/// 8鍵ずつの組の点（最後の加算の分数の形）から、1/Z と y の圧縮形式を計算する。
+/// `ys[k]` は k 番目の公開鍵の圧縮形式で x の符号のビットを 0 にしたもの、`xs[k]`・`xds[k]` は
+/// 符号を後から計算するための x の分子と分母（x = X/T）。
 ///
 /// 1/Z は Montgomery の一括逆元をレーンごとに（8本の鎖を並べて）する: 組を順に掛けた積の逆元を
 /// 1回だけ計算し、後ろの組から 1/Z を取り出す
@@ -505,7 +511,7 @@ unsafe fn compress<F: Field8, const N: usize>(
     acc: &[Ext8<F>],
     ys: &mut [[u8; 32]; N],
     xs: &mut [Fe; N],
-    zinvs: &mut [Fe; N],
+    xds: &mut [Fe; N],
 ) {
     unsafe {
         // prefix[g] = 0〜g 番目の組の Z の積（レーンごと）
@@ -526,11 +532,11 @@ unsafe fn compress<F: Field8, const N: usize>(
             if g > 0 {
                 inv = inv.mul(&p.z);
             }
-            let (y, x, zi) = (p.y.mul(&zinv).lanes(), p.x.lanes(), zinv.lanes());
+            let (y, x, xd) = (p.y.mul(&zinv).lanes(), p.x.lanes(), p.t.lanes());
             for k in 0..8 {
                 ys[8 * g + k] = y[k].to_bytes();
                 xs[8 * g + k] = x[k];
-                zinvs[8 * g + k] = zi[k];
+                xds[8 * g + k] = xd[k];
             }
         }
     }
@@ -579,13 +585,13 @@ unsafe fn mul_base_batch_ct<F: Field8, const W: usize, const R: usize, const N: 
     unsafe {
         let acc = points_ct::<F, W, R, N>(table, scalars);
         for (p, o) in acc.iter().zip(out.as_chunks_mut::<8>().0) {
-            let (x, y, z) = (p.x.lanes(), p.y.lanes(), p.z.lanes());
+            let (x, y, z, t) = (p.x.lanes(), p.y.lanes(), p.z.lanes(), p.t.lanes());
             for k in 0..8 {
                 o[k] = Extended {
                     x: x[k],
                     y: y[k],
                     z: z[k],
-                    t: Fe::ZERO,
+                    t: t[k],
                 };
             }
         }
@@ -599,11 +605,11 @@ unsafe fn mul_base_compress_ct<F: Field8, const W: usize, const R: usize, const 
     scalars: &[[u8; 32]; N],
     ys: &mut [[u8; 32]; N],
     xs: &mut [Fe; N],
-    zinvs: &mut [Fe; N],
+    xds: &mut [Fe; N],
 ) {
     unsafe {
         let acc = points_ct::<F, W, R, N>(table, scalars);
-        compress::<F, N>(&acc, ys, xs, zinvs);
+        compress::<F, N>(&acc, ys, xs, xds);
     }
 }
 
@@ -635,7 +641,7 @@ mod tests {
     use crate::rfc8032::secret_expand;
     use crate::rfc8032::to_le32;
     use crate::rfc8032::{Vector, vectors};
-    use crate::service::derive::comb::compress_with_zinv;
+    use crate::service::derive::comb::compress_frac;
     use crate::service::derive::field::Fe;
     use crate::simd_support::available;
     use curve25519_dalek::edwards::EdwardsPoint;
@@ -685,7 +691,7 @@ mod tests {
     }
 
     fn compress(p: &Extended) -> [u8; 32] {
-        compress_with_zinv(p, p.z.invert())
+        compress_frac(p)
     }
 
     /// curve25519-dalek で `s * B`（s は 2^255 未満の任意の値）

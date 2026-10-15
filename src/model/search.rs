@@ -36,16 +36,16 @@ pub enum SeedSource {
     /// 鍵ごとに ChaCha20 の出力から（既定）
     #[default]
     ChaCha20,
-    /// OS の乱数で作った 32 バイト（CPU はスレッドごと、GPU は起動ごと）の先頭 8 バイトに、通し番号を足したもの
-    /// （低セキュリティモード。乱数を作る手間が省ける）
+    /// OS の乱数で作った 32 バイト（CPU はスレッドごと、GPU は起動ごと）の最後の 8 バイトに、通し番号を足したもの
+    /// （低セキュリティモード。乱数を作る手間が省け、GPU では SHA-512 の最初の 3 ラウンドを前もって計算できる）
     Counter,
 }
 
-/// `base` の先頭 8 バイト（リトルエンディアン）に `index` を足したシード（[`SeedSource::Counter`]）
+/// `base` の最後の 8 バイト（リトルエンディアン）に `index` を足したシード（[`SeedSource::Counter`]）
 pub fn counter_seed(base: &[u8; 32], index: u64) -> [u8; 32] {
     let mut s = *base;
-    let head = u64::from_le_bytes(*base.first_chunk().expect("32 バイト"));
-    s[..8].copy_from_slice(&head.wrapping_add(index).to_le_bytes());
+    let tail = u64::from_le_bytes(*base.last_chunk().expect("32 バイト"));
+    s[24..].copy_from_slice(&tail.wrapping_add(index).to_le_bytes());
     s
 }
 
@@ -125,18 +125,18 @@ mod tests {
         }
     }
 
-    /// 通し番号のシードは、先頭 8 バイト（リトルエンディアン）に足すだけで、残りの 24 バイトは元のまま。
+    /// 通し番号のシードは、最後の 8 バイト（リトルエンディアン）に足すだけで、残りの 24 バイトは元のまま。
     /// 桁あふれは 2^64 で回る
     #[rstest]
     #[case::zero(0, 0, 0)]
     #[case::add(5, 3, 8)]
     #[case::wraps(u64::MAX, 2, 1)]
-    fn counter_seed_adds_to_head(#[case] head: u64, #[case] index: u64, #[case] want: u64) {
+    fn counter_seed_adds_to_tail(#[case] tail: u64, #[case] index: u64, #[case] want: u64) {
         let mut base = [0xabu8; 32];
-        base[..8].copy_from_slice(&head.to_le_bytes());
+        base[24..].copy_from_slice(&tail.to_le_bytes());
         let s = counter_seed(&base, index);
-        assert_eq!(u64::from_le_bytes(*s.first_chunk().unwrap()), want);
-        assert_eq!(&s[8..], &base[8..]);
+        assert_eq!(u64::from_le_bytes(*s.last_chunk().unwrap()), want);
+        assert_eq!(&s[..24], &base[..24]);
     }
 
     /// 止める合図は clone したものどうしで共有し、新しく作ったものには届かない

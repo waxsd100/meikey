@@ -197,9 +197,12 @@ pub struct Deriver {
     backend: Backend,
     lanes: Lanes,
     points: Box<[Extended; BATCH]>,
-    /// X（x の符号を後から計算するため）
+    /// x の分子と分母（最後の加算の分数の形で x = X/T。x の符号を後から計算するため）
     xs: Box<[Fe; BATCH]>,
-    /// 1/Z（逆元を計算したあと）
+    xds: Box<[Fe; BATCH]>,
+    /// 1/xds（直前の計算で、符号を初めて聞かれたときに全部まとめて計算する）
+    xinvs: Option<Box<[Fe; BATCH]>>,
+    /// y の分母の逆元 1/Z（逆元を計算したあと）
     zs: Box<[Fe; BATCH]>,
     scratch: Vec<Fe>,
     /// curve25519-dalek の倍算（SIMD の無い CPU での定数時間の倍算）で計算した x の符号。
@@ -217,6 +220,8 @@ impl Deriver {
             lanes: Lanes::detect(backend.simd),
             points: Box::new([Extended::IDENTITY; BATCH]),
             xs: Box::new([Fe::ZERO; BATCH]),
+            xds: Box::new([Fe::ZERO; BATCH]),
+            xinvs: None,
             zs: Box::new([Fe::ZERO; BATCH]),
             scratch: Vec::with_capacity(BATCH),
             signs: Box::new([0; BATCH]),
@@ -235,6 +240,7 @@ impl Deriver {
     /// 全シードの公開鍵を、x の符号（最後のバイトの最上位ビット）を 0 にして。符号は [`Deriver::sign`] で、
     /// 要るときだけ計算する（探索では、文字列が含まれそうな鍵だけ）
     pub fn public_keys_unsigned(&mut self, seeds: &Seeds, out: &mut PublicKeys) {
+        self.xinvs = None;
         let mut scalars = self.scalars(seeds);
         let ct = self.backend.mul == Mul::ConstantTime;
         self.dalek = ct && matches!(self.lanes, Lanes::Scalar);
@@ -251,12 +257,19 @@ impl Deriver {
         zeroize::Zeroize::zeroize(scalars.as_flattened_mut());
     }
 
-    /// 直前の [`Deriver::public_keys_unsigned`] の `k` 番目の鍵の x の符号（0 か 1）
-    pub fn sign(&self, k: usize) -> u8 {
-        match self.dalek {
-            true => self.signs[k],
-            false => (self.xs[k] * self.zs[k]).to_bytes()[0] & 1,
+    /// 直前の [`Deriver::public_keys_unsigned`] の `k` 番目の鍵の x の符号（0 か 1）。x = 分子 / 分母 の
+    /// 分母の逆元は、初めて聞かれたときに全部の鍵の分をまとめて計算する（逆元 1 回と掛け算 3 回ずつ。
+    /// 文字列が含まれそうな鍵の無い組では計算しない）
+    pub fn sign(&mut self, k: usize) -> u8 {
+        if self.dalek {
+            return self.signs[k];
         }
+        let xinvs = self.xinvs.get_or_insert_with(|| {
+            let mut v = self.xds.clone();
+            Fe::batch_invert(&mut v[..], &mut self.scratch);
+            v
+        });
+        (self.xs[k] * xinvs[k]).to_bytes()[0] & 1
     }
 
     /// 全シードの秘密スカラー
@@ -291,29 +304,29 @@ impl Deriver {
 
     /// SIMD の倍算（`ct` なら定数時間の倍算 [`ct`]、そうでなければテーブルの倍算）。SIMD が無ければ
     /// テーブルの倍算を1鍵ずつ（定数時間の倍算は [`constant_time`] で、ここには来ない）。
-    /// y の圧縮形式（符号のビットは 0）を `out` に、X と 1/Z を `xs`・`zs` に。
+    /// y の圧縮形式（符号のビットは 0）を `out` に、x の分子・分母を `xs`・`xds` に。
     /// AVX-512 では、逆元と圧縮も8鍵ずつ同時に計算する（逆元を [`Compress::Each`] で 1 鍵ずつ計算するときは、
     /// 比較用に1つずつ）。AVX2 は 4 レーンの乗算が1鍵ずつの乗算より何倍も遅く、逆元と圧縮は1つずつのほうが速い
     fn simd(&mut self, scalars: &Seeds, out: &mut PublicKeys, ct: bool) {
         let batch = self.backend.compress == Compress::Batch;
-        let (xs, zs) = (&mut self.xs, &mut self.zs);
+        let (xs, xds) = (&mut self.xs, &mut self.xds);
         match self.lanes {
             #[cfg(all(target_arch = "x86_64", feature = "amx"))]
             Lanes::Amx(a) if batch && ct => {
-                return avx512::f::mul_base_compress_ct(a.avx512(), scalars, out, xs, zs);
+                return avx512::f::mul_base_compress_ct(a.avx512(), scalars, out, xs, xds);
             }
             #[cfg(target_arch = "x86_64")]
             Lanes::Ifma(i) if batch => {
                 return match ct {
-                    true => avx512::ifma::mul_base_compress_ct(i, scalars, out, xs, zs),
-                    false => avx512::ifma::mul_base_compress(i, scalars, out, xs, zs),
+                    true => avx512::ifma::mul_base_compress_ct(i, scalars, out, xs, xds),
+                    false => avx512::ifma::mul_base_compress(i, scalars, out, xs, xds),
                 };
             }
             #[cfg(target_arch = "x86_64")]
             Lanes::Avx512(a) if batch => {
                 return match ct {
-                    true => avx512::f::mul_base_compress_ct(a, scalars, out, xs, zs),
-                    false => avx512::f::mul_base_compress(a, scalars, out, xs, zs),
+                    true => avx512::f::mul_base_compress_ct(a, scalars, out, xs, xds),
+                    false => avx512::f::mul_base_compress(a, scalars, out, xs, xds),
                 };
             }
             _ => {}
@@ -341,9 +354,17 @@ impl Deriver {
             }
             (Lanes::Scalar, false) => Table::get().mul_base_batch(scalars, points),
         }
-        for ((p, z), x) in self.points.iter().zip(&mut *self.zs).zip(&mut *self.xs) {
+        // 最後の加算の分数の形: y = Y/Z、x = X/T
+        for (((p, z), x), xd) in self
+            .points
+            .iter()
+            .zip(&mut *self.zs)
+            .zip(&mut *self.xs)
+            .zip(&mut *self.xds)
+        {
             *z = p.z;
             *x = p.x;
+            *xd = p.t;
         }
         match self.backend.compress {
             Compress::Batch => Fe::batch_invert(&mut self.zs[..], &mut self.scratch),

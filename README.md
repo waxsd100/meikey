@@ -105,7 +105,7 @@ With `--regex`, the regular expression is matched against the 43 characters afte
 | `--bench SECS` | Only measure the speed |
 | `--check` | Show the CPU, GPU and methods to use, then exit |
 | `--low-security` | Low-security mode (prioritizes speed) |
-| `--gpu` / `--both` | Search on the GPU only / on the GPU and the CPU (with `--low-security`) |
+| `--gpu` / `--both` | Search on the GPU only / on the GPU and the CPU (with `--low-security`). All GPUs are used if there are several |
 | `--gpu-width`, `--gpu-batch`, `--gpu-limbs` | GPU settings (without them, the fastest is measured on the GPU before searching) |
 | `--simd LEVEL` | Highest SIMD level to use (`avx512-ifma`, `avx512`, `avx2`, `off`) |
 

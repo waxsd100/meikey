@@ -216,11 +216,11 @@ pub fn mul_base_compress<const N: usize>(
     scalars: &[[u8; 32]; N],
     ys: &mut [[u8; 32]; N],
     xs: &mut [Fe; N],
-    zinvs: &mut [Fe; N],
+    xds: &mut [Fe; N],
 ) {
     let _ = ifma;
     // SAFETY: Ifma があるので、CPU は下の target_feature の命令に対応している
-    unsafe { run_compress(&TABLE, scalars, ys, xs, zinvs) }
+    unsafe { run_compress(&TABLE, scalars, ys, xs, xds) }
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512ifma")]
@@ -229,10 +229,10 @@ fn run_compress<const N: usize>(
     scalars: &[[u8; 32]; N],
     ys: &mut [[u8; 32]; N],
     xs: &mut [Fe; N],
-    zinvs: &mut [Fe; N],
+    xds: &mut [Fe; N],
 ) {
     // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
-    unsafe { super::mul_base_compress::<Fe5, N>(table, scalars, ys, xs, zinvs) }
+    unsafe { super::mul_base_compress::<Fe5, N>(table, scalars, ys, xs, xds) }
 }
 
 static CT_TABLE: LazyLock<CtTable8> = LazyLock::new(|| CtTable8::build::<Fe5>(ct::W_IFMA));
@@ -269,11 +269,11 @@ pub fn mul_base_compress_ct<const N: usize>(
     scalars: &[[u8; 32]; N],
     ys: &mut [[u8; 32]; N],
     xs: &mut [Fe; N],
-    zinvs: &mut [Fe; N],
+    xds: &mut [Fe; N],
 ) {
     let _ = ifma;
     // SAFETY: Ifma があるので、CPU は下の target_feature の命令に対応している
-    unsafe { run_compress_ct(&CT_TABLE, scalars, ys, xs, zinvs) }
+    unsafe { run_compress_ct(&CT_TABLE, scalars, ys, xs, xds) }
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512ifma")]
@@ -282,12 +282,12 @@ fn run_compress_ct<const N: usize>(
     scalars: &[[u8; 32]; N],
     ys: &mut [[u8; 32]; N],
     xs: &mut [Fe; N],
-    zinvs: &mut [Fe; N],
+    xds: &mut [Fe; N],
 ) {
     // SAFETY: この関数の target_feature で、中の unsafe fn が使う命令はすべて使える
     unsafe {
         super::mul_base_compress_ct::<Fe5, { ct::W_IFMA }, { ct::rows(ct::W_IFMA) }, N>(
-            table, scalars, ys, xs, zinvs,
+            table, scalars, ys, xs, xds,
         )
     }
 }

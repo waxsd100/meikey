@@ -1,10 +1,10 @@
-//! 埋め込む GPU カーネルの PTX（src/service/gpu/ptx/ の設定ごとのファイル）を kernel.cu から作る（`cargo make ptx`）。
+//! 埋め込む GPU カーネルの PTX（src/service/gpu/ptx/ の、まとめる鍵の数と体演算の種類の組ごとのファイル）を kernel.cu から作る（`cargo make ptx`）。
 //!
 //! PTX の版はコンパイルした NVRTC の版で決まり、それより古いドライバでは読めない。なるべく多くのドライバで
 //! 動くよう、古い NVRTC（CUDA 12.0）で作る。例: `pip install --target /tmp/nvrtc "nvidia-cuda-nvrtc-cu12==12.0.*"`
 //! として、`LD_LIBRARY_PATH=/tmp/nvrtc/nvidia/cuda_nvrtc/lib cargo make ptx`
 
-use meikey::service::gpu::{EMBEDDED, GpuError, portable_ptx};
+use meikey::service::gpu::{BUILDS, GpuError, portable_ptx};
 
 /// PTX を作れない・書けないときのエラー
 #[derive(Debug, thiserror::Error)]
@@ -19,12 +19,12 @@ enum GenError {
 }
 
 fn main() -> Result<(), GenError> {
-    for options in EMBEDDED {
-        let ptx = portable_ptx(options)?;
+    for build in BUILDS {
+        let ptx = portable_ptx(build)?;
         let path = format!(
             "{}/src/service/gpu/ptx/{}",
             env!("CARGO_MANIFEST_DIR"),
-            options.ptx_file()
+            build.ptx_file()
         );
         std::fs::write(&path, ptx).map_err(|source| GenError::Write {
             path: path.clone(),
