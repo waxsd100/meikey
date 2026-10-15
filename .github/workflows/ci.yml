@@ -78,3 +78,23 @@ jobs:
           name: junit-${{ matrix.os }}
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
+
+  # 本物の GPU で、GPU のテスト（PTX の読み込み・起動・設定を測って選ぶところまで）を回す。
+  # 自分のマシン（NVIDIA の GPU とドライバ、Rust、Windows なら Visual Studio の C++ ビルドツールが入ったもの）を
+  # ラベル `gpu` を付けた self-hosted runner として登録し、リポジトリの変数 GPU_RUNNER を true にしたときだけ動く
+  # （登録していないのに動かすと、runner を待ち続けるため）。
+  # 他人のプルリクエストのコードを自分のマシンで動かさないよう、プルリクエストでは動かさない
+  gpu:
+    name: test (GPU, self-hosted)
+    if: github.event_name != 'pull_request' && vars.GPU_RUNNER == 'true'
+    runs-on: [self-hosted, gpu]
+    env:
+      # GPU が見つからなければ、テストを飛ばさずに失敗させる
+      MEIKEY_REQUIRE_SIMD: cuda
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run --profile ci -E "test(/^service::gpu::/)"

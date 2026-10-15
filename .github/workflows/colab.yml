@@ -1,0 +1,69 @@
+# Google Colab の GPU の VM を借りて、GPU のテストを回す（手で実行したときだけ）。
+# Colab CLI（https://github.com/googlecolab/google-colab-cli）で VM を作り、colab/ci_test.py を実行して、
+# 結果（JUnit）を取ってきてから VM を止める。
+#
+# 使う前に、手元（Linux か macOS）で一度ログインして、できたトークンをリポジトリの secret COLAB_TOKEN に入れておく:
+#   uv tool install google-colab-cli
+#   colab --auth oauth2 sessions        # 表示された URL を開いて許可し、コードを貼る
+#   gh secret set COLAB_TOKEN < ~/.config/colab-cli/token.json
+name: Colab GPU
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: Colab の GPU
+        type: choice
+        options: [T4, L4, G4, A100, H100]
+        default: T4
+
+concurrency:
+  group: colab-gpu
+  cancel-in-progress: false
+
+jobs:
+  gpu:
+    name: test (GPU, Google Colab ${{ inputs.gpu }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SESSION: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      GPU: ${{ inputs.gpu }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Colab CLI
+        run: |
+          uv tool install google-colab-cli
+          uv tool dir --bin >> "$GITHUB_PATH"
+      - name: Log in to Colab
+        env:
+          COLAB_TOKEN: ${{ secrets.COLAB_TOKEN }}
+        run: |
+          if [ -z "$COLAB_TOKEN" ]; then
+            echo "::error::secret COLAB_TOKEN がありません（このファイルの先頭を参照）"
+            exit 1
+          fi
+          mkdir -p ~/.config/colab-cli
+          ( umask 077 && printf '%s' "$COLAB_TOKEN" > ~/.config/colab-cli/token.json )
+      # --keep で VM を残し、結果を取ってから止める。--timeout は長いテストでも打ち切られないように
+      - name: Run GPU tests on Colab
+        run: >-
+          colab --auth oauth2 run -s "$SESSION" --gpu "$GPU" --keep --timeout 3600
+          --env "MEIKEY_SHA=$GITHUB_SHA"
+          --env "MEIKEY_REPO=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          colab/ci_test.py
+      - name: Download test results
+        if: always()
+        run: colab --auth oauth2 download -s "$SESSION" content/meikey/target/nextest/ci/junit.xml junit.xml || true
+      # 失敗・取り消しのときも、VM を止めて Colab のコンピューティング ユニットを使い続けないようにする
+      - name: Stop the Colab VM
+        if: always()
+        run: colab --auth oauth2 stop -s "$SESSION" || true
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-colab-${{ inputs.gpu }}
+          path: junit.xml
+          if-no-files-found: ignore
